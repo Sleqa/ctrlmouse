@@ -1,0 +1,13 @@
+# Build output (the exe ships via GitHub Releases, not the repo)
+ctrlmouse.exe
+*.obj
+*.res
+*.manifest
+*.pdb
+build/
+
+# Per-user runtime settings
+config.json
+
+# Local tooling
+.claude/
