@@ -21,6 +21,8 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <dwmapi.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
 #include <string>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +36,8 @@
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -63,13 +67,15 @@ static volatile bool    g_running = true;
 static volatile bool    g_connected = false;
 static HANDLE           g_worker = NULL;
 static HWND             g_hwnd = NULL;
-static HWND             g_status = NULL;
 static NOTIFYICONDATAW  g_nid = {};
 static HFONT            g_font = NULL;
 static HFONT            g_font_hdr = NULL;
-static HWND             g_mouse_val = NULL, g_scroll_val = NULL, g_dz_val = NULL;
-static HWND             g_bind_val = NULL;
 static int              g_status_state = -1;
+static wchar_t          g_status_txt[64] = L"Controller: ...";
+static wchar_t          g_mouse_val_txt[32] = L"";
+static wchar_t          g_scroll_val_txt[32] = L"";
+static wchar_t          g_dz_val_txt[32] = L"";
+static wchar_t          g_bind_val_txt[32] = L"";
 
 static Config get_cfg() {
     EnterCriticalSection(&g_cs);
@@ -524,6 +530,99 @@ static void init_theme() {
     g_toggle_off = CreateSolidBrush(RGB(62, 62, 72));
 }
 
+// --- Direct2D / DirectWrite --------------------------------------------------
+// The main settings window is fully D2D-drawn (see wnd_proc's WM_PAINT). The
+// keyboard popup still uses its original GDI paint path for now; it moves to
+// D2D in a later pass.
+static ID2D1Factory1*     g_d2d_factory = NULL;
+static IDWriteFactory*    g_dwrite_factory = NULL;
+static IDWriteTextFormat* g_tf_body = NULL;    // Segoe UI 12
+static IDWriteTextFormat* g_tf_header = NULL;  // Segoe UI 14 semibold
+static IDWriteTextFormat* g_tf_key = NULL;     // Segoe UI 17 semibold (keyboard, future use)
+
+static ID2D1HwndRenderTarget* g_rt_main = NULL;
+static ID2D1SolidColorBrush*  g_br_main_bg = NULL;
+static ID2D1SolidColorBrush*  g_br_main_key = NULL;
+static ID2D1SolidColorBrush*  g_br_main_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_main_armed = NULL;
+static ID2D1SolidColorBrush*  g_br_main_toggle_off = NULL;
+static ID2D1SolidColorBrush*  g_br_main_text = NULL;
+static ID2D1SolidColorBrush*  g_br_main_white = NULL;
+static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
+
+static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
+    return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
+                         GetBValue(c) / 255.0f, a);
+}
+
+static void d2d_init_process() {
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                      __uuidof(ID2D1Factory1), (void**)&g_d2d_factory);
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                        (IUnknown**)&g_dwrite_factory);
+    if (!g_dwrite_factory) return;
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_tf_body);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_tf_header);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"en-us", &g_tf_key);
+    if (g_tf_body) {
+        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_tf_body->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    if (g_tf_header) {
+        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_tf_header->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    if (g_tf_key) {
+        g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_tf_key->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+}
+
+static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd) {
+    if (!g_d2d_factory) return NULL;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    ID2D1HwndRenderTarget* rt = NULL;
+    g_d2d_factory->CreateHwndRenderTarget(
+        D2D1::RenderTargetProperties(),
+        D2D1::HwndRenderTargetProperties(hwnd,
+            D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
+        &rt);
+    return rt;
+}
+
+static void d2d_release_main() {
+    if (g_br_main_bg) { g_br_main_bg->Release(); g_br_main_bg = NULL; }
+    if (g_br_main_key) { g_br_main_key->Release(); g_br_main_key = NULL; }
+    if (g_br_main_sel) { g_br_main_sel->Release(); g_br_main_sel = NULL; }
+    if (g_br_main_armed) { g_br_main_armed->Release(); g_br_main_armed = NULL; }
+    if (g_br_main_toggle_off) { g_br_main_toggle_off->Release(); g_br_main_toggle_off = NULL; }
+    if (g_br_main_text) { g_br_main_text->Release(); g_br_main_text = NULL; }
+    if (g_br_main_white) { g_br_main_white->Release(); g_br_main_white = NULL; }
+    if (g_br_main_status) { g_br_main_status->Release(); g_br_main_status = NULL; }
+    if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
+}
+
+static bool d2d_create_main(HWND hwnd) {
+    g_rt_main = d2d_create_rt(hwnd);
+    if (!g_rt_main) return false;
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_bg);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_main_key);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_sel);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_main_armed);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(62, 62, 72)), &g_br_main_toggle_off);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(235, 235, 240)), &g_br_main_text);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(255, 255, 255)), &g_br_main_white);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
+    return true;
+}
+
 static COLORREF lerp_clr(COLORREF a, COLORREF b, double t) {
     return RGB((int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
                (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
@@ -756,13 +855,34 @@ static void restore_from_tray(HWND hwnd) {
 }
 
 // --- Window ----------------------------------------------------------------
-#define IDC_MOUSE    1001
-#define IDC_SCROLL   1002
-#define IDC_DEADZONE 1003
-#define IDC_ENABLED  1004
-#define IDC_GAMECHK  1005
-#define IDC_BINDBTN  1006
 #define ID_TIMER     1
+
+// Trackbar indices (mouse sensitivity / scroll sensitivity / deadzone).
+enum { TRK_MOUSE = 0, TRK_SCROLL = 1, TRK_DEADZONE = 2 };
+static const int kTrackLo[3] = {1, 1, 0};
+static const int kTrackHi[3] = {60, 50, 50};
+
+// Fixed layout for the D2D-drawn controls (was previously native child HWNDs
+// via TRACKBAR_CLASSW / BS_OWNERDRAW buttons; geometry unchanged).
+static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
+static const RECT kTrackRect[3] = {
+    {20, 78, 20 + 344, 78 + 28},
+    {20, 140, 20 + 344, 140 + 28},
+    {20, 202, 20 + 344, 202 + 28},
+};
+static const RECT kValRect[3] = {
+    {284, 56, 284 + 80, 56 + 18},
+    {284, 118, 284 + 80, 118 + 18},
+    {284, 180, 284 + 80, 180 + 18},
+};
+static const RECT kToggleRect[2] = {
+    {20, 244, 20 + 46, 244 + 22},
+    {196, 244, 196 + 46, 244 + 22},
+};
+static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
+static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
+
+static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
 
 static void apply_font(HWND h) {
     if (h && g_font) SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -776,30 +896,18 @@ static HWND make_text(HWND parent, const wchar_t* text, DWORD style,
     return c;
 }
 
-static HWND make_trackbar(HWND parent, int id, int x, int y, int w,
-                          int lo, int hi, int pos) {
-    HWND tb = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                              WS_CHILD | WS_VISIBLE | TBS_HORZ | WS_TABSTOP,
-                              x, y, w, 28, parent, (HMENU)(INT_PTR)id,
-                              GetModuleHandleW(NULL), NULL);
-    SendMessageW(tb, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
-    SendMessageW(tb, TBM_SETPOS, TRUE, pos);
-    apply_font(tb);
-    return tb;
-}
-
-static void update_value(int id) {
+static void update_value(int idx) {
     Config c = get_cfg();
-    wchar_t b[32];
-    if (id == IDC_MOUSE) {
-        swprintf(b, 32, L"%d", (int)std::lround(c.mouse_sensitivity));
-        SetWindowTextW(g_mouse_val, b);
-    } else if (id == IDC_SCROLL) {
-        swprintf(b, 32, L"%.1f", c.scroll_sensitivity);
-        SetWindowTextW(g_scroll_val, b);
-    } else if (id == IDC_DEADZONE) {
-        swprintf(b, 32, L"%d%%", (int)std::lround(c.deadzone * 100));
-        SetWindowTextW(g_dz_val, b);
+    if (idx == TRK_MOUSE) {
+        swprintf(g_mouse_val_txt, 32, L"%d", (int)std::lround(c.mouse_sensitivity));
+    } else if (idx == TRK_SCROLL) {
+        swprintf(g_scroll_val_txt, 32, L"%.1f", c.scroll_sensitivity);
+    } else if (idx == TRK_DEADZONE) {
+        swprintf(g_dz_val_txt, 32, L"%d%%", (int)std::lround(c.deadzone * 100));
+    }
+    if (g_hwnd) {
+        InvalidateRect(g_hwnd, &kTrackRect[idx], FALSE);
+        InvalidateRect(g_hwnd, &kValRect[idx], FALSE);
     }
 }
 
@@ -809,10 +917,43 @@ static void update_bind_text() {
         L"Square", L"Cross", L"Circle", L"Triangle", L"L1", L"R1", L"L2",
         L"R2", L"Create", L"Options", L"L3", L"R3", L"PS", L"Touchpad"};
     int b = get_cfg().toggle_button;
-    wchar_t buf[32];
-    if (b >= 0 && b < 14) swprintf(buf, 32, L"%s", names[b]);
-    else swprintf(buf, 32, L"Button %d", b);
-    if (g_bind_val) SetWindowTextW(g_bind_val, buf);
+    if (b >= 0 && b < 14) swprintf(g_bind_val_txt, 32, L"%s", names[b]);
+    else swprintf(g_bind_val_txt, 32, L"Button %d", b);
+    if (g_hwnd) InvalidateRect(g_hwnd, &kBindValRect, FALSE);
+}
+
+// Current trackbar position (in the same integer units the old TBM_* range
+// used) derived straight from config, so painting and hit-testing agree.
+static int track_current_pos(int idx) {
+    Config c = get_cfg();
+    if (idx == TRK_MOUSE) return (int)std::lround(c.mouse_sensitivity);
+    if (idx == TRK_SCROLL) return (int)std::lround(c.scroll_sensitivity * 10);
+    return (int)std::lround(c.deadzone * 100);
+}
+
+static int track_pos_from_x(int idx, int x) {
+    const RECT& r = kTrackRect[idx];
+    double frac = (double)(x - r.left) / (double)(r.right - r.left);
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    return kTrackLo[idx] + (int)std::lround(frac * (kTrackHi[idx] - kTrackLo[idx]));
+}
+
+static void apply_track_pos(int idx, int pos) {
+    EnterCriticalSection(&g_cs);
+    if (idx == TRK_MOUSE) g_cfg.mouse_sensitivity = pos;
+    else if (idx == TRK_SCROLL) g_cfg.scroll_sensitivity = pos / 10.0;
+    else if (idx == TRK_DEADZONE) g_cfg.deadzone = pos / 100.0;
+    Config c = g_cfg;
+    LeaveCriticalSection(&g_cs);
+    save_config(c);
+    update_value(idx);
+}
+
+static int hit_test_track(POINT pt) {
+    for (int i = 0; i < 3; i++)
+        if (PtInRect(&kTrackRect[i], pt)) return i;
+    return -1;
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -821,153 +962,182 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        Config c = get_cfg();
-
-        g_status = make_text(hwnd, L"Controller: ...", 0, 20, 16, 344, 22);
-        SendMessageW(g_status, WM_SETFONT, (WPARAM)g_font_hdr, TRUE);
 
         make_text(hwnd, L"Mouse sensitivity", 0, 20, 56, 200, 18);
-        g_mouse_val = make_text(hwnd, L"", SS_RIGHT, 284, 56, 80, 18);
-        make_trackbar(hwnd, IDC_MOUSE, 20, 78, 344, 1, 60,
-                      (int)std::lround(c.mouse_sensitivity));
-
         make_text(hwnd, L"Scroll sensitivity", 0, 20, 118, 200, 18);
-        g_scroll_val = make_text(hwnd, L"", SS_RIGHT, 284, 118, 80, 18);
-        make_trackbar(hwnd, IDC_SCROLL, 20, 140, 344, 1, 50,
-                      (int)std::lround(c.scroll_sensitivity * 10));
-
         make_text(hwnd, L"Deadzone", 0, 20, 180, 200, 18);
-        g_dz_val = make_text(hwnd, L"", SS_RIGHT, 284, 180, 80, 18);
-        make_trackbar(hwnd, IDC_DEADZONE, 20, 202, 344, 0, 50,
-                      (int)std::lround(c.deadzone * 100));
-
-        // Toggle switches (owner-drawn pills; state lives in the config)
-        CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                      20, 244, 46, 22, hwnd, (HMENU)(INT_PTR)IDC_ENABLED,
-                      GetModuleHandleW(NULL), NULL);
         make_text(hwnd, L"Enabled", 0, 74, 246, 100, 18);
-
-        CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                      196, 244, 46, 22, hwnd, (HMENU)(INT_PTR)IDC_GAMECHK,
-                      GetModuleHandleW(NULL), NULL);
         make_text(hwnd, L"Pause in games", 0, 250, 246, 114, 18);
-
-        // Controller keybind that toggles enable/disable
         make_text(hwnd, L"Toggle button", 0, 20, 282, 100, 18);
-        g_bind_val = make_text(hwnd, L"", 0, 124, 282, 150, 18);
-        CreateWindowW(L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
-                      284, 278, 80, 24, hwnd, (HMENU)(INT_PTR)IDC_BINDBTN,
-                      GetModuleHandleW(NULL), NULL);
-        update_bind_text();
-
         make_text(hwnd, L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
                   0, 20, 316, 352, 16);
         make_text(hwnd, L"Circle backspace).  Close sends to tray; tray icon to quit.",
                   0, 20, 334, 352, 16);
 
-        update_value(IDC_MOUSE);
-        update_value(IDC_SCROLL);
-        update_value(IDC_DEADZONE);
+        d2d_create_main(hwnd);
+
+        update_value(TRK_MOUSE);
+        update_value(TRK_SCROLL);
+        update_value(TRK_DEADZONE);
+        update_bind_text();
         SetTimer(hwnd, ID_TIMER, 500, NULL);
         return 0;
     }
+    case WM_SIZE:
+        if (g_rt_main) g_rt_main->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        return 0;
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wp;
         SetBkMode(hdc, TRANSPARENT);
-        HWND ctl = (HWND)lp;
-        if (ctl == g_status) {
-            COLORREF sc = RGB(240, 110, 110);            // 0: disconnected (red)
-            if (g_status_state == 1) sc = RGB(88, 210, 128);   // active (green)
-            else if (g_status_state == 2) sc = RGB(235, 180, 80);  // game (amber)
-            else if (g_status_state == 3) sc = RGB(150, 150, 158); // off (grey)
-            SetTextColor(hdc, sc);
-        } else if (ctl == g_mouse_val || ctl == g_scroll_val ||
-                   ctl == g_dz_val || ctl == g_bind_val)
-            SetTextColor(hdc, RGB(235, 235, 240));      // values: white
-        else
-            SetTextColor(hdc, RGB(165, 165, 175));      // labels: dim grey
+        SetTextColor(hdc, RGB(165, 165, 175));      // remaining labels: dim grey
         return (LRESULT)g_kb_bg;
     }
-    case WM_NOTIFY: {
-        // Custom-draw the trackbars: thin rounded channel with an accent-filled
-        // portion and a round accent thumb, matching the keyboard's dark theme.
-        LPNMHDR nm = (LPNMHDR)lp;
-        if (nm->code == NM_CUSTOMDRAW &&
-            (nm->idFrom == IDC_MOUSE || nm->idFrom == IDC_SCROLL ||
-             nm->idFrom == IDC_DEADZONE)) {
-            LPNMCUSTOMDRAW cd = (LPNMCUSTOMDRAW)lp;
-            if (cd->dwDrawStage == CDDS_PREPAINT)
-                return CDRF_NOTIFYITEMDRAW;
-            if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
-                if (cd->dwItemSpec == TBCD_TICS)
-                    return CDRF_SKIPDEFAULT;
-                if (cd->dwItemSpec == TBCD_CHANNEL) {
-                    RECT rc = cd->rc;
-                    int cy = (rc.top + rc.bottom) / 2;
-                    HGDIOBJ op = SelectObject(cd->hdc, GetStockObject(NULL_PEN));
-                    SelectObject(cd->hdc, g_kb_key);
-                    RoundRect(cd->hdc, rc.left, cy - 2, rc.right, cy + 3, 4, 4);
-                    RECT tr;
-                    SendMessageW(nm->hwndFrom, TBM_GETTHUMBRECT, 0, (LPARAM)&tr);
-                    int tc = (tr.left + tr.right) / 2;
-                    if (tc > rc.left + 4) {
-                        SelectObject(cd->hdc, g_kb_sel);
-                        RoundRect(cd->hdc, rc.left, cy - 2, tc, cy + 3, 4, 4);
-                    }
-                    SelectObject(cd->hdc, op);
-                    return CDRF_SKIPDEFAULT;
+    case WM_LBUTTONDOWN: {
+        POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        int idx = hit_test_track(pt);
+        if (idx >= 0) {
+            g_drag_track = idx;
+            SetCapture(hwnd);
+            apply_track_pos(idx, track_pos_from_x(idx, pt.x));
+            return 0;
+        }
+        if (PtInRect(&kToggleRect[0], pt)) {
+            EnterCriticalSection(&g_cs);
+            g_cfg.enabled = !g_cfg.enabled;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
+            return 0;
+        }
+        if (PtInRect(&kToggleRect[1], pt)) {
+            EnterCriticalSection(&g_cs);
+            g_cfg.game_pause = !g_cfg.game_pause;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            InvalidateRect(hwnd, &kToggleRect[1], FALSE);
+            return 0;
+        }
+        if (PtInRect(&kBindBtnRect, pt)) {
+            g_capture = true;   // worker reports the next pressed button
+            InvalidateRect(hwnd, &kBindBtnRect, FALSE);
+            return 0;
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_drag_track >= 0) {
+            POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_drag_track >= 0) {
+            g_drag_track = -1;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        if (!g_rt_main) d2d_create_main(hwnd);
+        if (g_rt_main) {
+            g_rt_main->BeginDraw();
+            g_rt_main->Clear(d2d_clr(KB_CLR_BG));
+
+            // Status label (4-state color, same logic as before).
+            COLORREF sc = RGB(240, 110, 110);
+            if (g_status_state == 1) sc = RGB(88, 210, 128);
+            else if (g_status_state == 2) sc = RGB(235, 180, 80);
+            else if (g_status_state == 3) sc = RGB(150, 150, 158);
+            if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
+            if (g_tf_header && g_br_main_status) {
+                D2D1_RECT_F r = D2D1::RectF((float)kStatusRect.left, (float)kStatusRect.top,
+                                            (float)kStatusRect.right, (float)kStatusRect.bottom);
+                g_rt_main->DrawText(g_status_txt, (UINT32)wcslen(g_status_txt),
+                                    g_tf_header, r, g_br_main_status);
+            }
+
+            // Trackbars: rounded channel + accent fill + round thumb.
+            for (int i = 0; i < 3; i++) {
+                const RECT& r = kTrackRect[i];
+                float left = (float)r.left, right = (float)r.right;
+                float cy = (float)((r.top + r.bottom) / 2);
+                g_rt_main->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 4.0f, 4.0f),
+                    g_br_main_key);
+                int pos = track_current_pos(i);
+                double frac = (double)(pos - kTrackLo[i]) / (double)(kTrackHi[i] - kTrackLo[i]);
+                float tx = left + (float)(frac * (right - left));
+                if (tx > left + 4)
+                    g_rt_main->FillRoundedRectangle(
+                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 4.0f, 4.0f),
+                        g_br_main_sel);
+                g_rt_main->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f),
+                                       g_br_main_sel);
+            }
+
+            // Value readouts, right-aligned like the old SS_RIGHT statics.
+            if (g_tf_body) {
+                const wchar_t* vals[3] = {g_mouse_val_txt, g_scroll_val_txt, g_dz_val_txt};
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                for (int i = 0; i < 3; i++) {
+                    D2D1_RECT_F r = D2D1::RectF((float)kValRect[i].left, (float)kValRect[i].top,
+                                                (float)kValRect[i].right, (float)kValRect[i].bottom);
+                    g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
+                                        g_tf_body, r, g_br_main_text);
                 }
-                if (cd->dwItemSpec == TBCD_THUMB) {
-                    RECT tr = cd->rc;
-                    int d = (tr.right - tr.left < tr.bottom - tr.top)
-                                ? tr.right - tr.left : tr.bottom - tr.top;
-                    int cx = (tr.left + tr.right) / 2;
-                    int cy = (tr.top + tr.bottom) / 2;
-                    HGDIOBJ op = SelectObject(cd->hdc, GetStockObject(NULL_PEN));
-                    SelectObject(cd->hdc, g_kb_sel);
-                    Ellipse(cd->hdc, cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2);
-                    SelectObject(cd->hdc, op);
-                    return CDRF_SKIPDEFAULT;
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+
+            // Toggle switches: pill track + sliding white knob.
+            Config c = get_cfg();
+            bool toggle_on[2] = {c.enabled, c.game_pause};
+            for (int i = 0; i < 2; i++) {
+                const RECT& r = kToggleRect[i];
+                float h = (float)(r.bottom - r.top);
+                g_rt_main->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
+                                                  (float)r.right, (float)r.bottom), h / 2, h / 2),
+                    toggle_on[i] ? g_br_main_sel : g_br_main_toggle_off);
+                float d = h - 6;
+                float kx = toggle_on[i] ? (float)r.right - 3 - d : (float)r.left + 3;
+                g_rt_main->FillEllipse(
+                    D2D1::Ellipse(D2D1::Point2F(kx + d / 2, (float)r.top + 3 + d / 2), d / 2, d / 2),
+                    g_br_main_white);
+            }
+
+            // Bind button + its value text.
+            {
+                const RECT& r = kBindBtnRect;
+                g_rt_main->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
+                                                  (float)r.right, (float)r.bottom), 10.0f, 10.0f),
+                    g_capture ? g_br_main_armed : g_br_main_key);
+                if (g_tf_body) {
+                    D2D1_RECT_F rf = D2D1::RectF((float)r.left, (float)r.top,
+                                                 (float)r.right, (float)r.bottom);
+                    const wchar_t* t = g_capture ? L"Press..." : L"Change";
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body, rf, g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             }
+            if (g_tf_body) {
+                D2D1_RECT_F r = D2D1::RectF((float)kBindValRect.left, (float)kBindValRect.top,
+                                            (float)kBindValRect.right, (float)kBindValRect.bottom);
+                g_rt_main->DrawText(g_bind_val_txt, (UINT32)wcslen(g_bind_val_txt),
+                                    g_tf_body, r, g_br_main_text);
+            }
+
+            HRESULT hr = g_rt_main->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) d2d_release_main();
         }
-        break;
-    }
-    case WM_DRAWITEM: {
-        // The "Enabled" toggle switch: pill track + sliding white knob.
-        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lp;
-        if (di->CtlID == IDC_ENABLED || di->CtlID == IDC_GAMECHK) {
-            RECT r = di->rcItem;
-            FillRect(di->hDC, &r, g_kb_bg);
-            Config c = get_cfg();
-            bool on = (di->CtlID == IDC_ENABLED) ? c.enabled : c.game_pause;
-            HGDIOBJ op = SelectObject(di->hDC, GetStockObject(NULL_PEN));
-            SelectObject(di->hDC, on ? g_kb_sel : g_toggle_off);
-            int h = r.bottom - r.top;
-            RoundRect(di->hDC, r.left, r.top, r.right, r.bottom, h, h);
-            int d = h - 6;
-            int kx = on ? r.right - 3 - d : r.left + 3;
-            SelectObject(di->hDC, GetStockObject(WHITE_BRUSH));
-            Ellipse(di->hDC, kx, r.top + 3, kx + d, r.top + 3 + d);
-            SelectObject(di->hDC, op);
-            return TRUE;
-        }
-        if (di->CtlID == IDC_BINDBTN) {
-            RECT r = di->rcItem;
-            FillRect(di->hDC, &r, g_kb_bg);
-            HGDIOBJ op = SelectObject(di->hDC, GetStockObject(NULL_PEN));
-            SelectObject(di->hDC, g_capture ? g_kb_armed : g_kb_key);
-            RoundRect(di->hDC, r.left, r.top, r.right, r.bottom, 10, 10);
-            SelectObject(di->hDC, op);
-            HGDIOBJ of = SelectObject(di->hDC, g_font);
-            SetBkMode(di->hDC, TRANSPARENT);
-            SetTextColor(di->hDC, RGB(235, 235, 240));
-            DrawTextW(di->hDC, g_capture ? L"Press..." : L"Change", -1, &r,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(di->hDC, of);
-            return TRUE;
-        }
-        break;
+        EndPaint(hwnd, &ps);
+        return 0;
     }
     case WM_TIMER: {
         Config c = get_cfg();
@@ -980,45 +1150,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else                   { st = 1; txt = L"Controller: connected"; }
         if (st != g_status_state) {
             g_status_state = st;
-            SetWindowTextW(g_status, txt);
-            InvalidateRect(GetDlgItem(hwnd, IDC_ENABLED), NULL, TRUE);
+            wcscpy(g_status_txt, txt);
+            InvalidateRect(hwnd, &kStatusRect, FALSE);
+            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
         }
         return 0;
     }
-    case WM_HSCROLL: {
-        HWND ctl = (HWND)lp;
-        int id = GetDlgCtrlID(ctl);
-        int pos = (int)SendMessageW(ctl, TBM_GETPOS, 0, 0);
-        EnterCriticalSection(&g_cs);
-        if (id == IDC_MOUSE) g_cfg.mouse_sensitivity = pos;
-        else if (id == IDC_SCROLL) g_cfg.scroll_sensitivity = pos / 10.0;
-        else if (id == IDC_DEADZONE) g_cfg.deadzone = pos / 100.0;
-        Config c = g_cfg;
-        LeaveCriticalSection(&g_cs);
-        save_config(c);
-        update_value(id);
-        return 0;
-    }
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDC_ENABLED) {
-            EnterCriticalSection(&g_cs);
-            g_cfg.enabled = !g_cfg.enabled;
-            Config c = g_cfg;
-            LeaveCriticalSection(&g_cs);
-            save_config(c);
-            InvalidateRect((HWND)lp, NULL, TRUE);   // redraw the toggle
-        } else if (LOWORD(wp) == IDC_GAMECHK) {
-            EnterCriticalSection(&g_cs);
-            g_cfg.game_pause = !g_cfg.game_pause;
-            Config c = g_cfg;
-            LeaveCriticalSection(&g_cs);
-            save_config(c);
-            InvalidateRect((HWND)lp, NULL, TRUE);
-        } else if (LOWORD(wp) == IDC_BINDBTN) {
-            g_capture = true;   // worker reports the next pressed button
-            InvalidateRect((HWND)lp, NULL, TRUE);
-        }
-        return 0;
     case WM_GAMEPAD:
         switch (wp) {
         case GP_KB_TOGGLE:    kb_toggle(); break;
@@ -1037,7 +1174,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
-            InvalidateRect(GetDlgItem(hwnd, IDC_ENABLED), NULL, TRUE);
+            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
             break;
         }
         case GP_CAPTURED: {
@@ -1048,7 +1185,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             save_config(c);
             g_capture = false;
             update_bind_text();
-            InvalidateRect(GetDlgItem(hwnd, IDC_BINDBTN), NULL, TRUE);
+            InvalidateRect(hwnd, &kBindBtnRect, FALSE);
             break;
         }
         }
@@ -1078,6 +1215,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, ID_TIMER);
         remove_tray_icon();
         if (g_font) { DeleteObject(g_font); g_font = NULL; }
+        d2d_release_main();
         g_running = false;
         if (g_worker) {
             WaitForSingleObject(g_worker, 1000);
@@ -1105,8 +1243,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     InitializeCriticalSection(&g_cs);
     g_cfg = load_config();
     init_theme();
+    d2d_init_process();
 
-    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
     WNDCLASSW wc = {};
