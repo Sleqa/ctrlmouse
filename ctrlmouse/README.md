@@ -14,6 +14,9 @@ XInput pads.
 | Right stick (up/down) | Scroll wheel |
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
+| Square / X | Play / pause |
+| D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
+| D-pad left / right | Previous / next track |
 | Triangle / Y | Open / close the on-screen keyboard |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |

@@ -188,6 +188,18 @@ static void mouse_button(DWORD flag) {
     SendInput(1, &in, sizeof(in));
 }
 
+// Tap a virtual key. Used for the media keys, which Windows routes to
+// whichever app owns media playback, so this works without knowing about it.
+static void tap_key(WORD vk) {
+    INPUT in[2] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = vk;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = vk;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+
 static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
     if (pressed && !prev) {
         mouse_button(down);
@@ -899,6 +911,11 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
+    // Media controls (D-pad + Square) while the on-screen keyboard is closed.
+    int       media_dir = -1;              // D-pad direction being held
+    ULONGLONG media_t0 = 0, media_last = 0;
+    int       media_reps = 0;              // repeats so far, drives acceleration
+    bool      sq_prev = false;             // Square edge state
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -994,8 +1011,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
             hid_gen_seen = g_hid_gen;
             tri_prev = cross_prev = circ_prev = true;
             tbtn_prev = true;
+            sq_prev = true;
             btn_mask_prev = 0xFFFFFFFFu;
             dpad_prev = st.hat;
+            media_dir = st.hat;
         }
 
         if (g_capture) {
@@ -1077,6 +1096,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
             tri_prev = tri;
 
             if (g_kb_visible) {
+                // Keep the media state in step while the keyboard owns the
+                // D-pad, so closing it with a direction held doesn't fire.
+                media_dir = st.hat;
+                sq_prev = (mask >> 0) & 1;
                 // Keyboard open: buttons drive the keyboard, not the mouse.
                 if (cross && !cross_prev)
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SELECT, 0);
@@ -1101,6 +1124,36 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 a = cross;
                 b = circle;
                 dpad_prev = -1;
+
+                // Media controls. The D-pad only does this while the keyboard
+                // is closed; with it open the same directions move between
+                // keys, which is handled above.
+                bool square = (mask >> 0) & 1;
+                if (square && !sq_prev) tap_key(VK_MEDIA_PLAY_PAUSE);
+                sq_prev = square;
+
+                int dir = st.hat;
+                ULONGLONG tnow = GetTickCount64();
+                if (dir != media_dir) {
+                    media_dir = dir;
+                    media_t0 = media_last = tnow;
+                    media_reps = 0;
+                    if (dir == 0)      tap_key(VK_VOLUME_UP);
+                    else if (dir == 2) tap_key(VK_VOLUME_DOWN);
+                    else if (dir == 1) tap_key(VK_MEDIA_NEXT_TRACK);
+                    else if (dir == 3) tap_key(VK_MEDIA_PREV_TRACK);
+                } else if ((dir == 0 || dir == 2) && tnow - media_t0 >= 350) {
+                    // Hold to keep changing volume, speeding up the longer it
+                    // is held: 140ms between steps down to 40ms. Track skip
+                    // deliberately does not repeat.
+                    ULONGLONG gap = 140 - (ULONGLONG)media_reps * 8;
+                    if (gap < 40) gap = 40;
+                    if (tnow - media_last >= gap) {
+                        tap_key(dir == 0 ? VK_VOLUME_UP : VK_VOLUME_DOWN);
+                        media_last = tnow;
+                        media_reps++;
+                    }
+                }
             }
             cross_prev = cross;
             circ_prev = circle;
@@ -1108,6 +1161,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
             scroll_accum = 0.0;
             tri_prev = cross_prev = circ_prev = false;
             dpad_prev = -1;
+            // Track the pad while paused too, so re-enabling with a button or
+            // direction already held does not fire a media action.
+            media_dir = st.hat;
+            sq_prev = (mask >> 0) & 1;
         }
 
         edge_click(a, a_down, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
@@ -1619,7 +1676,7 @@ static const int kTrackHi[3] = {60, 50, 50};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 360
+#define WIN_H 382
 
 static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
 static const RECT kTrackRect[3] = {
@@ -1649,17 +1706,20 @@ static const RECT kToggleLabel[NTOGGLES] = {
 static const RECT kBindLabelRect = {20, 282, 20 + 100, 282 + 18};
 static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
 static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
-static const RECT kHelpRect[2] = {
+#define NHELP 3
+static const RECT kHelpRect[NHELP] = {
     {20, 314, 20 + 352, 314 + 18},
     {20, 332, 20 + 352, 332 + 18},
+    {20, 350, 20 + 352, 350 + 18},
 };
 
 static const wchar_t* kTrackLabel[3] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
 static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
-static const wchar_t* kHelpText[2] = {
-    L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
-    L"Circle backspace).  Close sends to tray; tray icon to quit."};
+static const wchar_t* kHelpText[NHELP] = {
+    L"D-pad: volume up / down (hold), skip track.   Square: play / pause.",
+    L"Triangle: on-screen keyboard - then D-pad moves, Cross types,",
+    L"Circle backspaces.   Close sends to tray; tray icon to quit."};
 
 // Second line of the status area: whether the pad is actually hidden from
 // other apps, since that silently depends on HidHide being present and on us
@@ -1846,7 +1906,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
                 g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
                                     to_f(kBindLabelRect), g_br_main_dim);
-                for (int i = 0; i < 2; i++)
+                for (int i = 0; i < NHELP; i++)
                     g_rt_main->DrawText(kHelpText[i], (UINT32)wcslen(kHelpText[i]),
                                         g_tf_label, to_f(kHelpRect[i]), g_br_main_dim);
             }
