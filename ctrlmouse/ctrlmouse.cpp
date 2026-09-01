@@ -513,12 +513,21 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     return true;
 }
 
-static bool path_is_dualsense(const wchar_t* p) {
-    std::wstring s(p);
-    for (size_t i = 0; i < s.size(); i++) s[i] = (wchar_t)towlower(s[i]);
-    if (s.find(L"vid_054c") == std::wstring::npos) return false;
-    return s.find(L"pid_0ce6") != std::wstring::npos ||
-           s.find(L"pid_0df2") != std::wstring::npos;
+// Ask the device what it is rather than pattern-matching its path. Path
+// formats differ by transport - USB gives HID\VID_054C&PID_0CE6\..., while
+// Bluetooth gives HID\{00001124-...}_VID&0002054C_PID&0CE6\... - so any
+// string match silently misses one of them. Opening with zero desired access
+// is a query-only open: it always succeeds and never conflicts with an
+// exclusive handle.
+static bool path_is_dualsense(const wchar_t* path) {
+    HANDLE q = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (q == INVALID_HANDLE_VALUE) return false;
+    HIDD_ATTRIBUTES a = {sizeof(a)};
+    bool ok = HidD_GetAttributes(q, &a) != FALSE && a.VendorID == SONY_VID &&
+              (a.ProductID == PID_DUALSENSE || a.ProductID == PID_DUALSENSE_EDGE);
+    CloseHandle(q);
+    return ok;
 }
 
 static bool hid_scan(bool exclusive) {
@@ -1521,10 +1530,18 @@ static const wchar_t* kHelpText[2] = {
 // having been able to whitelist ourselves.
 static const RECT kHideRect = {20, 38, 20 + 344, 38 + 16};
 static const wchar_t* hide_status_text() {
-    if (g_hh == INVALID_HANDLE_VALUE) return L"HidHide not installed - pad stays visible to other apps";
-    if (!g_hh_whitelisted)            return L"HidHide present, but whitelisting failed - try running as admin";
-    if (g_hh_hiding)                  return L"Pad hidden from other apps";
-    return L"HidHide ready - pad hidden while the mapping is on";
+    static wchar_t buf[160];
+    if (g_hh == INVALID_HANDLE_VALUE)
+        return L"HidHide not installed - pad stays visible to other apps";
+    if (!g_hh_whitelisted)
+        return L"HidHide: allow-list write failed - run ctrlmouse as admin once";
+    if (!g_pad_inst_count)
+        return L"HidHide ready, but no DualSense collections found to hide";
+    swprintf(buf, 160, L"HidHide: %s (%d collection%s)",
+             g_hh_hiding ? L"pad hidden from other apps"
+                         : L"ready, hides while mapping is on",
+             g_pad_inst_count, g_pad_inst_count == 1 ? L"" : L"s");
+    return buf;
 }
 
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
