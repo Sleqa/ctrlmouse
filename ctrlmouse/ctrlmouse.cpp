@@ -61,19 +61,29 @@ extern "C" {
     "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // --- Config ----------------------------------------------------------------
+// Every controller action is rebindable. Fullscreen and the launcher are hold
+// actions; the rest act on press or while held.
+enum { F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
+       F_LAUNCHER, F_TOGGLE, F_COUNT };
+static const char* kBindKeyA[F_COUNT] = {
+    "bind_lclick", "bind_rclick", "bind_keyboard", "bind_playpause",
+    "bind_fullscreen", "bind_launcher", "bind_toggle"};
+
 struct Config {
     double mouse_sensitivity;   // pixels per poll at full stick deflection
     double scroll_sensitivity;  // scroll steps per poll at full deflection
     double deadzone;            // fraction of stick travel ignored near centre
     bool   enabled;
-    int    toggle_button;       // controller button that toggles enable/disable
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
     int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F
     double mouse_curve;         // 1 = linear; higher = finer near centre
+    int    bind[F_COUNT];       // controller button per action
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, 0, 2.0};
+// Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad.
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
+                                {1, 2, 3, 0, 0, 9, 13}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -95,7 +105,6 @@ static wchar_t          g_mouse_val_txt[32] = L"";
 static wchar_t          g_scroll_val_txt[32] = L"";
 static wchar_t          g_dz_val_txt[32] = L"";
 static wchar_t          g_curve_val_txt[32] = L"";
-static wchar_t          g_bind_val_txt[32] = L"";
 
 static Config get_cfg() {
     EnterCriticalSection(&g_cs);
@@ -160,15 +169,18 @@ static void save_config(const Config& c) {
             "  \"scroll_sensitivity\": %.3f,\n"
             "  \"deadzone\": %.3f,\n"
             "  \"enabled\": %s,\n"
-            "  \"toggle_button\": %d,\n"
             "  \"game_pause\": %s,\n"
             "  \"fullscreen_key\": %d,\n"
-            "  \"mouse_curve\": %.2f\n"
-            "}\n",
+            "  \"mouse_curve\": %.2f",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
-            c.enabled ? "true" : "false", c.toggle_button,
+            c.enabled ? "true" : "false",
             c.game_pause ? "true" : "false", c.fullscreen_key,
             c.mouse_curve);
+    // Flat keys rather than a nested object: the reader looks each name up
+    // directly, so nesting would buy nothing and cost a real parser.
+    for (int i = 0; i < F_COUNT; i++)
+        fprintf(f, ",\n  \"%s\": %d", kBindKeyA[i], c.bind[i]);
+    fprintf(f, "\n}\n");
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -209,9 +221,15 @@ static Config load_config() {
     parse_double(s, "scroll_sensitivity", c.scroll_sensitivity);
     parse_double(s, "deadzone", c.deadzone);
     parse_bool(s, "enabled", c.enabled);
-    double tb;
-    if (parse_double(s, "toggle_button", tb)) c.toggle_button = (int)tb;
     parse_bool(s, "game_pause", c.game_pause);
+    double tb;
+    // Older configs stored only the toggle under its own name.
+    if (parse_double(s, "toggle_button", tb)) c.bind[F_TOGGLE] = (int)tb;
+    for (int i = 0; i < F_COUNT; i++) {
+        double v;
+        if (parse_double(s, kBindKeyA[i], v) && v >= 0 && v < 32)
+            c.bind[i] = (int)v;
+    }
     double fk;
     if (parse_double(s, "fullscreen_key", fk)) {
         c.fullscreen_key = (int)fk;
@@ -308,6 +326,7 @@ static volatile bool g_lx_visible = false;   // app launcher popup
 static volatile bool g_game_active = false;  // fullscreen game detected
 static volatile bool g_override    = false;  // user forced mapping on in-game
 static volatile bool g_capture     = false;  // waiting for a new bind press
+static volatile int  g_capture_feature = -1; // which action is being rebound
 
 // True when a fullscreen game (or other fullscreen app) is in front. Two cheap
 // checks, no process enumeration: the shell's own notification state (which
@@ -1012,11 +1031,12 @@ static DWORD WINAPI worker_thread(LPVOID) {
     double scroll_accum = 0.0;
     double move_ax = 0.0, move_ay = 0.0;   // sub-pixel cursor remainder
     bool a_down = false, b_down = false;
-    bool tri_prev = false, cross_prev = false, circ_prev = false;
+
     int dpad_prev = -1;
     ULONGLONG dpad_t0 = 0, dpad_last = 0;  // hold-to-repeat timing
-    unsigned btn_mask_prev = 0;            // all-button mask (bind capture)
-    bool tbtn_prev = false;                // toggle-button edge state
+    unsigned btn_mask_prev = 0;            // all-button mask, for edge detection
+    ULONGLONG hold_t0[F_COUNT] = {};       // when each bound button went down
+    bool hold_fired[F_COUNT] = {};         // its hold action already ran
     ULONGLONG tbtn_last_fire = 0;          // debounce reference for the toggle
     ULONGLONG gamechk_last = 0;            // last fullscreen-game check
     bool game_prev = false;                // previous fullscreen-game state
@@ -1031,12 +1051,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     int       media_dir = -1;              // D-pad direction being held
     ULONGLONG media_t0 = 0, media_last = 0;
     int       media_reps = 0;              // repeats so far, drives acceleration
-    bool      sq_prev = false;             // Square edge state
-    ULONGLONG sq_t0 = 0;                   // when Square went down
-    bool      sq_fired = false;            // hold already sent fullscreen
-    bool      opt_prev = false;            // Options edge state
-    ULONGLONG opt_t0 = 0;
-    bool      opt_fired = false;           // hold already opened the launcher
+
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -1086,8 +1101,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // because the button state lives in the OS input stack
                 // rather than in here.
                 edge_click_release_all(a_down, b_down);
-                tri_prev = cross_prev = circ_prev = false;
-                tbtn_prev = false;
+                for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
                 dpad_prev = -1;
                 btn_mask_prev = 0;
                 Sleep(300);
@@ -1111,8 +1125,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             scroll_accum = 0.0;
             move_ax = move_ay = 0.0;
             edge_click_release_all(a_down, b_down);
-            tri_prev = cross_prev = circ_prev = false;
-            tbtn_prev = false;
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
             dpad_prev = -1;
             btn_mask_prev = 0;
             Sleep(300);
@@ -1137,42 +1150,55 @@ static DWORD WINAPI worker_thread(LPVOID) {
         if (g_hid_gen != hid_gen_seen &&
             (g_hid == INVALID_HANDLE_VALUE || g_hid_have_report)) {
             hid_gen_seen = g_hid_gen;
-            int tbi = cfg.toggle_button;
-            tbtn_prev  = (tbi >= 0 && tbi < 32) && ((mask >> tbi) & 1);
-            sq_prev    = (mask >> 0) & 1;
-            sq_fired   = true;
-            opt_prev   = (mask >> 9) & 1;
-            opt_fired  = true;
-            cross_prev = (mask >> 1) & 1;
-            circ_prev  = (mask >> 2) & 1;
-            tri_prev   = (mask >> 3) & 1;
-            btn_mask_prev = mask;
+            btn_mask_prev = mask;              // adopt every button at once
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
             dpad_prev = st.hat;
             media_dir = st.hat;
         }
 
+        // Edge helpers over the raw mask, so every action reads its own bound
+        // button rather than a hard-coded index.
+        unsigned prev_mask = btn_mask_prev;
+        auto bit = [&](int f) {
+            int b = cfg.bind[f];
+            return (b >= 0 && b < 32) ? b : -1;
+        };
+        auto is_down = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && ((mask >> b) & 1) != 0;
+        };
+        auto went_down = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && ((mask >> b) & 1) && !((prev_mask >> b) & 1);
+        };
+        auto went_up = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && !((mask >> b) & 1) && ((prev_mask >> b) & 1);
+        };
+
+        ULONGLONG bnow = GetTickCount64();
+        for (int f = 0; f < F_COUNT; f++) {
+            if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
+            if (went_up(f))   { hold_fired[f] = false; }
+        }
+
         if (g_capture) {
-            // Bind capture: the first newly pressed button becomes the toggle.
-            unsigned fresh = mask & ~btn_mask_prev;
+            // Rebinding: the first newly pressed button is the new binding.
+            unsigned fresh = mask & ~prev_mask;
             if (fresh) {
                 int idx = 0;
                 while (!(fresh & (1u << idx))) idx++;
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_CAPTURED, idx);
             }
         } else {
-            // The enable/disable toggle works even while the mapping is off.
-            int tb = cfg.toggle_button;
-            bool tbtn = (tb >= 0 && tb < 32) && ((mask >> tb) & 1);
-            // Debounce as well as edge-detect. Toggling rebuilds the device
-            // stack, and a touchpad click can bounce; either can present a
-            // second edge within a few tens of milliseconds. No human toggles
-            // deliberately twice that fast, so ignore it.
-            ULONGLONG tb_now = GetTickCount64();
-            if (tbtn && !tbtn_prev && tb_now - tbtn_last_fire >= 300) {
-                tbtn_last_fire = tb_now;
+            // Works even while the mapping is off, so it can turn it back on.
+            // Debounced: toggling rebuilds the device stack and a touchpad
+            // click can bounce, either of which can present a second edge
+            // within a few tens of milliseconds.
+            if (went_down(F_TOGGLE) && bnow - tbtn_last_fire >= 300) {
+                tbtn_last_fire = bnow;
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_TOGGLE, 0);
             }
-            tbtn_prev = tbtn;
         }
         btn_mask_prev = mask;
 
@@ -1196,10 +1222,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
             drop_device();
             hid_close();   // reopened next iteration, in whatever mode it is now in
             edge_click_release_all(a_down, b_down);
-            tri_prev = cross_prev = circ_prev = false;
-            tbtn_prev = false;
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
             dpad_prev = -1;
-            btn_mask_prev = 0;
+            btn_mask_prev = mask;
             game_prev = false;
             Sleep(150);
             continue;
@@ -1254,139 +1279,116 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 scroll_accum = 0.0;
             }
 
-            bool cross  = (mask >> 1) & 1;
-            bool circle = (mask >> 2) & 1;
-            bool tri    = (mask >> 3) & 1;
-
-            if (tri && !tri_prev)
+            if (went_down(F_KEYBOARD))
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
-            tri_prev = tri;
 
-            // Options held opens the app launcher. Checked before the popups
-            // so it works whichever of them is up.
-            bool opt = (mask >> 9) & 1;
-            ULONGLONG opt_now = GetTickCount64();
-            if (opt && !opt_prev) { opt_t0 = opt_now; opt_fired = false; }
-            if (opt && !opt_fired && opt_now - opt_t0 >= 500) {
+            // Launcher is a hold, checked before the popups so it works
+            // whichever of them happens to be up.
+            if (is_down(F_LAUNCHER) && !hold_fired[F_LAUNCHER] &&
+                bnow - hold_t0[F_LAUNCHER] >= 500) {
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_TOGGLE, 0);
-                opt_fired = true;
+                hold_fired[F_LAUNCHER] = true;
             }
-            opt_prev = opt;
 
             if (g_lx_visible) {
-                // Launcher owns the D-pad and Cross while it is up.
+                // Launcher owns navigation and the click buttons while up.
                 media_dir = st.hat;
-                sq_prev = (mask >> 0) & 1;
-                sq_fired = true;
-                if (cross && !cross_prev)
+                if (went_down(F_LCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_SELECT, 0);
-                if (circle && !circ_prev)
+                if (went_down(F_RCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_CLOSE, 0);
                 int dir = st.hat;
-                ULONGLONG tnow = GetTickCount64();
                 if (dir != dpad_prev) {
                     if (dir != -1) {
                         PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
-                        dpad_t0 = dpad_last = tnow;
+                        dpad_t0 = dpad_last = bnow;
                     }
                     dpad_prev = dir;
-                } else if (dir != -1 && tnow - dpad_t0 >= 400 &&
-                           tnow - dpad_last >= 110) {
+                } else if (dir != -1 && bnow - dpad_t0 >= 400 &&
+                           bnow - dpad_last >= 110) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
-                    dpad_last = tnow;
+                    dpad_last = bnow;
                 }
             } else if (g_kb_visible) {
-                // Keep the media state in step while the keyboard owns the
-                // D-pad, so closing it with a direction held doesn't fire.
+                // Keep media state in step while the keyboard owns the D-pad,
+                // so closing it with a direction held doesn't fire.
                 media_dir = st.hat;
-                sq_prev = (mask >> 0) & 1;
-                sq_fired = true;
-                // Keyboard open: buttons drive the keyboard, not the mouse.
-                if (cross && !cross_prev)
+                if (went_down(F_LCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SELECT, 0);
-                if (circle && !circ_prev)
+                if (went_down(F_RCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_BACKSPACE, 0);
                 // D-pad with hold-to-repeat: first move immediately, then
                 // after 400ms repeat every 110ms while held.
                 int dir = st.hat;
-                ULONGLONG tnow = GetTickCount64();
                 if (dir != dpad_prev) {
                     if (dir != -1) {
                         PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_NAV, dir);
-                        dpad_t0 = dpad_last = tnow;
+                        dpad_t0 = dpad_last = bnow;
                     }
                     dpad_prev = dir;
-                } else if (dir != -1 && tnow - dpad_t0 >= 400 &&
-                           tnow - dpad_last >= 110) {
+                } else if (dir != -1 && bnow - dpad_t0 >= 400 &&
+                           bnow - dpad_last >= 110) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_NAV, dir);
-                    dpad_last = tnow;
+                    dpad_last = bnow;
                 }
             } else {
-                a = cross;
-                b = circle;
+                a = is_down(F_LCLICK);
+                b = is_down(F_RCLICK);
                 dpad_prev = -1;
 
-                // Media controls. The D-pad only does this while the keyboard
-                // is closed; with it open the same directions move between
-                // keys, which is handled above.
-                // Square: tap for play/pause, hold for fullscreen. Play/pause
-                // therefore fires on release, since a press alone cannot yet
-                // be told apart from the start of a hold.
-                bool square = (mask >> 0) & 1;
-                ULONGLONG sq_now = GetTickCount64();
-                if (square && !sq_prev) { sq_t0 = sq_now; sq_fired = false; }
-                if (square && !sq_fired && sq_now - sq_t0 >= 600) {
+                // Fullscreen is a hold.
+                if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
+                    bnow - hold_t0[F_FULLSCREEN] >= 600) {
                     send_fullscreen(cfg.fullscreen_key);
-                    sq_fired = true;
+                    hold_fired[F_FULLSCREEN] = true;
                 }
-                if (!square && sq_prev && !sq_fired) tap_key(VK_MEDIA_PLAY_PAUSE);
-                sq_prev = square;
+                // Play/pause is a tap. If it shares a button with fullscreen -
+                // as it does by default - it can only fire on release, once a
+                // hold has been ruled out. On its own button it fires at once.
+                if (cfg.bind[F_PLAYPAUSE] == cfg.bind[F_FULLSCREEN]) {
+                    if (went_up(F_PLAYPAUSE) && !hold_fired[F_FULLSCREEN])
+                        tap_key(VK_MEDIA_PLAY_PAUSE);
+                } else if (went_down(F_PLAYPAUSE)) {
+                    tap_key(VK_MEDIA_PLAY_PAUSE);
+                }
 
-                // Up/down are system-wide volume keys. Left/right send arrow
-                // keys, which is how players (YouTube, VLC, Netflix) seek -
-                // there is no system-wide seek key, so unlike volume these go
-                // to the focused window.
+                // Media on the D-pad: up/down are system-wide volume keys,
+                // left/right send arrow keys, which is how players seek.
                 int dir = st.hat;
                 WORD mk = 0;
                 if (dir == 0)      mk = VK_VOLUME_UP;
                 else if (dir == 2) mk = VK_VOLUME_DOWN;
                 else if (dir == 1) mk = VK_RIGHT;
                 else if (dir == 3) mk = VK_LEFT;
-
-                ULONGLONG tnow = GetTickCount64();
                 if (dir != media_dir) {
                     media_dir = dir;
-                    media_t0 = media_last = tnow;
+                    media_t0 = media_last = bnow;
                     media_reps = 0;
                     if (mk) tap_key(mk);
-                } else if (mk && tnow - media_t0 >= 350) {
-                    // Hold to keep going, speeding up the longer it is held:
-                    // 140ms between steps down to 40ms. Signed on purpose -
-                    // computing this in unsigned made it wrap to a huge value
-                    // once the subtraction went negative, which silently
-                    // stalled the repeat after ~18 steps.
+                } else if (mk && bnow - media_t0 >= 350) {
+                    // Speeds up the longer it is held: 140ms down to 40ms.
+                    // Signed on purpose - in unsigned this wrapped once the
+                    // subtraction went negative and stalled the repeat.
                     int gap = 140 - media_reps * 8;
                     if (gap < 40) gap = 40;
-                    if (tnow - media_last >= (ULONGLONG)gap) {
+                    if (bnow - media_last >= (ULONGLONG)gap) {
                         tap_key(mk);
-                        media_last = tnow;
+                        media_last = bnow;
                         media_reps++;
                     }
                 }
             }
-            cross_prev = cross;
-            circ_prev = circle;
         } else {
             scroll_accum = 0.0;
             move_ax = move_ay = 0.0;
-            tri_prev = cross_prev = circ_prev = false;
             dpad_prev = -1;
-            // Track the pad while paused too, so re-enabling with a button or
-            // direction already held does not fire a media action.
+            // Track the pad while paused too, so re-enabling with something
+            // already held does not fire an action.
             media_dir = st.hat;
-            sq_prev = (mask >> 0) & 1;
-            sq_fired = true;
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
         }
+
+        btn_mask_prev = mask;
 
         edge_click(a, a_down, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
         edge_click(b, b_down, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
@@ -2462,7 +2464,7 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 666
+#define WIN_H 756
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
@@ -2495,9 +2497,6 @@ static const RECT kToggleLabel[NTOGGLES] = {
     {74, 334, 74 + 110, 334 + 18},
     {250, 334, 250 + 114, 334 + 18},
 };
-static const RECT kBindLabelRect = {20, 370, 20 + 100, 370 + 18};
-static const RECT kBindValRect   = {124, 370, 124 + 150, 370 + 18};
-static const RECT kBindBtnRect   = {284, 366, 284 + 80, 366 + 24};
 
 // Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
 // the right answer depends entirely on the app being used.
@@ -2510,25 +2509,38 @@ static const RECT kFsSeg[NFSKEYS] = {
 };
 static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
 
-// Control legend. Each row is an icon of the physical control with the
-// relevant part filled in, so it reads on any pad regardless of what the
-// buttons are called.
-static const RECT kLegendHdr = {20, 446, 20 + 344, 446 + 18};
-#define NLEGEND 6
-#define LEGEND_Y0   474
-#define LEGEND_STEP 27
-// icon kind: 0..3 = face button (top/right/bottom/left), 4 = D-pad vertical,
-// 5 = D-pad horizontal
-static const int kLegendIcon[NLEGEND] = {2, 1, 0, 3, 4, 5};
-static const wchar_t* kLegendText[NLEGEND] = {
-    L"Left click",
-    L"Right click",
-    L"Pop-up keyboard",
-    L"Play / pause   (hold: fullscreen)",
-    L"Volume up / down  (hold)",
-    L"Arrow keys - scrub media  (hold)",
-};
-static const RECT kFooterRect = {20, 636, 20 + 344, 636 + 18};
+// Feature list. Each row is an icon for what the action does, its name, and a
+// button showing the control bound to it - click to rebind. The two D-pad
+// rows are shown for reference and are not rebindable.
+static const RECT kLegendHdr = {20, 416, 20 + 344, 416 + 18};
+#define NROWS 9
+#define ROW_Y0   442
+#define ROW_STEP 30
+// icon kind
+enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB };
+// feature index, or -1 for a fixed row
+static const int kRowFeature[NROWS] = {
+    F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
+    F_LAUNCHER, F_TOGGLE, -1, -1};
+static const int kRowIcon[NROWS] = {
+    IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+    IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB};
+static const wchar_t* kRowName[NROWS] = {
+    L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
+    L"Fullscreen (hold)", L"App launcher (hold)", L"Toggle mapping",
+    L"Volume up / down", L"Seek / scrub"};
+static const wchar_t* kRowFixed[NROWS] = {
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    L"D-pad !91 !93", L"D-pad !90 !92"};
+
+static RECT row_btn_rect(int i) {
+    int y = ROW_Y0 + i * ROW_STEP;
+    RECT r = {248, y, 248 + 116, y + 26};
+    return r;
+}
+
+static const RECT kFooterRect = {20, 726, 20 + 344, 726 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
@@ -2548,6 +2560,106 @@ static const wchar_t* hide_status_text() {
 }
 
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
+
+// --- Feature icons ----------------------------------------------------------
+// Drawn rather than shipped as bitmaps or taken from an icon font: they stay
+// sharp at any DPI, and nothing depends on a particular font being present.
+static void fill_tri(ID2D1RenderTarget* rt, D2D1_POINT_2F a, D2D1_POINT_2F b,
+                     D2D1_POINT_2F c, ID2D1Brush* br) {
+    if (!g_d2d_factory) return;
+    ID2D1PathGeometry* g = NULL;
+    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
+    ID2D1GeometrySink* sink = NULL;
+    if (SUCCEEDED(g->Open(&sink)) && sink) {
+        sink->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
+        D2D1_POINT_2F pts[2] = {b, c};
+        sink->AddLines(pts, 2);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink->Close();
+        sink->Release();
+        rt->FillGeometry(g, br);
+    }
+    g->Release();
+}
+
+static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
+                              int kind, ID2D1Brush* on, ID2D1Brush* off) {
+    switch (kind) {
+    case IC_LCLICK:
+    case IC_RCLICK: {
+        // Mouse body with the pressed button filled.
+        D2D1_RECT_F body = D2D1::RectF(cx - 7, cy - 10, cx + 7, cy + 10);
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(body, 7, 7), off, 1.3f);
+        float split = cy - 2;
+        D2D1_RECT_F half = (kind == IC_LCLICK)
+            ? D2D1::RectF(cx - 6, cy - 9, cx - 0.5f, split)
+            : D2D1::RectF(cx + 0.5f, cy - 9, cx + 6, split);
+        rt->FillRectangle(half, on);
+        rt->DrawLine(D2D1::Point2F(cx - 7, split), D2D1::Point2F(cx + 7, split),
+                     off, 1.2f);
+        break;
+    }
+    case IC_KEYBOARD: {
+        D2D1_RECT_F b = D2D1::RectF(cx - 11, cy - 7, cx + 11, cy + 7);
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(b, 3, 3), off, 1.3f);
+        for (int r = 0; r < 2; r++)
+            for (int c = 0; c < 4; c++)
+                rt->FillRectangle(
+                    D2D1::RectF(cx - 8 + c * 5, cy - 4 + r * 5,
+                                cx - 5.5f + c * 5, cy - 1.5f + r * 5), on);
+        break;
+    }
+    case IC_PLAY: {
+        fill_tri(rt, D2D1::Point2F(cx - 9, cy - 7), D2D1::Point2F(cx - 9, cy + 7),
+                 D2D1::Point2F(cx - 1, cy), on);
+        rt->FillRectangle(D2D1::RectF(cx + 3, cy - 7, cx + 5, cy + 7), on);
+        rt->FillRectangle(D2D1::RectF(cx + 7, cy - 7, cx + 9, cy + 7), on);
+        break;
+    }
+    case IC_FULLSCREEN: {
+        // Four corner brackets.
+        const float o = 9, t = 1.6f, l = 5;
+        D2D1_RECT_F r[8] = {
+            {cx - o, cy - o, cx - o + l, cy - o + t},
+            {cx - o, cy - o, cx - o + t, cy - o + l},
+            {cx + o - l, cy - o, cx + o, cy - o + t},
+            {cx + o - t, cy - o, cx + o, cy - o + l},
+            {cx - o, cy + o - t, cx - o + l, cy + o},
+            {cx - o, cy + o - l, cx - o + t, cy + o},
+            {cx + o - l, cy + o - t, cx + o, cy + o},
+            {cx + o - t, cy + o - l, cx + o, cy + o}};
+        for (int i = 0; i < 8; i++) rt->FillRectangle(r[i], on);
+        break;
+    }
+    case IC_LAUNCHER: {
+        for (int i = 0; i < 4; i++) {
+            float x = cx - 9 + (i % 2) * 10, y = cy - 9 + (i / 2) * 10;
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(x, y, x + 8, y + 8), 2, 2), on);
+        }
+        break;
+    }
+    case IC_POWER: {
+        rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 1), 8, 8), off, 1.4f);
+        rt->FillRectangle(D2D1::RectF(cx - 1, cy - 10, cx + 1, cy - 1), on);
+        break;
+    }
+    case IC_VOLUME: {
+        rt->FillRectangle(D2D1::RectF(cx - 10, cy - 3, cx - 5, cy + 3), on);
+        fill_tri(rt, D2D1::Point2F(cx - 5, cy - 8), D2D1::Point2F(cx - 5, cy + 8),
+                 D2D1::Point2F(cx + 1, cy), on);
+        rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx + 1, cy), 6, 6), off, 1.3f);
+        break;
+    }
+    case IC_SCRUB: {
+        fill_tri(rt, D2D1::Point2F(cx - 2, cy - 7), D2D1::Point2F(cx - 2, cy + 7),
+                 D2D1::Point2F(cx - 10, cy), on);
+        fill_tri(rt, D2D1::Point2F(cx + 2, cy - 7), D2D1::Point2F(cx + 2, cy + 7),
+                 D2D1::Point2F(cx + 10, cy), on);
+        break;
+    }
+    }
+}
 
 // --- Control legend icons ---------------------------------------------------
 // Drawn rather than shipped as bitmaps: they stay sharp at any DPI, and a
@@ -2602,15 +2714,14 @@ static void update_value(int idx) {
     if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
-static void update_bind_text() {
-    // DualSense / DualShock DirectInput button names for the common indices.
+// DualSense / DualShock DirectInput button names for the common indices.
+static void button_name(int b, wchar_t* out, size_t n) {
     static const wchar_t* names[] = {
         L"Square", L"Cross", L"Circle", L"Triangle", L"L1", L"R1", L"L2",
         L"R2", L"Create", L"Options", L"L3", L"R3", L"PS", L"Touchpad"};
-    int b = get_cfg().toggle_button;
-    if (b >= 0 && b < 14) swprintf(g_bind_val_txt, 32, L"%s", names[b]);
-    else swprintf(g_bind_val_txt, 32, L"Button %d", b);
-    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+    if (b >= 0 && b < 14) swprintf(out, n, L"%s", names[b]);
+    else if (b >= 0)      swprintf(out, n, L"Button %d", b);
+    else                  swprintf(out, n, L"Unbound");
 }
 
 // Current trackbar position (in the same integer units the old TBM_* range
@@ -2657,7 +2768,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         update_value(TRK_SCROLL);
         update_value(TRK_DEADZONE);
         update_value(TRK_CURVE);
-        update_bind_text();
         SetTimer(hwnd, ID_TIMER, 500, NULL);
         return 0;
     }
@@ -2686,7 +2796,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        if (PtInRect(&kBindBtnRect, pt)) {
+        for (int i = 0; i < NROWS; i++) {
+            int f = kRowFeature[i];
+            if (f < 0) continue;
+            RECT br = row_btn_rect(i);
+            if (!PtInRect(&br, pt)) continue;
+            g_capture_feature = f;
             g_capture = true;   // worker reports the next pressed button
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
@@ -2730,6 +2845,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_rt_main) {
             g_rt_main->BeginDraw();
             g_rt_main->Clear(d2d_clr(KB_CLR_BG));
+            Config c = get_cfg();
 
             // Status label (4-state color, same logic as before).
             COLORREF sc = RGB(240, 110, 110);
@@ -2753,8 +2869,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 for (int i = 0; i < NTOGGLES; i++)
                     g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
-                g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
-                                    to_f(kBindLabelRect), g_br_main_dim);
                 g_rt_main->DrawText(L"Fullscreen", 10, g_tf_label,
                                     to_f(kFsLabelRect), g_br_main_dim);
                 g_rt_main->DrawText(L"Controls", 8, g_tf_label,
@@ -2763,24 +2877,40 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     g_tf_label, to_f(kFooterRect), g_br_main_dim);
             }
 
-            // Control legend: icon of the physical control, then what it does.
-            for (int i = 0; i < NLEGEND; i++) {
-                float cy = (float)(LEGEND_Y0 + i * LEGEND_STEP) + 9.0f;
-                if (kLegendIcon[i] < 4)
-                    draw_face_icon(g_rt_main, 32.0f, cy, kLegendIcon[i],
-                                   g_br_main_sel, g_br_main_dim);
-                else
-                    draw_dpad_icon(g_rt_main, 32.0f, cy, kLegendIcon[i] == 4,
-                                   g_br_main_sel, g_br_main_key);
+            // Feature rows: icon, name, and the control bound to it.
+            for (int i = 0; i < NROWS; i++) {
+                float cy = (float)(ROW_Y0 + i * ROW_STEP) + 13.0f;
+                int f = kRowFeature[i];
+                draw_feature_icon(g_rt_main, 34.0f, cy, kRowIcon[i],
+                                  g_br_main_sel, g_br_main_dim);
                 if (g_tf_label) {
-                    RECT tr = {58, LEGEND_Y0 + i * LEGEND_STEP,
-                               58 + 306, LEGEND_Y0 + i * LEGEND_STEP + 18};
-                    g_rt_main->DrawText(kLegendText[i], (UINT32)wcslen(kLegendText[i]),
-                                        g_tf_label, to_f(tr), g_br_main_text);
+                    RECT nr = {58, ROW_Y0 + i * ROW_STEP + 4,
+                               58 + 184, ROW_Y0 + i * ROW_STEP + 22};
+                    g_rt_main->DrawText(kRowName[i], (UINT32)wcslen(kRowName[i]),
+                                        g_tf_label, to_f(nr), g_br_main_text);
+                }
+                RECT br = row_btn_rect(i);
+                bool capturing = (g_capture && g_capture_feature == f && f >= 0);
+                if (f >= 0)
+                    draw_control(g_rt_main, to_f(br), 6.0f,
+                                 capturing ? g_br_main_armed : g_br_main_key,
+                                 NULL);
+                if (g_tf_body) {
+                    const wchar_t* t = kRowFixed[i];
+                    wchar_t buf[32];
+                    if (f >= 0) {
+                        if (capturing) t = L"Press a button";
+                        else { button_name(c.bind[f], buf, 32); t = buf; }
+                    }
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body,
+                                        to_f(br),
+                                        f >= 0 ? g_br_main_text : g_br_main_dim);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             }
 
-            // Trackbars: rounded channel + accent fill + round thumb.
+            // Trackbars: rounded channel            // Trackbars: rounded channel + accent fill + round thumb.
             for (int i = 0; i < NTRACKS; i++) {
                 const RECT& r = kTrackRect[i];
                 float left = (float)r.left, right = (float)r.right;
@@ -2825,7 +2955,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             // Toggle switches: pill track + sliding white knob.
-            Config c = get_cfg();
             bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause};
             for (int i = 0; i < NTOGGLES; i++) {
                 const RECT& r = kToggleRect[i];
@@ -2844,28 +2973,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     toggle_on[i] ? (ID2D1Brush*)g_br_main_onacc : g_br_main_white);
             }
 
-            // Bind button + its value text.
-            {
-                const RECT& r = kBindBtnRect;
-                g_rt_main->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
-                                                  (float)r.right, (float)r.bottom), 10.0f, 10.0f),
-                    g_capture ? g_br_main_armed : g_br_main_key);
-                if (g_tf_body) {
-                    D2D1_RECT_F rf = D2D1::RectF((float)r.left, (float)r.top,
-                                                 (float)r.right, (float)r.bottom);
-                    const wchar_t* t = g_capture ? L"Press..." : L"Change";
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body, rf, g_br_main_text);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
-            }
-            if (g_tf_body) {
-                D2D1_RECT_F r = D2D1::RectF((float)kBindValRect.left, (float)kBindValRect.top,
-                                            (float)kBindValRect.right, (float)kBindValRect.bottom);
-                g_rt_main->DrawText(g_bind_val_txt, (UINT32)wcslen(g_bind_val_txt),
-                                    g_tf_body, r, g_br_main_text);
-            }
 
             // Fullscreen shortcut picker: selected segment is filled, the
             // others are outlined.
@@ -2988,13 +3095,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case GP_CAPTURED: {
-            EnterCriticalSection(&g_cs);
-            g_cfg.toggle_button = (int)lp;
-            Config c = g_cfg;
-            LeaveCriticalSection(&g_cs);
-            save_config(c);
+            int f = g_capture_feature;
+            if (f >= 0 && f < F_COUNT) {
+                EnterCriticalSection(&g_cs);
+                g_cfg.bind[f] = (int)lp;
+                Config c = g_cfg;
+                LeaveCriticalSection(&g_cs);
+                save_config(c);
+            }
             g_capture = false;
-            update_bind_text();
+            g_capture_feature = -1;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         }

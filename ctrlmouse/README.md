@@ -8,6 +8,9 @@ XInput pads.
 
 ## Controls
 
+Every action below is rebindable from the settings window — click the button
+beside it and press a controller button. The D-pad media bindings are fixed.
+
 | Controller | Action |
 |---|---|
 | Left stick | Move the mouse cursor |
@@ -93,7 +96,7 @@ line). Settings written by older builds are moved there on first run.
 | `scroll_sensitivity` | Scroll speed at full deflection | `1.0` |
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
-| `toggle_button` | Controller button index for the toggle bind | `13` (touchpad) |
+| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` | Controller button index per action; rebindable from the settings window | `1, 2, 3, 0, 0, 9, 13` |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F | `0` |
