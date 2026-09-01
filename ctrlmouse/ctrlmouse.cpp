@@ -585,6 +585,10 @@ static bool     g_hid_bt = false;          // Bluetooth transport (vs USB)
 // Bumped on every (re)open. The worker uses it to tell that its edge-detection
 // state refers to a handle that no longer exists.
 static unsigned g_hid_gen = 0;
+// False until a genuine report has been parsed on the current handle. Until
+// then hid_poll can only hand back the zeroed placeholder from the open, which
+// must not be mistaken for "every button released".
+static bool     g_hid_have_report = false;
 
 static void hid_close() {
     if (g_hid != INVALID_HANDLE_VALUE) {
@@ -641,6 +645,7 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     memset(&g_hid_state, 0, sizeof(g_hid_state));
     g_hid_state.hat = -1;
     g_hid_gen++;
+    g_hid_have_report = false;
     return true;
 }
 
@@ -786,7 +791,7 @@ static bool hid_poll(PadState& out) {
         DWORD got = 0;
         if (!GetOverlappedResult(g_hid, &g_hid_ov, &got, FALSE)) { alive = false; break; }
         g_hid_pending = false;
-        hid_parse(g_hid_buf, got, g_hid_state);
+        if (hid_parse(g_hid_buf, got, g_hid_state)) g_hid_have_report = true;
     }
     if (!alive) { hid_close(); return false; }
     out = g_hid_state;
@@ -902,6 +907,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     ULONGLONG dpad_t0 = 0, dpad_last = 0;  // hold-to-repeat timing
     unsigned btn_mask_prev = 0;            // all-button mask (bind capture)
     bool tbtn_prev = false;                // toggle-button edge state
+    ULONGLONG tbtn_last_fire = 0;          // debounce reference for the toggle
     ULONGLONG gamechk_last = 0;            // last fullscreen-game check
     bool game_prev = false;                // previous fullscreen-game state
     // Whether the pad should be held exclusively right now. Computed at the
@@ -1007,12 +1013,21 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // while the touchpad is still physically down. Treat everything as
         // already-held; these clear themselves on the first poll that shows a
         // button released.
-        if (g_hid_gen != hid_gen_seen) {
+        // Wait for a genuine report before reconciling, then adopt exactly
+        // what the pad currently reads. Adopting the real state (rather than
+        // assuming everything is held) means a button spanning the reopen
+        // produces no edge, while one released during it still works on its
+        // next press.
+        if (g_hid_gen != hid_gen_seen &&
+            (g_hid == INVALID_HANDLE_VALUE || g_hid_have_report)) {
             hid_gen_seen = g_hid_gen;
-            tri_prev = cross_prev = circ_prev = true;
-            tbtn_prev = true;
-            sq_prev = true;
-            btn_mask_prev = 0xFFFFFFFFu;
+            int tbi = cfg.toggle_button;
+            tbtn_prev  = (tbi >= 0 && tbi < 32) && ((mask >> tbi) & 1);
+            sq_prev    = (mask >> 0) & 1;
+            cross_prev = (mask >> 1) & 1;
+            circ_prev  = (mask >> 2) & 1;
+            tri_prev   = (mask >> 3) & 1;
+            btn_mask_prev = mask;
             dpad_prev = st.hat;
             media_dir = st.hat;
         }
@@ -1029,8 +1044,15 @@ static DWORD WINAPI worker_thread(LPVOID) {
             // The enable/disable toggle works even while the mapping is off.
             int tb = cfg.toggle_button;
             bool tbtn = (tb >= 0 && tb < 32) && ((mask >> tb) & 1);
-            if (tbtn && !tbtn_prev)
+            // Debounce as well as edge-detect. Toggling rebuilds the device
+            // stack, and a touchpad click can bounce; either can present a
+            // second edge within a few tens of milliseconds. No human toggles
+            // deliberately twice that fast, so ignore it.
+            ULONGLONG tb_now = GetTickCount64();
+            if (tbtn && !tbtn_prev && tb_now - tbtn_last_fire >= 300) {
+                tbtn_last_fire = tb_now;
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_TOGGLE, 0);
+            }
             tbtn_prev = tbtn;
         }
         btn_mask_prev = mask;
