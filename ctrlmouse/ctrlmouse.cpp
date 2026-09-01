@@ -62,10 +62,11 @@ struct Config {
     bool   enabled;
     int    toggle_button;       // controller button that toggles enable/disable
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
+    int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true};
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, 0};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -116,11 +117,12 @@ static void save_config(const Config& c) {
             "  \"deadzone\": %.3f,\n"
             "  \"enabled\": %s,\n"
             "  \"toggle_button\": %d,\n"
-            "  \"game_pause\": %s\n"
+            "  \"game_pause\": %s,\n"
+            "  \"fullscreen_key\": %d\n"
             "}\n",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false", c.toggle_button,
-            c.game_pause ? "true" : "false");
+            c.game_pause ? "true" : "false", c.fullscreen_key);
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -164,6 +166,11 @@ static Config load_config() {
     double tb;
     if (parse_double(s, "toggle_button", tb)) c.toggle_button = (int)tb;
     parse_bool(s, "game_pause", c.game_pause);
+    double fk;
+    if (parse_double(s, "fullscreen_key", fk)) {
+        c.fullscreen_key = (int)fk;
+        if (c.fullscreen_key < 0 || c.fullscreen_key > 2) c.fullscreen_key = 0;
+    }
     return c;
 }
 
@@ -202,6 +209,23 @@ static void tap_key(WORD vk) {
     in[1].ki.wVk = vk;
     in[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, in, sizeof(INPUT));
+}
+
+// Fullscreen has no system-wide key, so this sends whichever shortcut the
+// user's player actually uses.
+static void send_fullscreen(int which) {
+    if (which == 1) {   // Alt+Enter
+        INPUT in[4] = {};
+        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_MENU;
+        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_RETURN;
+        in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = VK_RETURN;
+        in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_MENU;
+        in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(4, in, sizeof(INPUT));
+    } else {
+        tap_key(which == 2 ? 'F' : VK_F11);
+    }
 }
 
 static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
@@ -956,6 +980,8 @@ static DWORD WINAPI worker_thread(LPVOID) {
     ULONGLONG media_t0 = 0, media_last = 0;
     int       media_reps = 0;              // repeats so far, drives acceleration
     bool      sq_prev = false;             // Square edge state
+    ULONGLONG sq_t0 = 0;                   // when Square went down
+    bool      sq_fired = false;            // hold already sent fullscreen
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -1058,6 +1084,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             int tbi = cfg.toggle_button;
             tbtn_prev  = (tbi >= 0 && tbi < 32) && ((mask >> tbi) & 1);
             sq_prev    = (mask >> 0) & 1;
+            sq_fired   = true;
             cross_prev = (mask >> 1) & 1;
             circ_prev  = (mask >> 2) & 1;
             tri_prev   = (mask >> 3) & 1;
@@ -1156,6 +1183,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // D-pad, so closing it with a direction held doesn't fire.
                 media_dir = st.hat;
                 sq_prev = (mask >> 0) & 1;
+                sq_fired = true;
                 // Keyboard open: buttons drive the keyboard, not the mouse.
                 if (cross && !cross_prev)
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SELECT, 0);
@@ -1184,8 +1212,17 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // Media controls. The D-pad only does this while the keyboard
                 // is closed; with it open the same directions move between
                 // keys, which is handled above.
+                // Square: tap for play/pause, hold for fullscreen. Play/pause
+                // therefore fires on release, since a press alone cannot yet
+                // be told apart from the start of a hold.
                 bool square = (mask >> 0) & 1;
-                if (square && !sq_prev) tap_key(VK_MEDIA_PLAY_PAUSE);
+                ULONGLONG sq_now = GetTickCount64();
+                if (square && !sq_prev) { sq_t0 = sq_now; sq_fired = false; }
+                if (square && !sq_fired && sq_now - sq_t0 >= 600) {
+                    send_fullscreen(cfg.fullscreen_key);
+                    sq_fired = true;
+                }
+                if (!square && sq_prev && !sq_fired) tap_key(VK_MEDIA_PLAY_PAUSE);
                 sq_prev = square;
 
                 // Up/down are system-wide volume keys. Left/right send arrow
@@ -1230,6 +1267,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             // direction already held does not fire a media action.
             media_dir = st.hat;
             sq_prev = (mask >> 0) & 1;
+            sq_fired = true;
         }
 
         edge_click(a, a_down, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
@@ -1342,6 +1380,7 @@ static int       g_kb_x = 0, g_kb_y = 0;  // resting position
 #define KB_ANIM_MS  160
 #define KB_PULSE_MS 140
 #define KB_SLIDE    26
+#define KB_BREATH_MS 2200   // glow breathing cycle
 
 static void init_theme() {
     g_kb_bg = CreateSolidBrush(KB_CLR_BG);
@@ -1549,8 +1588,8 @@ static bool d2d_create_kb(HWND hwnd) {
         {0.42f, D2D1::ColorF(1, 1, 1, 0.018f)},
         {1.0f, D2D1::ColorF(1, 1, 1, 0.0f)}};
     D2D1_GRADIENT_STOP edge[3] = {
-        {0.0f, D2D1::ColorF(1, 1, 1, 0.50f)},
-        {0.30f, D2D1::ColorF(1, 1, 1, 0.07f)},
+        {0.0f, D2D1::ColorF(1, 1, 1, 0.32f)},
+        {0.30f, D2D1::ColorF(1, 1, 1, 0.05f)},
         {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
     D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(12, 12, 15))},
                                   {1.0f, d2d_clr(KB_CLR_BG)}};
@@ -1642,7 +1681,15 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else g_kb_pulse_t0 = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        if (!active) KillTimer(hwnd, KB_TIMER);
+        // While the keyboard is up, keep ticking so the selection glow can
+        // breathe; drop to a slower rate once the open/close animation and the
+        // key flash are done, since nothing else needs frame-rate updates.
+        if (!active && g_kb_visible) {
+            SetTimer(hwnd, KB_TIMER, 33, NULL);
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (!active) {
+            KillTimer(hwnd, KB_TIMER);
+        }
         return 0;
     }
     case WM_ERASEBKGND:
@@ -1691,10 +1738,17 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
 
                     // Glow sits outside the key, so the selection reads as
-                    // light spilling around it rather than a repaint.
-                    if (sel)
-                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, KB_RADIUS, 10.0f,
-                                      0.30f + 0.40f * flash, 4);
+                    // light spilling around it rather than a repaint. It
+                    // breathes: the spread eases down and back to full size on
+                    // a slow cycle, which keeps the eye on the cursor without
+                    // anything moving.
+                    if (sel) {
+                        double ph = (double)(GetTickCount64() % KB_BREATH_MS)
+                                    / KB_BREATH_MS;
+                        float b = 0.72f + 0.28f * (float)((1.0 + cos(ph * 6.2831853)) * 0.5);
+                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, KB_RADIUS,
+                                      10.0f * b, (0.26f + 0.40f * flash) * b, 4);
+                    }
 
                     // Face: same dark gradient whether selected or not.
                     ID2D1LinearGradientBrush* fill =
@@ -1725,10 +1779,17 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     } else if (armed) {
                         tb = g_br_kb_sel;
                     }
+                    // Letters follow the Shift state, so the keyboard shows
+                    // what will actually be typed.
+                    const wchar_t* lab = KB_ROWS[r][i].label;
+                    wchar_t lower[2];
+                    if (!g_kb_shift && lab[0] >= L'A' && lab[0] <= L'Z' && !lab[1]) {
+                        lower[0] = (wchar_t)towlower(lab[0]);
+                        lower[1] = 0;
+                        lab = lower;
+                    }
                     if (g_tf_key)
-                        g_rt_kb->DrawText(KB_ROWS[r][i].label,
-                                          (UINT32)wcslen(KB_ROWS[r][i].label),
-                                          g_tf_key, kf, tb);
+                        g_rt_kb->DrawText(lab, (UINT32)wcslen(lab), g_tf_key, kf, tb);
                 }
             }
 
@@ -1850,7 +1911,7 @@ static const int kTrackHi[3] = {60, 50, 50};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 562
+#define WIN_H 604
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
@@ -1884,12 +1945,23 @@ static const RECT kBindLabelRect = {20, 308, 20 + 100, 308 + 18};
 static const RECT kBindValRect   = {124, 308, 124 + 150, 308 + 18};
 static const RECT kBindBtnRect   = {284, 304, 284 + 80, 304 + 24};
 
+// Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
+// the right answer depends entirely on the app being used.
+static const RECT kFsLabelRect = {20, 344, 20 + 100, 344 + 18};
+#define NFSKEYS 3
+static const RECT kFsSeg[NFSKEYS] = {
+    {124, 340, 124 + 76, 340 + 26},
+    {206, 340, 206 + 76, 340 + 26},
+    {288, 340, 288 + 76, 340 + 26},
+};
+static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
+
 // Control legend. Each row is an icon of the physical control with the
 // relevant part filled in, so it reads on any pad regardless of what the
 // buttons are called.
-static const RECT kLegendHdr = {20, 344, 20 + 344, 344 + 18};
+static const RECT kLegendHdr = {20, 384, 20 + 344, 384 + 18};
 #define NLEGEND 6
-#define LEGEND_Y0   372
+#define LEGEND_Y0   412
 #define LEGEND_STEP 27
 // icon kind: 0..3 = face button (top/right/bottom/left), 4 = D-pad vertical,
 // 5 = D-pad horizontal
@@ -1898,11 +1970,11 @@ static const wchar_t* kLegendText[NLEGEND] = {
     L"Left click",
     L"Right click",
     L"Pop-up keyboard",
-    L"Play / pause",
+    L"Play / pause   (hold: fullscreen)",
     L"Volume up / down  (hold)",
     L"Arrow keys - scrub media  (hold)",
 };
-static const RECT kFooterRect = {20, 532, 20 + 344, 532 + 18};
+static const RECT kFooterRect = {20, 574, 20 + 344, 574 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
@@ -2062,6 +2134,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        for (int i = 0; i < NFSKEYS; i++) {
+            if (!PtInRect(&kFsSeg[i], pt)) continue;
+            EnterCriticalSection(&g_cs);
+            g_cfg.fullscreen_key = i;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&kHidBtnRect, pt)) {
             // Open the download page only; installing a driver is the user's
             // decision to make in their own browser.
@@ -2116,6 +2198,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
                 g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
                                     to_f(kBindLabelRect), g_br_main_dim);
+                g_rt_main->DrawText(L"Fullscreen", 10, g_tf_label,
+                                    to_f(kFsLabelRect), g_br_main_dim);
                 g_rt_main->DrawText(L"Controls", 8, g_tf_label,
                                     to_f(kLegendHdr), g_br_main_text);
                 g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
@@ -2220,6 +2304,23 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                             (float)kBindValRect.right, (float)kBindValRect.bottom);
                 g_rt_main->DrawText(g_bind_val_txt, (UINT32)wcslen(g_bind_val_txt),
                                     g_tf_body, r, g_br_main_text);
+            }
+
+            // Fullscreen shortcut picker: selected segment is filled, the
+            // others are outlined.
+            for (int i = 0; i < NFSKEYS; i++) {
+                D2D1_ROUNDED_RECT rr =
+                    D2D1::RoundedRect(to_f(kFsSeg[i]), 8.0f, 8.0f);
+                bool on = (c.fullscreen_key == i);
+                if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
+                else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(kFsName[i], (UINT32)wcslen(kFsName[i]),
+                                        g_tf_body, to_f(kFsSeg[i]),
+                                        on ? g_br_main_white : g_br_main_dim);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
             }
 
             // Install button, only while HidHide is missing.

@@ -14,7 +14,7 @@ XInput pads.
 | Right stick (up/down) | Scroll wheel (stick up scrolls down) |
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
-| Square / X | Play / pause |
+| Square / X | Play / pause — **hold** for fullscreen |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
@@ -86,6 +86,7 @@ Settings are saved automatically to `config.json` beside the exe:
 | `enabled` | Master on/off | `true` |
 | `toggle_button` | Controller button index for the toggle bind | `13` (touchpad) |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
+| `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F | `0` |
 
 ## License
 
