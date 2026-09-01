@@ -44,6 +44,7 @@ extern "C" {
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -267,6 +268,7 @@ static int          g_pad_inst_count = 0;
 #define HH_CTL(n)      CTL_CODE(32769, (n), METHOD_BUFFERED, FILE_READ_DATA)
 #define HH_GET_WHITELIST          HH_CTL(2048)
 #define HH_SET_WHITELIST          HH_CTL(2049)
+#define HH_GET_ACTIVE             HH_CTL(2052)
 #define HH_SET_ACTIVE             HH_CTL(2053)
 #define HH_ADD_SESSION_BLACKLIST  HH_CTL(2056)
 #define HH_CLR_SESSION_BLACKLIST  HH_CTL(2057)
@@ -275,6 +277,16 @@ static int          g_pad_inst_count = 0;
 static HANDLE g_hh = INVALID_HANDLE_VALUE;
 static bool   g_hh_whitelisted = false;   // are we allowed to see hidden pads?
 static bool   g_hh_hiding = false;        // is the pad currently hidden?
+
+static bool is_elevated() {
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el = {};
+    DWORD sz = 0;
+    BOOL ok = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &sz);
+    CloseHandle(tok);
+    return ok && el.TokenIsElevated;
+}
 
 static bool hh_present() {
     HANDLE h = CreateFileW(HH_DEVICE_PATH, GENERIC_READ,
@@ -370,27 +382,41 @@ static bool hh_whitelist_self() {
 // Hide every DualSense collection from other software, for this session only.
 // Session entries are owned by this process and the driver drops them if we
 // exit or crash, so the pad can never be left hidden.
+static BOOLEAN g_hh_prev_active = FALSE;
+static bool    g_hh_changed_active = false;
+
 static bool hh_hide(bool on) {
     if (g_hh == INVALID_HANDLE_VALUE || on == g_hh_hiding) return true;
+    DWORD ret = 0;
     if (!on) {
         std::wstring empty;
         empty.push_back(L'\0');
         hh_ioctl(HH_CLR_SESSION_BLACKLIST, empty);
-        BOOLEAN active = FALSE;
-        DWORD ret = 0;
-        DeviceIoControl(g_hh, HH_SET_ACTIVE, &active, sizeof(active),
-                        NULL, 0, &ret, NULL);
+        // Only put the global switch back if we were the ones who turned it
+        // on. The user may be hiding other devices with it, and forcing it off
+        // would silently break their own HidHide setup.
+        if (g_hh_changed_active) {
+            DeviceIoControl(g_hh, HH_SET_ACTIVE, &g_hh_prev_active,
+                            sizeof(g_hh_prev_active), NULL, 0, &ret, NULL);
+            g_hh_changed_active = false;
+        }
         g_hh_hiding = false;
         return true;
     }
     if (!g_hh_whitelisted || !g_pad_inst_count) return false;
     std::wstring payload = hh_multi_sz(g_pad_inst, g_pad_inst_count);
     if (!hh_ioctl(HH_ADD_SESSION_BLACKLIST, payload)) return false;
-    BOOLEAN active = TRUE;
-    DWORD ret = 0;
-    if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &active, sizeof(active),
-                         NULL, 0, &ret, NULL))
-        return false;
+
+    BOOLEAN active = FALSE;
+    if (DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &active, sizeof(active),
+                        &ret, NULL) && !active) {
+        BOOLEAN on_val = TRUE;
+        if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &on_val, sizeof(on_val),
+                             NULL, 0, &ret, NULL))
+            return false;
+        g_hh_prev_active = active;
+        g_hh_changed_active = true;
+    }
     g_hh_hiding = true;
     return true;
 }
@@ -428,6 +454,7 @@ static bool     g_hid_pending = false;
 static USHORT   g_hid_inlen = 0;
 static PadState g_hid_state = {};
 static bool     g_hid_exclusive = false;   // did we actually get exclusive access?
+static bool     g_hid_bt = false;          // Bluetooth transport (vs USB)
 
 static void hid_close() {
     if (g_hid != INVALID_HANDLE_VALUE) {
@@ -468,6 +495,17 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     g_hid = h;
     g_hid_inlen = caps.InputReportByteLength;
     if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
+    // Transport decides how a report ID of 0x01 is laid out, and it cannot be
+    // inferred from the size of a received report: HID ReadFile always returns
+    // the full advertised report length, zero-padded, so a 10-byte Bluetooth
+    // report arrives as 78 bytes. A DualSense advertises 64-byte input reports
+    // over USB and 78 over Bluetooth.
+    g_hid_bt = caps.InputReportByteLength > 64;
+    {
+        std::wstring p(path);
+        for (size_t i = 0; i < p.size(); i++) p[i] = (wchar_t)towlower(p[i]);
+        if (p.find(L"bth") != std::wstring::npos) g_hid_bt = true;
+    }
     g_hid_ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_hid_pending = false;
     memset(&g_hid_state, 0, sizeof(g_hid_state));
@@ -567,7 +605,10 @@ static void hid_buttons(const BYTE* b, PadState& st) {
 // Bluetooth 0x01 report orders its fields differently.
 static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
     if (len < 10) return false;
-    if (buf[0] == 0x01 && len < 40) {          // Bluetooth basic (10 bytes)
+    if (buf[0] == 0x01 && g_hid_bt) {          // Bluetooth basic
+        // Same axis offsets as the USB layout, but the button bytes sit three
+        // earlier - which is why getting this branch wrong leaves the sticks
+        // working and every button dead.
         st.lx = hid_axis(buf[1]);
         st.ly = hid_axis(buf[2]);
         st.rx = hid_axis(buf[3]);
@@ -727,6 +768,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     // while we are actually driving the mouse and is handed straight back the
     // moment the mapping is switched off or pauses for a game.
     bool want_exclusive = false;
+    int  open_fail_streak = 0;             // consecutive failures to see any pad
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -746,9 +788,18 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 g_connected = false;
                 scroll_accum = 0.0;
                 edge_click_release_all(a_down, b_down);
+                // If we are hiding the pad and can no longer see it either,
+                // the whitelist is not doing its job - unhide rather than sit
+                // there having made the controller invisible to everyone.
+                if (g_hh_hiding && ++open_fail_streak >= 8) {
+                    hh_hide(false);
+                    g_hh_whitelisted = false;   // stop re-hiding until restart
+                    open_fail_streak = 0;
+                }
                 Sleep(400);
                 continue;
             }
+            open_fail_streak = 0;
             DIJOYSTATE2 js;
             HRESULT hr = g_dev->Poll();
             if (FAILED(hr)) {
@@ -1956,6 +2007,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // ourselves. Requires elevation, and failing is not fatal.
     if (hh_open()) {
         g_hh_whitelisted = hh_whitelist_self();
+        // Writing HidHide's whitelist needs elevation. Rather than force a UAC
+        // prompt on every launch with a manifest, ask only when we actually
+        // needed it and did not have it.
+        if (!g_hh_whitelisted && !is_elevated()) {
+            int r = MessageBoxW(
+                NULL,
+                L"HidHide is installed, but ctrlmouse needs administrator "
+                L"rights once to add itself to HidHide's allowed-applications "
+                L"list.\n\nWithout that it cannot hide your controller from "
+                L"other apps, so the D-pad and stick clicks will keep "
+                L"reaching games, Steam and menus.\n\n"
+                L"Restart ctrlmouse as administrator now?",
+                L"ctrlmouse - administrator rights needed once",
+                MB_YESNO | MB_ICONWARNING);
+            if (r == IDYES) {
+                wchar_t exe[MAX_PATH];
+                if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+                    if (mutex) CloseHandle(mutex);   // let the new instance win
+                    ShellExecuteW(NULL, L"runas", exe, NULL, NULL, SW_SHOWNORMAL);
+                    return 0;
+                }
+            }
+        }
     } else {
         offer_hidhide();
     }

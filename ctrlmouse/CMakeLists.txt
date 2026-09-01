@@ -18,4 +18,7 @@ target_link_libraries(ctrlmouse PRIVATE
     dwmapi
     d2d1
     dwrite
+    hid
+    setupapi
+    advapi32
 )
