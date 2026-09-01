@@ -247,6 +247,154 @@ static int pov_dir(DWORD pov) {
     return (int)(((pov + 4500) / 9000) % 4);
 }
 
+// Device instance IDs of every DualSense HID collection present, in the form
+// SetupDiGetDeviceInstanceId returns - this is what HidHide blacklists by.
+// Filled by hid_scan() below; declared here because the HidHide code uses it.
+#define MAX_INST 16
+static std::wstring g_pad_inst[MAX_INST];
+static int          g_pad_inst_count = 0;
+
+// --- HidHide integration ----------------------------------------------------
+// Opening the pad exclusively is not enough to stop other software reacting to
+// it: that only blocks other user-mode CreateFile opens, while RawInput
+// consumers, the Game Bar and Steam Input keep getting fed by the OS itself.
+// Genuinely hiding a device needs a kernel filter driver sitting under the HID
+// stack, which is exactly what HidHide is. It is optional - without it the app
+// still works, it just cannot stop the pad reaching other software.
+//
+// Contract from HidHide's Shared/HidHideIoctlContract.h.
+#define HH_DEVICE_PATH L"\\\\.\\HidHide"
+#define HH_CTL(n)      CTL_CODE(32769, (n), METHOD_BUFFERED, FILE_READ_DATA)
+#define HH_GET_WHITELIST          HH_CTL(2048)
+#define HH_SET_WHITELIST          HH_CTL(2049)
+#define HH_SET_ACTIVE             HH_CTL(2053)
+#define HH_ADD_SESSION_BLACKLIST  HH_CTL(2056)
+#define HH_CLR_SESSION_BLACKLIST  HH_CTL(2057)
+#define HH_RELEASES_URL L"https://github.com/nefarius/HidHide/releases/latest"
+
+static HANDLE g_hh = INVALID_HANDLE_VALUE;
+static bool   g_hh_whitelisted = false;   // are we allowed to see hidden pads?
+static bool   g_hh_hiding = false;        // is the pad currently hidden?
+
+static bool hh_present() {
+    HANDLE h = CreateFileW(HH_DEVICE_PATH, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+static bool hh_open() {
+    if (g_hh != INVALID_HANDLE_VALUE) return true;
+    g_hh = CreateFileW(HH_DEVICE_PATH, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+    return g_hh != INVALID_HANDLE_VALUE;
+}
+
+static void hh_close() {
+    if (g_hh != INVALID_HANDLE_VALUE) { CloseHandle(g_hh); g_hh = INVALID_HANDLE_VALUE; }
+    g_hh_hiding = false;
+}
+
+// HidHide identifies applications by NT full image name, e.g.
+// \Device\HarddiskVolume3\Apps\ctrlmouse.exe - volume-based so it survives a
+// drive-letter change.
+static bool hh_self_image_name(std::wstring& out) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!n || n >= MAX_PATH || path[1] != L':') return false;
+    wchar_t drive[3] = {path[0], L':', 0};
+    wchar_t devname[512];
+    if (!QueryDosDeviceW(drive, devname, 512)) return false;
+    out = std::wstring(devname) + (path + 2);
+    return true;
+}
+
+// MULTI_SZ: each string null-terminated, list closed by one more null.
+static std::wstring hh_multi_sz(const std::wstring* items, int n) {
+    std::wstring b;
+    for (int i = 0; i < n; i++) {
+        if (items[i].empty()) continue;
+        b += items[i];
+        b.push_back(L'\0');
+    }
+    b.push_back(L'\0');
+    return b;
+}
+
+static bool hh_ioctl(DWORD code, std::wstring& payload) {
+    DWORD ret = 0;
+    return DeviceIoControl(g_hh, code, (LPVOID)payload.data(),
+                           (DWORD)(payload.size() * sizeof(wchar_t)),
+                           NULL, 0, &ret, NULL) != 0;
+}
+
+// Add ourselves to HidHide's whitelist, preserving whatever is already there.
+// This must succeed before anything is hidden, otherwise we would hide the pad
+// from ourselves too.
+static bool hh_whitelist_self() {
+    std::wstring me;
+    if (!hh_self_image_name(me)) return false;
+
+    DWORD need = 0;
+    DeviceIoControl(g_hh, HH_GET_WHITELIST, NULL, 0, NULL, 0, &need, NULL);
+    std::wstring cur;
+    if (need >= sizeof(wchar_t)) {
+        cur.resize(need / sizeof(wchar_t));
+        DWORD got = 0;
+        if (!DeviceIoControl(g_hh, HH_GET_WHITELIST, NULL, 0, &cur[0],
+                             (DWORD)(cur.size() * sizeof(wchar_t)), &got, NULL))
+            return false;   // never overwrite a list we failed to read
+        cur.resize(got / sizeof(wchar_t));
+    }
+
+    // Walk the MULTI_SZ looking for ourselves (paths are case-insensitive).
+    std::wstring items[64];
+    int n = 0;
+    for (size_t i = 0; i < cur.size() && n < 63;) {
+        size_t e = cur.find(L'\0', i);
+        if (e == std::wstring::npos || e == i) break;
+        items[n++] = cur.substr(i, e - i);
+        i = e + 1;
+    }
+    for (int i = 0; i < n; i++)
+        if (_wcsicmp(items[i].c_str(), me.c_str()) == 0) return true;  // already there
+
+    items[n++] = me;
+    std::wstring payload = hh_multi_sz(items, n);
+    return hh_ioctl(HH_SET_WHITELIST, payload);
+}
+
+// Hide every DualSense collection from other software, for this session only.
+// Session entries are owned by this process and the driver drops them if we
+// exit or crash, so the pad can never be left hidden.
+static bool hh_hide(bool on) {
+    if (g_hh == INVALID_HANDLE_VALUE || on == g_hh_hiding) return true;
+    if (!on) {
+        std::wstring empty;
+        empty.push_back(L'\0');
+        hh_ioctl(HH_CLR_SESSION_BLACKLIST, empty);
+        BOOLEAN active = FALSE;
+        DWORD ret = 0;
+        DeviceIoControl(g_hh, HH_SET_ACTIVE, &active, sizeof(active),
+                        NULL, 0, &ret, NULL);
+        g_hh_hiding = false;
+        return true;
+    }
+    if (!g_hh_whitelisted || !g_pad_inst_count) return false;
+    std::wstring payload = hh_multi_sz(g_pad_inst, g_pad_inst_count);
+    if (!hh_ioctl(HH_ADD_SESSION_BLACKLIST, payload)) return false;
+    BOOLEAN active = TRUE;
+    DWORD ret = 0;
+    if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &active, sizeof(active),
+                         NULL, 0, &ret, NULL))
+        return false;
+    g_hh_hiding = true;
+    return true;
+}
+
 // --- Normalised pad state ---------------------------------------------------
 // Both input backends below fill this, so the worker loop does not care which
 // one is in use. Axes are [-1000, 1000]; button bit indices deliberately match
@@ -327,6 +475,14 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     return true;
 }
 
+static bool path_is_dualsense(const wchar_t* p) {
+    std::wstring s(p);
+    for (size_t i = 0; i < s.size(); i++) s[i] = (wchar_t)towlower(s[i]);
+    if (s.find(L"vid_054c") == std::wstring::npos) return false;
+    return s.find(L"pid_0ce6") != std::wstring::npos ||
+           s.find(L"pid_0df2") != std::wstring::npos;
+}
+
 static bool hid_scan(bool exclusive) {
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
@@ -334,6 +490,8 @@ static bool hid_scan(bool exclusive) {
                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (set == INVALID_HANDLE_VALUE) return false;
 
+    bool opened = false;
+    g_pad_inst_count = 0;
     SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd); i++) {
         DWORD need = 0;
@@ -343,16 +501,22 @@ static bool hid_scan(bool exclusive) {
             (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
         if (!det) continue;
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, NULL) &&
-            hid_try_path(det->DevicePath, exclusive)) {
-            free(det);
-            SetupDiDestroyDeviceInfoList(set);
-            return true;
+        SP_DEVINFO_DATA dev = {sizeof(dev)};
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, &dev)) {
+            // Record every DualSense collection, not just the one we read
+            // from: hiding only the gamepad collection would leave the others
+            // visible to whatever else is listening.
+            if (path_is_dualsense(det->DevicePath) && g_pad_inst_count < MAX_INST) {
+                wchar_t inst[512];
+                if (SetupDiGetDeviceInstanceIdW(set, &dev, inst, 512, NULL))
+                    g_pad_inst[g_pad_inst_count++] = inst;
+            }
+            if (!opened && hid_try_path(det->DevicePath, exclusive)) opened = true;
         }
         free(det);
     }
     SetupDiDestroyDeviceInfoList(set);
-    return false;
+    return opened;
 }
 
 // Exclusive is best-effort: if something already holds the pad we still want
@@ -764,12 +928,20 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 hid_close();   // reopened at the top of the next iteration
         }
 
+        // Hide the pad from every other application while we own it, so the
+        // D-pad and L3 cannot drive menus or media at the same time as us.
+        // Whitelisting ourselves first is what stops us hiding it from
+        // ourselves; if that failed we never hide anything.
+        if (g_hh != INVALID_HANDLE_VALUE)
+            hh_hide(now_exclusive && g_pad_inst_count > 0);
+
         Sleep(8);  // ~120 Hz
     }
 
     // Never exit holding a button: an unmatched LEFTDOWN would leave the whole
     // desktop stuck in a drag after we are gone.
     edge_click_release_all(a_down, b_down);
+    hh_hide(false);   // give the pad back before we go
     hid_close();
     drop_device();
     if (g_di) {
@@ -1293,6 +1465,17 @@ static const wchar_t* kHelpText[2] = {
     L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
     L"Circle backspace).  Close sends to tray; tray icon to quit."};
 
+// Second line of the status area: whether the pad is actually hidden from
+// other apps, since that silently depends on HidHide being present and on us
+// having been able to whitelist ourselves.
+static const RECT kHideRect = {20, 38, 20 + 344, 38 + 16};
+static const wchar_t* hide_status_text() {
+    if (g_hh == INVALID_HANDLE_VALUE) return L"HidHide not installed - pad stays visible to other apps";
+    if (!g_hh_whitelisted)            return L"HidHide present, but whitelisting failed - try running as admin";
+    if (g_hh_hiding)                  return L"Pad hidden from other apps";
+    return L"HidHide ready - pad hidden while the mapping is on";
+}
+
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
 
 static inline D2D1_RECT_F to_f(const RECT& r) {
@@ -1440,6 +1623,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Section labels (were native STATIC controls; now DirectWrite so
             // they stay sharp at any DPI).
             if (g_tf_label) {
+                const wchar_t* hs = hide_status_text();
+                g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
+                                    to_f(kHideRect), g_br_main_dim);
                 for (int i = 0; i < 3; i++)
                     g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
                                         g_tf_label, to_f(kLabelRect[i]), g_br_main_dim);
@@ -1675,6 +1861,39 @@ static void enable_dpi_awareness() {
     }
 }
 
+// Offer HidHide on first launch without it. We only ever open the download
+// page - downloading or running an installer on the user's behalf is not
+// something this app should be doing. Declining is remembered so this is not
+// a recurring nag; delete the marker (or the config) to be asked again.
+static void offer_hidhide() {
+    std::wstring marker = config_path();
+    marker.resize(marker.find_last_of(L"\\/") + 1);
+    marker += L"hidhide_declined";
+    if (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    int r = MessageBoxW(
+        NULL,
+        L"ctrlmouse can stop your controller reaching other applications "
+        L"while the mapping is on, so the D-pad and stick clicks don't drive "
+        L"menus or media at the same time as the mouse.\n\n"
+        L"That needs HidHide - a small, free, open-source driver by Nefarius. "
+        L"It is a one-time install and ctrlmouse only hides the pad while the "
+        L"mapping is enabled.\n\n"
+        L"Without it everything else still works; the controller just stays "
+        L"visible to other apps.\n\n"
+        L"Open the HidHide download page?",
+        L"ctrlmouse - optional: block the pad from other apps",
+        MB_YESNO | MB_ICONINFORMATION);
+
+    if (r == IDYES) {
+        ShellExecuteW(NULL, L"open", HH_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+    } else {
+        HANDLE f = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     enable_dpi_awareness();
     HANDLE mutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
@@ -1731,6 +1950,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     DwmSetWindowAttribute(g_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/,
                           &dark, sizeof(dark));
     ShowWindow(g_hwnd, SW_SHOW);
+
+    // Optional device-hiding support. Whitelist ourselves up front: hiding is
+    // only ever enabled if that worked, so we can't hide the pad from
+    // ourselves. Requires elevation, and failing is not fatal.
+    if (hh_open()) {
+        g_hh_whitelisted = hh_whitelist_self();
+    } else {
+        offer_hidhide();
+    }
 
     g_worker = CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
 
