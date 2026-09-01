@@ -95,6 +95,7 @@ line). Settings written by older builds are moved there on first run.
 | `enabled` | Master on/off | `true` |
 | `toggle_button` | Controller button index for the toggle bind | `13` (touchpad) |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
+| `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F | `0` |
 
 ## License

@@ -69,10 +69,11 @@ struct Config {
     int    toggle_button;       // controller button that toggles enable/disable
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
     int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F
+    double mouse_curve;         // 1 = linear; higher = finer near centre
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, 0};
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, 0, 2.0};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -93,6 +94,7 @@ static wchar_t          g_pad_name[48] = L"Controller";
 static wchar_t          g_mouse_val_txt[32] = L"";
 static wchar_t          g_scroll_val_txt[32] = L"";
 static wchar_t          g_dz_val_txt[32] = L"";
+static wchar_t          g_curve_val_txt[32] = L"";
 static wchar_t          g_bind_val_txt[32] = L"";
 
 static Config get_cfg() {
@@ -160,11 +162,13 @@ static void save_config(const Config& c) {
             "  \"enabled\": %s,\n"
             "  \"toggle_button\": %d,\n"
             "  \"game_pause\": %s,\n"
-            "  \"fullscreen_key\": %d\n"
+            "  \"fullscreen_key\": %d,\n"
+            "  \"mouse_curve\": %.2f\n"
             "}\n",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false", c.toggle_button,
-            c.game_pause ? "true" : "false", c.fullscreen_key);
+            c.game_pause ? "true" : "false", c.fullscreen_key,
+            c.mouse_curve);
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -213,6 +217,9 @@ static Config load_config() {
         c.fullscreen_key = (int)fk;
         if (c.fullscreen_key < 0 || c.fullscreen_key > 2) c.fullscreen_key = 0;
     }
+    parse_double(s, "mouse_curve", c.mouse_curve);
+    if (c.mouse_curve < 1.0) c.mouse_curve = 1.0;
+    if (c.mouse_curve > 3.0) c.mouse_curve = 3.0;
     return c;
 }
 
@@ -1003,6 +1010,7 @@ static bool ensure_device() {
 
 static DWORD WINAPI worker_thread(LPVOID) {
     double scroll_accum = 0.0;
+    double move_ax = 0.0, move_ay = 0.0;   // sub-pixel cursor remainder
     bool a_down = false, b_down = false;
     bool tri_prev = false, cross_prev = false, circ_prev = false;
     int dpad_prev = -1;
@@ -1101,6 +1109,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         if (!got) {   // HID pad went away mid-read
             g_connected = false;
             scroll_accum = 0.0;
+            move_ax = move_ay = 0.0;
             edge_click_release_all(a_down, b_down);
             tri_prev = cross_prev = circ_prev = false;
             tbtn_prev = false;
@@ -1201,11 +1210,37 @@ static DWORD WINAPI worker_thread(LPVOID) {
                           !(cfg.game_pause && g_game_active && !g_override);
 
         if (mapping_on && !g_capture) {
-            double nlx = norm(st.lx, cfg.deadzone);
-            double nly = norm(st.ly, cfg.deadzone);  // Y is screen-oriented
-            LONG dx = (LONG)std::lround(nlx * cfg.mouse_sensitivity);
-            LONG dy = (LONG)std::lround(nly * cfg.mouse_sensitivity);
-            if (dx || dy) mouse_move(dx, dy);
+            // Stick to cursor movement. Three things matter here for fine
+            // control, and they have to work together:
+            //
+            //  * Radial deadzone and magnitude. Treating the axes separately
+            //    lets a diagonal reach a magnitude of 1.41, so diagonals ran
+            //    faster than cardinals; this normalises the vector instead.
+            //  * A response curve. Raising the normalised magnitude to a power
+            //    keeps full deflection at full speed while stretching the
+            //    slow end of the range over much more stick travel, which is
+            //    what makes small adjustments possible at a high sensitivity.
+            //  * Sub-pixel accumulation. Rounding each poll independently
+            //    discards anything under half a pixel, so below a certain
+            //    deflection the cursor simply would not move no matter how
+            //    gentle the curve. The remainder is carried to the next poll.
+            double rx = st.lx / 1000.0, ry = st.ly / 1000.0;
+            double m = sqrt(rx * rx + ry * ry);
+            if (m > 1.0) { rx /= m; ry /= m; m = 1.0; }
+            if (m > cfg.deadzone) {
+                double t = (m - cfg.deadzone) / (1.0 - cfg.deadzone);
+                double speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
+                move_ax += (rx / m) * speed;
+                move_ay += (ry / m) * speed;   // Y is screen-oriented
+                LONG dx = (LONG)move_ax, dy = (LONG)move_ay;
+                if (dx || dy) {
+                    mouse_move(dx, dy);
+                    move_ax -= dx;
+                    move_ay -= dy;
+                }
+            } else {
+                move_ax = move_ay = 0.0;
+            }
 
             double nrz = norm(st.ry, cfg.deadzone);  // right stick Y
             if (nrz != 0.0) {
@@ -1343,6 +1378,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             circ_prev = circle;
         } else {
             scroll_accum = 0.0;
+            move_ax = move_ay = 0.0;
             tri_prev = cross_prev = circ_prev = false;
             dpad_prev = -1;
             // Track the pad while paused too, so re-enabling with a button or
@@ -2416,66 +2452,70 @@ static void restore_from_tray(HWND hwnd) {
 #define ID_TIMER     1
 
 // Trackbar indices (mouse sensitivity / scroll sensitivity / deadzone).
-enum { TRK_MOUSE = 0, TRK_SCROLL = 1, TRK_DEADZONE = 2 };
-static const int kTrackLo[3] = {1, 1, 0};
-static const int kTrackHi[3] = {60, 50, 50};
+enum { TRK_MOUSE = 0, TRK_SCROLL = 1, TRK_DEADZONE = 2, TRK_CURVE = 3 };
+#define NTRACKS 4
+static const int kTrackLo[NTRACKS] = {1, 1, 0, 10};
+static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 
 // Client size, and the whole layout below, in DIPs. Nothing here is a native
 // child control any more - every label, slider, toggle and button is drawn by
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 604
+#define WIN_H 666
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
 static const RECT kHidBtnRect = {284, 42, 284 + 80, 42 + 24};
 
-static const RECT kLabelRect[3] = {
+static const RECT kLabelRect[NTRACKS] = {
     {20, 82, 20 + 200, 82 + 18},
     {20, 144, 20 + 200, 144 + 18},
     {20, 206, 20 + 200, 206 + 18},
+    {20, 268, 20 + 200, 268 + 18},
 };
-static const RECT kValRect[3] = {
+static const RECT kValRect[NTRACKS] = {
     {284, 82, 284 + 80, 82 + 18},
     {284, 144, 284 + 80, 144 + 18},
     {284, 206, 284 + 80, 206 + 18},
+    {284, 268, 284 + 80, 268 + 18},
 };
-static const RECT kTrackRect[3] = {
+static const RECT kTrackRect[NTRACKS] = {
     {20, 104, 20 + 344, 104 + 28},
     {20, 166, 20 + 344, 166 + 28},
     {20, 228, 20 + 344, 228 + 28},
+    {20, 290, 20 + 344, 290 + 28},
 };
 #define NTOGGLES 2
 static const RECT kToggleRect[NTOGGLES] = {
-    {20, 270, 20 + 46, 270 + 22},
-    {196, 270, 196 + 46, 270 + 22},
+    {20, 332, 20 + 46, 332 + 22},
+    {196, 332, 196 + 46, 332 + 22},
 };
 static const RECT kToggleLabel[NTOGGLES] = {
-    {74, 272, 74 + 110, 272 + 18},
-    {250, 272, 250 + 114, 272 + 18},
+    {74, 334, 74 + 110, 334 + 18},
+    {250, 334, 250 + 114, 334 + 18},
 };
-static const RECT kBindLabelRect = {20, 308, 20 + 100, 308 + 18};
-static const RECT kBindValRect   = {124, 308, 124 + 150, 308 + 18};
-static const RECT kBindBtnRect   = {284, 304, 284 + 80, 304 + 24};
+static const RECT kBindLabelRect = {20, 370, 20 + 100, 370 + 18};
+static const RECT kBindValRect   = {124, 370, 124 + 150, 370 + 18};
+static const RECT kBindBtnRect   = {284, 366, 284 + 80, 366 + 24};
 
 // Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
 // the right answer depends entirely on the app being used.
-static const RECT kFsLabelRect = {20, 344, 20 + 100, 344 + 18};
+static const RECT kFsLabelRect = {20, 406, 20 + 100, 406 + 18};
 #define NFSKEYS 3
 static const RECT kFsSeg[NFSKEYS] = {
-    {124, 340, 124 + 76, 340 + 26},
-    {206, 340, 206 + 76, 340 + 26},
-    {288, 340, 288 + 76, 340 + 26},
+    {124, 402, 124 + 76, 402 + 26},
+    {206, 402, 206 + 76, 402 + 26},
+    {288, 402, 288 + 76, 402 + 26},
 };
 static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
 
 // Control legend. Each row is an icon of the physical control with the
 // relevant part filled in, so it reads on any pad regardless of what the
 // buttons are called.
-static const RECT kLegendHdr = {20, 384, 20 + 344, 384 + 18};
+static const RECT kLegendHdr = {20, 446, 20 + 344, 446 + 18};
 #define NLEGEND 6
-#define LEGEND_Y0   412
+#define LEGEND_Y0   474
 #define LEGEND_STEP 27
 // icon kind: 0..3 = face button (top/right/bottom/left), 4 = D-pad vertical,
 // 5 = D-pad horizontal
@@ -2488,12 +2528,13 @@ static const wchar_t* kLegendText[NLEGEND] = {
     L"Volume up / down  (hold)",
     L"Arrow keys - scrub media  (hold)",
 };
-static const RECT kFooterRect = {20, 574, 20 + 344, 574 + 18};
+static const RECT kFooterRect = {20, 636, 20 + 344, 636 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
-static const wchar_t* kTrackLabel[3] = {
-    L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
+static const wchar_t* kTrackLabel[NTRACKS] = {
+    L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone",
+    L"Response curve"};
 static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
 
 // HidHide state, kept to one short line. Detail only appears when something
@@ -2554,6 +2595,9 @@ static void update_value(int idx) {
         swprintf(g_scroll_val_txt, 32, L"%.1f", c.scroll_sensitivity);
     } else if (idx == TRK_DEADZONE) {
         swprintf(g_dz_val_txt, 32, L"%d%%", (int)std::lround(c.deadzone * 100));
+    } else if (idx == TRK_CURVE) {
+        if (c.mouse_curve <= 1.02) wcscpy(g_curve_val_txt, L"Linear");
+        else swprintf(g_curve_val_txt, 32, L"%.1f", c.mouse_curve);
     }
     if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
 }
@@ -2575,6 +2619,7 @@ static int track_current_pos(int idx) {
     Config c = get_cfg();
     if (idx == TRK_MOUSE) return (int)std::lround(c.mouse_sensitivity);
     if (idx == TRK_SCROLL) return (int)std::lround(c.scroll_sensitivity * 10);
+    if (idx == TRK_CURVE) return (int)std::lround(c.mouse_curve * 10);
     return (int)std::lround(c.deadzone * 100);
 }
 
@@ -2591,6 +2636,7 @@ static void apply_track_pos(int idx, int pos) {
     if (idx == TRK_MOUSE) g_cfg.mouse_sensitivity = pos;
     else if (idx == TRK_SCROLL) g_cfg.scroll_sensitivity = pos / 10.0;
     else if (idx == TRK_DEADZONE) g_cfg.deadzone = pos / 100.0;
+    else if (idx == TRK_CURVE) g_cfg.mouse_curve = pos / 10.0;
     Config c = g_cfg;
     LeaveCriticalSection(&g_cs);
     save_config(c);
@@ -2598,7 +2644,7 @@ static void apply_track_pos(int idx, int pos) {
 }
 
 static int hit_test_track(POINT pt) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < NTRACKS; i++)
         if (PtInRect(&kTrackRect[i], pt)) return i;
     return -1;
 }
@@ -2610,6 +2656,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         update_value(TRK_MOUSE);
         update_value(TRK_SCROLL);
         update_value(TRK_DEADZONE);
+        update_value(TRK_CURVE);
         update_bind_text();
         SetTimer(hwnd, ID_TIMER, 500, NULL);
         return 0;
@@ -2700,7 +2747,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const wchar_t* hs = hide_status_text();
                 g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
                                     to_f(kHideRect), g_br_main_dim);
-                for (int i = 0; i < 3; i++)
+                for (int i = 0; i < NTRACKS; i++)
                     g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
                                         g_tf_label, to_f(kLabelRect[i]), g_br_main_dim);
                 for (int i = 0; i < NTOGGLES; i++)
@@ -2734,7 +2781,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             // Trackbars: rounded channel + accent fill + round thumb.
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < NTRACKS; i++) {
                 const RECT& r = kTrackRect[i];
                 float left = (float)r.left, right = (float)r.right;
                 float cy = (float)((r.top + r.bottom) / 2);
@@ -2768,9 +2815,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Value readouts, right-aligned like the old SS_RIGHT statics.
             if (g_tf_body) {
-                const wchar_t* vals[3] = {g_mouse_val_txt, g_scroll_val_txt, g_dz_val_txt};
+                const wchar_t* vals[NTRACKS] = {g_mouse_val_txt, g_scroll_val_txt,
+                                                g_dz_val_txt, g_curve_val_txt};
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                for (int i = 0; i < 3; i++)
+                for (int i = 0; i < NTRACKS; i++)
                     g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
                                         g_tf_body, to_f(kValRect[i]), g_br_main_text);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
