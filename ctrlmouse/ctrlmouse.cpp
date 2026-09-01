@@ -78,7 +78,11 @@ static HANDLE           g_worker = NULL;
 static HWND             g_hwnd = NULL;
 static NOTIFYICONDATAW  g_nid = {};
 static int              g_status_state = -1;
-static wchar_t          g_status_txt[64] = L"Controller: ...";
+static wchar_t          g_status_txt[64] = L"Controller";
+// Friendly name of the pad in use, shown in place of "Controller" once one is
+// found. Written by the worker, read by the UI thread; worst case a repaint
+// shows the previous name for one frame.
+static wchar_t          g_pad_name[48] = L"Controller";
 static wchar_t          g_mouse_val_txt[32] = L"";
 static wchar_t          g_scroll_val_txt[32] = L"";
 static wchar_t          g_dz_val_txt[32] = L"";
@@ -646,6 +650,8 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     g_hid_state.hat = -1;
     g_hid_gen++;
     g_hid_have_report = false;
+    wcscpy(g_pad_name, attr.ProductID == PID_DUALSENSE_EDGE ? L"DualSense Edge"
+                                                            : L"DualSense");
     return true;
 }
 
@@ -655,6 +661,24 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
 // string match silently misses one of them. Opening with zero desired access
 // is a query-only open: it always succeeds and never conflicts with an
 // exclusive handle.
+// Reduce a raw HID/DirectInput product string to something worth showing.
+// Pads rarely report a tidy name - a DualShock 4 calls itself "Wireless
+// Controller" - so match the families we know and fall back to the raw name.
+static void set_pad_name(const wchar_t* raw) {
+    std::wstring s(raw ? raw : L"");
+    for (size_t i = 0; i < s.size(); i++) s[i] = (wchar_t)towlower(s[i]);
+    const wchar_t* name = NULL;
+    if (s.find(L"dualsense") != std::wstring::npos) name = L"DualSense";
+    else if (s.find(L"dualshock") != std::wstring::npos) name = L"DualShock";
+    else if (s.find(L"xbox") != std::wstring::npos) name = L"Xbox Controller";
+    else if (s.find(L"pro controller") != std::wstring::npos ||
+             s.find(L"switch") != std::wstring::npos) name = L"Switch Controller";
+    else if (s.find(L"wireless controller") != std::wstring::npos) name = L"DualShock";
+    if (name) wcscpy(g_pad_name, name);
+    else if (raw && *raw) { wcsncpy(g_pad_name, raw, 47); g_pad_name[47] = 0; }
+    else wcscpy(g_pad_name, L"Third Party");
+}
+
 static bool path_is_dualsense(const wchar_t* path) {
     HANDLE q = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_EXISTING, 0, NULL);
@@ -827,8 +851,13 @@ static GUID g_open_guid = {};        // pad we currently have open
 static GUID g_last_good = {};        // last pad that actually produced input
 static bool g_have_last_good = false;
 
+static std::wstring g_pad_names[MAX_PADS];
+
 static BOOL CALLBACK enum_cb(const DIDEVICEINSTANCEW* inst, void*) {
-    if (g_pad_count < MAX_PADS) g_pad_guids[g_pad_count++] = inst->guidInstance;
+    if (g_pad_count < MAX_PADS) {
+        g_pad_names[g_pad_count] = inst->tszProductName;
+        g_pad_guids[g_pad_count++] = inst->guidInstance;
+    }
     return DIENUM_CONTINUE;   // collect them all; ensure_device() picks
 }
 
@@ -891,11 +920,16 @@ static bool ensure_device() {
     // it persists across app restarts because the enumeration order does.
     if (g_have_last_good)
         for (int i = 0; i < g_pad_count; i++)
-            if (IsEqualGUID(g_pad_guids[i], g_last_good) && try_open(g_pad_guids[i]))
+            if (IsEqualGUID(g_pad_guids[i], g_last_good) && try_open(g_pad_guids[i])) {
+                set_pad_name(g_pad_names[i].c_str());
                 return true;
+            }
 
     for (int i = 0; i < g_pad_count; i++)
-        if (try_open(g_pad_guids[i])) return true;
+        if (try_open(g_pad_guids[i])) {
+            set_pad_name(g_pad_names[i].c_str());
+            return true;
+        }
     return false;
 }
 
@@ -1099,7 +1133,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
             double nrz = norm(st.ry, cfg.deadzone);  // right stick Y
             if (nrz != 0.0) {
-                scroll_accum += -nrz * cfg.scroll_sensitivity;  // stick up -> scroll up
+                scroll_accum += nrz * cfg.scroll_sensitivity;  // stick up -> scroll down
                 int steps = (int)scroll_accum;
                 if (steps) {
                     mouse_scroll(steps);
@@ -1707,82 +1741,112 @@ static const int kTrackHi[3] = {60, 50, 50};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 382
+#define WIN_H 562
 
-static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
-static const RECT kTrackRect[3] = {
-    {20, 78, 20 + 344, 78 + 28},
-    {20, 140, 20 + 344, 140 + 28},
-    {20, 202, 20 + 344, 202 + 28},
-};
+static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
+static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
+static const RECT kHidBtnRect = {284, 42, 284 + 80, 42 + 24};
+
 static const RECT kLabelRect[3] = {
-    {20, 56, 20 + 200, 56 + 18},
-    {20, 118, 20 + 200, 118 + 18},
-    {20, 180, 20 + 200, 180 + 18},
+    {20, 82, 20 + 200, 82 + 18},
+    {20, 144, 20 + 200, 144 + 18},
+    {20, 206, 20 + 200, 206 + 18},
 };
 static const RECT kValRect[3] = {
-    {284, 56, 284 + 80, 56 + 18},
-    {284, 118, 284 + 80, 118 + 18},
-    {284, 180, 284 + 80, 180 + 18},
+    {284, 82, 284 + 80, 82 + 18},
+    {284, 144, 284 + 80, 144 + 18},
+    {284, 206, 284 + 80, 206 + 18},
+};
+static const RECT kTrackRect[3] = {
+    {20, 104, 20 + 344, 104 + 28},
+    {20, 166, 20 + 344, 166 + 28},
+    {20, 228, 20 + 344, 228 + 28},
 };
 #define NTOGGLES 2
 static const RECT kToggleRect[NTOGGLES] = {
-    {20, 244, 20 + 46, 244 + 22},
-    {196, 244, 196 + 46, 244 + 22},
+    {20, 270, 20 + 46, 270 + 22},
+    {196, 270, 196 + 46, 270 + 22},
 };
 static const RECT kToggleLabel[NTOGGLES] = {
-    {74, 246, 74 + 110, 246 + 18},
-    {250, 246, 250 + 114, 246 + 18},
+    {74, 272, 74 + 110, 272 + 18},
+    {250, 272, 250 + 114, 272 + 18},
 };
-static const RECT kBindLabelRect = {20, 282, 20 + 100, 282 + 18};
-static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
-static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
-#define NHELP 3
-static const RECT kHelpRect[NHELP] = {
-    {20, 314, 20 + 352, 314 + 18},
-    {20, 332, 20 + 352, 332 + 18},
-    {20, 350, 20 + 352, 350 + 18},
+static const RECT kBindLabelRect = {20, 308, 20 + 100, 308 + 18};
+static const RECT kBindValRect   = {124, 308, 124 + 150, 308 + 18};
+static const RECT kBindBtnRect   = {284, 304, 284 + 80, 304 + 24};
+
+// Control legend. Each row is an icon of the physical control with the
+// relevant part filled in, so it reads on any pad regardless of what the
+// buttons are called.
+static const RECT kLegendHdr = {20, 344, 20 + 344, 344 + 18};
+#define NLEGEND 6
+#define LEGEND_Y0   372
+#define LEGEND_STEP 27
+// icon kind: 0..3 = face button (top/right/bottom/left), 4 = D-pad vertical,
+// 5 = D-pad horizontal
+static const int kLegendIcon[NLEGEND] = {2, 1, 0, 3, 4, 5};
+static const wchar_t* kLegendText[NLEGEND] = {
+    L"Left click",
+    L"Right click",
+    L"Pop-up keyboard",
+    L"Play / pause",
+    L"Volume up / down  (hold)",
+    L"Arrow keys - scrub media  (hold)",
 };
+static const RECT kFooterRect = {20, 532, 20 + 344, 532 + 18};
+static const wchar_t* kFooterText =
+    L"Close sends to tray; right-click the tray icon to quit.";
 
 static const wchar_t* kTrackLabel[3] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
 static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
-static const wchar_t* kHelpText[NHELP] = {
-    L"D-pad: up/down volume, left/right scrub (hold).   Square: play/pause.",
-    L"Triangle: on-screen keyboard - then D-pad moves, Cross types,",
-    L"Circle backspaces.   Close sends to tray; tray icon to quit."};
 
-// Second line of the status area: whether the pad is actually hidden from
-// other apps, since that silently depends on HidHide being present and on us
-// having been able to whitelist ourselves.
-static const RECT kHideRect = {20, 38, 20 + 344, 38 + 16};
+// HidHide state, kept to one short line. Detail only appears when something
+// needs doing about it.
 static const wchar_t* hide_status_text() {
-    static wchar_t buf[160];
-    if (g_hh == INVALID_HANDLE_VALUE)
-        return L"HidHide not installed - pad stays visible to other apps";
-    if (!g_hh_whitelisted)
-        return L"HidHide: allow-list write failed - run ctrlmouse as admin once";
-    if (!g_pad_inst_count)
-        return L"HidHide ready, but no DualSense collections found to hide";
-    // Report HidHide's global switch as well as our own state: a blacklist
-    // with the master switch off enforces nothing, and that combination used
-    // to be indistinguishable from working.
-    BOOLEAN act = FALSE;
-    DWORD ret = 0;
-    bool known = g_hh != INVALID_HANDLE_VALUE &&
-                 DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &act,
-                                 sizeof(act), &ret, NULL) != 0;
-    swprintf(buf, 160, L"HidHide: %s, %d collection%s, master switch %s",
-             g_hh_hiding ? L"hiding" : L"idle",
-             g_pad_inst_count, g_pad_inst_count == 1 ? L"" : L"s",
-             !known ? L"unreadable" : (act ? L"on" : L"OFF"));
-    return buf;
+    if (g_hh == INVALID_HANDLE_VALUE) return L"HidHide: Not installed";
+    if (!g_hh_whitelisted)            return L"HidHide: Installed (needs admin)";
+    if (!g_pad_inst_count)            return L"HidHide: Installed (no pad found)";
+    return g_hh_hiding ? L"HidHide: Installed - pad hidden"
+                       : L"HidHide: Installed";
 }
 
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
 
 static inline D2D1_RECT_F to_f(const RECT& r) {
     return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
+}
+
+// --- Control legend icons ---------------------------------------------------
+// Drawn rather than shipped as bitmaps: they stay sharp at any DPI, and a
+// filled position on an otherwise plain diamond/cross reads the same whether
+// the pad calls that button Cross, A or B.
+
+// Four buttons in a diamond; `which` is 0=top,1=right,2=bottom,3=left.
+static void draw_face_icon(ID2D1RenderTarget* rt, float cx, float cy, int which,
+                           ID2D1Brush* on, ID2D1Brush* off) {
+    const float d = 7.0f, r = 3.4f;
+    D2D1_POINT_2F p[4] = {{cx, cy - d}, {cx + d, cy}, {cx, cy + d}, {cx - d, cy}};
+    for (int i = 0; i < 4; i++) {
+        D2D1_ELLIPSE e = D2D1::Ellipse(p[i], r, r);
+        if (i == which) rt->FillEllipse(e, on);
+        else            rt->DrawEllipse(e, off, 1.2f);
+    }
+}
+
+// A D-pad cross with one axis highlighted; `vertical` picks up/down vs left/right.
+static void draw_dpad_icon(ID2D1RenderTarget* rt, float cx, float cy, bool vertical,
+                           ID2D1Brush* on, ID2D1Brush* off) {
+    const float a = 3.2f, b = 10.0f;   // arm half-width, arm reach
+    D2D1_RECT_F up    = D2D1::RectF(cx - a, cy - b, cx + a, cy - a);
+    D2D1_RECT_F down  = D2D1::RectF(cx - a, cy + a, cx + a, cy + b);
+    D2D1_RECT_F left  = D2D1::RectF(cx - b, cy - a, cx - a, cy + a);
+    D2D1_RECT_F right = D2D1::RectF(cx + a, cy - a, cx + b, cy + a);
+    rt->FillRectangle(up,    vertical ? on : off);
+    rt->FillRectangle(down,  vertical ? on : off);
+    rt->FillRectangle(left,  vertical ? off : on);
+    rt->FillRectangle(right, vertical ? off : on);
+    rt->FillRectangle(D2D1::RectF(cx - a, cy - a, cx + a, cy + a), off);
 }
 
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
@@ -1889,6 +1953,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&kHidBtnRect, pt)) {
+            // Open the download page only; installing a driver is the user's
+            // decision to make in their own browser.
+            ShellExecuteW(NULL, L"open", HH_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        }
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -1937,9 +2007,27 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
                 g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
                                     to_f(kBindLabelRect), g_br_main_dim);
-                for (int i = 0; i < NHELP; i++)
-                    g_rt_main->DrawText(kHelpText[i], (UINT32)wcslen(kHelpText[i]),
-                                        g_tf_label, to_f(kHelpRect[i]), g_br_main_dim);
+                g_rt_main->DrawText(L"Controls", 8, g_tf_label,
+                                    to_f(kLegendHdr), g_br_main_text);
+                g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
+                                    g_tf_label, to_f(kFooterRect), g_br_main_dim);
+            }
+
+            // Control legend: icon of the physical control, then what it does.
+            for (int i = 0; i < NLEGEND; i++) {
+                float cy = (float)(LEGEND_Y0 + i * LEGEND_STEP) + 9.0f;
+                if (kLegendIcon[i] < 4)
+                    draw_face_icon(g_rt_main, 32.0f, cy, kLegendIcon[i],
+                                   g_br_main_sel, g_br_main_dim);
+                else
+                    draw_dpad_icon(g_rt_main, 32.0f, cy, kLegendIcon[i] == 4,
+                                   g_br_main_sel, g_br_main_key);
+                if (g_tf_label) {
+                    RECT tr = {58, LEGEND_Y0 + i * LEGEND_STEP,
+                               58 + 306, LEGEND_Y0 + i * LEGEND_STEP + 18};
+                    g_rt_main->DrawText(kLegendText[i], (UINT32)wcslen(kLegendText[i]),
+                                        g_tf_label, to_f(tr), g_br_main_text);
+                }
             }
 
             // Trackbars: rounded channel + accent fill + round thumb.
@@ -2025,6 +2113,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     g_tf_body, r, g_br_main_text);
             }
 
+            // Install button, only while HidHide is missing.
+            if (g_hh == INVALID_HANDLE_VALUE) {
+                const RECT& r = kHidBtnRect;
+                g_rt_main->FillRoundedRectangle(
+                    D2D1::RoundedRect(to_f(r), 10.0f, 10.0f), g_br_main_key);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Install", 7, g_tf_body, to_f(r), g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+
             HRESULT hr = g_rt_main->EndDraw();
             if (hr == D2DERR_RECREATE_TARGET) d2d_release_main();
         }
@@ -2034,15 +2134,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: {
         Config c = get_cfg();
         int st;
-        const wchar_t* txt;
-        if (!g_connected)      { st = 0; txt = L"Controller: not detected"; }
+        const wchar_t* state;
+        if (!g_connected)      { st = 0; state = L"Disconnected"; }
         else if (c.enabled && c.game_pause && g_game_active && !g_override)
-                               { st = 2; txt = L"Paused: game detected"; }
-        else if (!c.enabled)   { st = 3; txt = L"Mapping disabled"; }
-        else                   { st = 1; txt = L"Controller: connected"; }
-        if (st != g_status_state) {
+                               { st = 2; state = L"Paused - game detected"; }
+        else if (!c.enabled)   { st = 3; state = L"Disabled"; }
+        else                   { st = 1; state = L"Connected"; }
+        // Name the pad once we have one, so the line reads e.g.
+        // "DualSense Edge : Connected" rather than a generic label.
+        wchar_t line[128];
+        swprintf(line, 128, L"%s : %s",
+                 g_connected ? g_pad_name : L"Controller", state);
+        if (st != g_status_state || wcscmp(line, g_status_txt) != 0) {
             g_status_state = st;
-            wcscpy(g_status_txt, txt);
+            wcsncpy(g_status_txt, line, 63);
+            g_status_txt[63] = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;

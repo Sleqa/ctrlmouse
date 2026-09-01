@@ -11,7 +11,7 @@ XInput pads.
 | Controller | Action |
 |---|---|
 | Left stick | Move the mouse cursor |
-| Right stick (up/down) | Scroll wheel |
+| Right stick (up/down) | Scroll wheel (stick up scrolls down) |
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
 | Square / X | Play / pause |
