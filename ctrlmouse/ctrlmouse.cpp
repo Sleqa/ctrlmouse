@@ -407,16 +407,27 @@ static bool hh_hide(bool on) {
     std::wstring payload = hh_multi_sz(g_pad_inst, g_pad_inst_count);
     if (!hh_ioctl(HH_ADD_SESSION_BLACKLIST, payload)) return false;
 
-    BOOLEAN active = FALSE;
-    if (DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &active, sizeof(active),
-                        &ret, NULL) && !active) {
-        BOOLEAN on_val = TRUE;
-        if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &on_val, sizeof(on_val),
-                             NULL, 0, &ret, NULL))
-            return false;
-        g_hh_prev_active = active;
-        g_hh_changed_active = true;
-    }
+    // HidHide has a global on/off switch, and a blacklist means nothing while
+    // it is off. Read the old value if we can - purely so we can put it back -
+    // but always write TRUE, and treat failure to do so as failure to hide.
+    // Making the write conditional on a successful read is what previously let
+    // this report success while HidHide was globally disabled.
+    BOOLEAN prev = FALSE;
+    bool have_prev = DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &prev,
+                                     sizeof(prev), &ret, NULL) != 0;
+    BOOLEAN on_val = TRUE;
+    if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &on_val, sizeof(on_val),
+                         NULL, 0, &ret, NULL))
+        return false;
+    g_hh_changed_active = have_prev && !prev;   // only restore what we changed
+    g_hh_prev_active = prev;
+
+    // Confirm it really is on rather than trusting the write.
+    BOOLEAN now = FALSE;
+    if (DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &now, sizeof(now),
+                        &ret, NULL) && !now)
+        return false;
+
     g_hh_hiding = true;
     return true;
 }
@@ -1537,10 +1548,18 @@ static const wchar_t* hide_status_text() {
         return L"HidHide: allow-list write failed - run ctrlmouse as admin once";
     if (!g_pad_inst_count)
         return L"HidHide ready, but no DualSense collections found to hide";
-    swprintf(buf, 160, L"HidHide: %s (%d collection%s)",
-             g_hh_hiding ? L"pad hidden from other apps"
-                         : L"ready, hides while mapping is on",
-             g_pad_inst_count, g_pad_inst_count == 1 ? L"" : L"s");
+    // Report HidHide's global switch as well as our own state: a blacklist
+    // with the master switch off enforces nothing, and that combination used
+    // to be indistinguishable from working.
+    BOOLEAN act = FALSE;
+    DWORD ret = 0;
+    bool known = g_hh != INVALID_HANDLE_VALUE &&
+                 DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &act,
+                                 sizeof(act), &ret, NULL) != 0;
+    swprintf(buf, 160, L"HidHide: %s, %d collection%s, master switch %s",
+             g_hh_hiding ? L"hiding" : L"idle",
+             g_pad_inst_count, g_pad_inst_count == 1 ? L"" : L"s",
+             !known ? L"unreadable" : (act ? L"on" : L"OFF"));
     return buf;
 }
 
