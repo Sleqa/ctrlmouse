@@ -1303,12 +1303,22 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 #define KB_W (10 * KB_KU + 9 * KB_GAP + 2 * KB_M)
 #define KB_H (KB_NROWS * KB_KU + (KB_NROWS - 1) * KB_GAP + 2 * KB_M)
 
-// Dark theme palette.
-#define KB_CLR_BG    RGB(24, 24, 28)     // window background
-#define KB_CLR_KEY   RGB(45, 45, 52)     // key face
-#define KB_CLR_SEL   RGB(0, 120, 212)    // selected key (Windows accent blue)
-#define KB_CLR_ARMED RGB(70, 70, 110)    // Shift key while armed
-#define KB_CLR_TEXT  RGB(232, 232, 238)  // key labels
+// Dark theme palette. Keys are not flat fills: each is a soft vertical
+// gradient with a lit top edge and a faint sheen falling away from it, which
+// is what gives a physical, raised look without any transparency.
+#define KB_CLR_BG    RGB(18, 18, 21)     // window background
+#define KB_CLR_KEY   RGB(48, 48, 55)     // key face (mid tone / flat fallback)
+#define KB_CLR_SEL   RGB(228, 170, 66)   // accent - warm amber
+#define KB_CLR_ARMED RGB(92, 72, 40)     // Shift key while armed
+#define KB_CLR_TEXT  RGB(238, 238, 242)  // key labels
+
+#define KB_KEY_TOP   RGB(60, 60, 68)     // key gradient, lit top
+#define KB_KEY_BOT   RGB(36, 36, 42)     // key gradient, shaded bottom
+#define KB_SEL_TOP   RGB(244, 190, 86)
+#define KB_SEL_BOT   RGB(204, 138, 36)
+#define KB_ARM_TOP   RGB(104, 82, 44)
+#define KB_ARM_BOT   RGB(70, 54, 28)
+#define KB_TEXT_ON_SEL RGB(32, 22, 6)    // dark label on a bright amber key
 
 static HWND   g_kb = NULL;
 static int    g_kb_row = 1, g_kb_col = 0;
@@ -1369,6 +1379,15 @@ static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
+static ID2D1SolidColorBrush*  g_br_kb_text_dark = NULL;  // label on a bright key
+// Depth: a vertical gradient per key, a sheen falling from the top edge, and a
+// stroke that is bright at the top and fades out before the sides.
+static ID2D1LinearGradientBrush* g_br_kb_face_g = NULL;
+static ID2D1LinearGradientBrush* g_br_kb_sel_g = NULL;
+static ID2D1LinearGradientBrush* g_br_kb_arm_g = NULL;
+static ID2D1LinearGradientBrush* g_br_kb_sheen = NULL;
+static ID2D1LinearGradientBrush* g_br_kb_edge = NULL;
+static ID2D1LinearGradientBrush* g_br_kb_card = NULL;
 
 static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
@@ -1432,6 +1451,27 @@ static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd, bool grayscale_text) {
 // a few progressively larger, progressively fainter rounded rects behind the
 // shape. Cheap, and reads as a real blur at these sizes. Only valid over an
 // opaque background - see the note on the keyboard geometry above.
+// Vertical gradient brush. Endpoints are moved per shape at draw time, so one
+// brush serves every key.
+static ID2D1LinearGradientBrush* make_vgrad(ID2D1RenderTarget* rt,
+                                            const D2D1_GRADIENT_STOP* stops,
+                                            UINT32 count) {
+    ID2D1GradientStopCollection* col = NULL;
+    if (FAILED(rt->CreateGradientStopCollection(stops, count, &col))) return NULL;
+    ID2D1LinearGradientBrush* br = NULL;
+    rt->CreateLinearGradientBrush(
+        D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, 0), D2D1::Point2F(0, 1)),
+        col, &br);
+    col->Release();
+    return br;
+}
+
+static inline void set_vgrad(ID2D1LinearGradientBrush* b, float x, float top, float bot) {
+    if (!b) return;
+    b->SetStartPoint(D2D1::Point2F(x, top));
+    b->SetEndPoint(D2D1::Point2F(x, bot));
+}
+
 static void d2d_soft_glow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
                           D2D1_RECT_F r, float radius, float spread,
                           float alpha, int layers) {
@@ -1474,9 +1514,15 @@ static bool d2d_create_main(HWND hwnd) {
 
 static void d2d_release_kb() {
     ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
-                                   &g_br_kb_text, &g_br_kb_flash};
-    for (int i = 0; i < 5; i++)
+                                   &g_br_kb_text, &g_br_kb_flash,
+                                   &g_br_kb_text_dark};
+    for (int i = 0; i < 6; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    ID2D1LinearGradientBrush** gs[] = {&g_br_kb_face_g, &g_br_kb_sel_g,
+                                       &g_br_kb_arm_g, &g_br_kb_sheen,
+                                       &g_br_kb_edge, &g_br_kb_card};
+    for (int i = 0; i < 6; i++)
+        if (*gs[i]) { (*gs[i])->Release(); *gs[i] = NULL; }
     if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
 }
 
@@ -1487,7 +1533,33 @@ static bool d2d_create_kb(HWND hwnd) {
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_TEXT_ON_SEL), &g_br_kb_text_dark);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_flash);
+
+    D2D1_GRADIENT_STOP face[2] = {{0.0f, d2d_clr(KB_KEY_TOP)},
+                                  {1.0f, d2d_clr(KB_KEY_BOT)}};
+    D2D1_GRADIENT_STOP sel[2]  = {{0.0f, d2d_clr(KB_SEL_TOP)},
+                                  {1.0f, d2d_clr(KB_SEL_BOT)}};
+    D2D1_GRADIENT_STOP arm[2]  = {{0.0f, d2d_clr(KB_ARM_TOP)},
+                                  {1.0f, d2d_clr(KB_ARM_BOT)}};
+    // Sheen and edge are white at low alpha, fading to nothing well before the
+    // bottom - that asymmetry is what reads as "lit from above".
+    D2D1_GRADIENT_STOP sheen[3] = {
+        {0.0f, D2D1::ColorF(1, 1, 1, 0.085f)},
+        {0.42f, D2D1::ColorF(1, 1, 1, 0.018f)},
+        {1.0f, D2D1::ColorF(1, 1, 1, 0.0f)}};
+    D2D1_GRADIENT_STOP edge[3] = {
+        {0.0f, D2D1::ColorF(1, 1, 1, 0.50f)},
+        {0.30f, D2D1::ColorF(1, 1, 1, 0.07f)},
+        {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
+    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(30, 30, 35))},
+                                  {1.0f, d2d_clr(KB_CLR_BG)}};
+    g_br_kb_face_g = make_vgrad(g_rt_kb, face, 2);
+    g_br_kb_sel_g  = make_vgrad(g_rt_kb, sel, 2);
+    g_br_kb_arm_g  = make_vgrad(g_rt_kb, arm, 2);
+    g_br_kb_sheen  = make_vgrad(g_rt_kb, sheen, 3);
+    g_br_kb_edge   = make_vgrad(g_rt_kb, edge, 3);
+    g_br_kb_card   = make_vgrad(g_rt_kb, card, 2);
     return true;
 }
 
@@ -1589,37 +1661,63 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rt_kb->BeginDraw();
             g_rt_kb->Clear(d2d_clr(KB_CLR_BG));
 
+            // The card itself gets the same treatment as the keys: a slightly
+            // lifted top fading into the background, plus a lit top edge.
+            {
+                D2D1_SIZE_F sz = g_rt_kb->GetSize();
+                D2D1_RECT_F cr = D2D1::RectF(0, 0, sz.width, sz.height);
+                set_vgrad(g_br_kb_card, 0, 0, sz.height * 0.6f);
+                g_rt_kb->FillRectangle(cr, g_br_kb_card);
+                set_vgrad(g_br_kb_edge, 0, 0, 26.0f);
+                g_rt_kb->DrawRoundedRectangle(D2D1::RoundedRect(cr, 16.0f, 16.0f),
+                                              g_br_kb_edge, 1.4f);
+            }
+
             for (int r = 0; r < KB_NROWS; r++) {
                 for (int i = 0; i < KB_COUNT[r]; i++) {
                     RECT kr = kb_key_rect(r, i);
                     D2D1_RECT_F kf = D2D1::RectF((float)kr.left, (float)kr.top,
                                                  (float)kr.right, (float)kr.bottom);
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(kf, 12.0f, 12.0f);
                     bool sel = (r == g_kb_row && i == g_kb_col);
                     bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
 
-                    ID2D1SolidColorBrush* fill =
-                        sel ? g_br_kb_sel : (armed ? g_br_kb_armed : g_br_kb_key);
+                    // Base: a vertical gradient, lit at the top edge.
+                    ID2D1Brush* fill = g_br_kb_face_g;
+                    if (sel)        fill = g_br_kb_sel_g;
+                    else if (armed) fill = g_br_kb_arm_g;
+                    set_vgrad((ID2D1LinearGradientBrush*)fill, kf.left, kf.top, kf.bottom);
+
                     if (sel && g_kb_pulse_t0) {
                         // key-press flash: bright at press, decaying back to accent
                         double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
                                            / KB_PULSE_MS;
                         if (f > 0.0) {
                             g_br_kb_flash->SetColor(
-                                d2d_clr(lerp_clr(KB_CLR_SEL, RGB(150, 205, 255), f)));
+                                d2d_clr(lerp_clr(KB_CLR_SEL, RGB(255, 236, 190), f)));
                             fill = g_br_kb_flash;
                         }
                     }
                     // Gentle glow around the selected key so it reads at a
                     // distance (this is a couch/TV UI).
                     if (sel)
-                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, 12.0f, 7.0f, 0.30f, 3);
+                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, 12.0f, 7.0f, 0.26f, 3);
 
-                    g_rt_kb->FillRoundedRectangle(
-                        D2D1::RoundedRect(kf, 12.0f, 12.0f), fill);
+                    g_rt_kb->FillRoundedRectangle(rr, fill);
+
+                    // Sheen falling away from the top, then the lit top edge.
+                    // Both fade out before the bottom, which is what sells the
+                    // raised look without any transparency.
+                    set_vgrad(g_br_kb_sheen, kf.left, kf.top, kf.bottom);
+                    g_rt_kb->FillRoundedRectangle(rr, g_br_kb_sheen);
+                    set_vgrad(g_br_kb_edge, kf.left, kf.top, kf.bottom);
+                    g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_edge, 1.3f);
+
                     if (g_tf_key)
                         g_rt_kb->DrawText(KB_ROWS[r][i].label,
                                           (UINT32)wcslen(KB_ROWS[r][i].label),
-                                          g_tf_key, kf, g_br_kb_text);
+                                          g_tf_key, kf,
+                                          sel ? g_br_kb_text_dark : g_br_kb_text);
                 }
             }
 
