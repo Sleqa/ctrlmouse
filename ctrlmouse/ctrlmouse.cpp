@@ -59,10 +59,11 @@ struct Config {
     bool   enabled;
     int    toggle_button;       // controller button that toggles enable/disable
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
+    bool   exclusive;           // hold the pad exclusively while the mapping is on
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true};
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, true};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -109,11 +110,13 @@ static void save_config(const Config& c) {
             "  \"deadzone\": %.3f,\n"
             "  \"enabled\": %s,\n"
             "  \"toggle_button\": %d,\n"
-            "  \"game_pause\": %s\n"
+            "  \"game_pause\": %s,\n"
+            "  \"exclusive\": %s\n"
             "}\n",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false", c.toggle_button,
-            c.game_pause ? "true" : "false");
+            c.game_pause ? "true" : "false",
+            c.exclusive ? "true" : "false");
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -157,6 +160,7 @@ static Config load_config() {
     double tb;
     if (parse_double(s, "toggle_button", tb)) c.toggle_button = (int)tb;
     parse_bool(s, "game_pause", c.game_pause);
+    parse_bool(s, "exclusive", c.exclusive);
     return c;
 }
 
@@ -279,6 +283,7 @@ static BYTE     g_hid_buf[256];
 static bool     g_hid_pending = false;
 static USHORT   g_hid_inlen = 0;
 static PadState g_hid_state = {};
+static bool     g_hid_exclusive = false;   // did we actually get exclusive access?
 
 static void hid_close() {
     if (g_hid != INVALID_HANDLE_VALUE) {
@@ -291,12 +296,14 @@ static void hid_close() {
     g_hid_state.hat = -1;
 }
 
-static bool hid_try_path(const wchar_t* path) {
-    // Shared access: a streaming client or Steam may legitimately hold the pad
-    // at the same time, and we only ever read.
+static bool hid_try_path(const wchar_t* path, bool exclusive) {
+    // Exclusive (share mode 0) stops other user-mode apps opening the pad, so
+    // D-pad/L3/face buttons stop leaking into whatever else is running while
+    // we own the controller. Shared lets a streaming client or Steam hold it
+    // at the same time; we only ever read either way.
     HANDLE h = CreateFileW(path, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                           exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE),
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
     if (h == INVALID_HANDLE_VALUE) return false;
 
     HIDD_ATTRIBUTES attr = {sizeof(attr)};
@@ -324,8 +331,7 @@ static bool hid_try_path(const wchar_t* path) {
     return true;
 }
 
-static bool hid_open() {
-    if (g_hid != INVALID_HANDLE_VALUE) return true;
+static bool hid_scan(bool exclusive) {
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
     HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
@@ -342,7 +348,7 @@ static bool hid_open() {
         if (!det) continue;
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
         if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, NULL) &&
-            hid_try_path(det->DevicePath)) {
+            hid_try_path(det->DevicePath, exclusive)) {
             free(det);
             SetupDiDestroyDeviceInfoList(set);
             return true;
@@ -350,6 +356,15 @@ static bool hid_open() {
         free(det);
     }
     SetupDiDestroyDeviceInfoList(set);
+    return false;
+}
+
+// Exclusive is best-effort: if something already holds the pad we still want
+// to work, just without blocking it.
+static bool hid_open(bool exclusive) {
+    if (g_hid != INVALID_HANDLE_VALUE) return true;
+    if (exclusive && hid_scan(true)) { g_hid_exclusive = true; return true; }
+    if (hid_scan(false)) { g_hid_exclusive = false; return true; }
     return false;
 }
 
@@ -547,6 +562,11 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool tbtn_prev = false;                // toggle-button edge state
     ULONGLONG gamechk_last = 0;            // last fullscreen-game check
     bool game_prev = false;                // previous fullscreen-game state
+    // Whether the pad should be held exclusively right now. Computed at the
+    // end of each iteration from the mapping state, so the pad is grabbed only
+    // while we are actually driving the mouse and is handed straight back the
+    // moment the mapping is switched off or pauses for a game.
+    bool want_exclusive = false;
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -558,7 +578,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         st.hat = -1;
         bool got = false;
 
-        if (g_hid != INVALID_HANDLE_VALUE || (!g_dev && hid_open()))
+        if (g_hid != INVALID_HANDLE_VALUE || (!g_dev && hid_open(want_exclusive)))
             got = hid_poll(st);
 
         if (!got && g_hid == INVALID_HANDLE_VALUE) {
@@ -736,6 +756,17 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
         edge_click(a, a_down, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
         edge_click(b, b_down, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+
+        // Re-open the pad if the required access level changed. Dropping the
+        // handle is what hands the controller back to other apps, so this is
+        // also what makes the toggle button work as a "give me my pad back"
+        // gesture mid-stream.
+        bool now_exclusive = cfg.exclusive && mapping_on && !g_capture;
+        if (now_exclusive != want_exclusive) {
+            want_exclusive = now_exclusive;
+            if (g_hid != INVALID_HANDLE_VALUE && g_hid_exclusive != now_exclusive)
+                hid_close();   // reopened at the top of the next iteration
+        }
 
         Sleep(8);  // ~120 Hz
     }
@@ -1224,7 +1255,7 @@ static const int kTrackHi[3] = {60, 50, 50};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 360
+#define WIN_H 392
 
 static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
 static const RECT kTrackRect[3] = {
@@ -1242,25 +1273,29 @@ static const RECT kValRect[3] = {
     {284, 118, 284 + 80, 118 + 18},
     {284, 180, 284 + 80, 180 + 18},
 };
-static const RECT kToggleRect[2] = {
+#define NTOGGLES 3
+static const RECT kToggleRect[NTOGGLES] = {
     {20, 244, 20 + 46, 244 + 22},
     {196, 244, 196 + 46, 244 + 22},
+    {20, 276, 20 + 46, 276 + 22},
 };
-static const RECT kToggleLabel[2] = {
+static const RECT kToggleLabel[NTOGGLES] = {
     {74, 246, 74 + 110, 246 + 18},
     {250, 246, 250 + 114, 246 + 18},
+    {74, 278, 74 + 260, 278 + 18},
 };
-static const RECT kBindLabelRect = {20, 282, 20 + 100, 282 + 18};
-static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
-static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
+static const RECT kBindLabelRect = {20, 314, 20 + 100, 314 + 18};
+static const RECT kBindValRect = {124, 314, 124 + 150, 314 + 18};
+static const RECT kBindBtnRect = {284, 310, 284 + 80, 310 + 24};
 static const RECT kHelpRect[2] = {
-    {20, 314, 20 + 352, 314 + 18},
-    {20, 332, 20 + 352, 332 + 18},
+    {20, 346, 20 + 352, 346 + 18},
+    {20, 364, 20 + 352, 364 + 18},
 };
 
 static const wchar_t* kTrackLabel[3] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
-static const wchar_t* kToggleText[2] = {L"Enabled", L"Pause in games"};
+static const wchar_t* kToggleText[NTOGGLES] = {
+    L"Enabled", L"Pause in games", L"Take exclusive control of the pad"};
 static const wchar_t* kHelpText[2] = {
     L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
     L"Circle backspace).  Close sends to tray; tray icon to quit."};
@@ -1359,18 +1394,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             apply_track_pos(idx, track_pos_from_x(idx, pt.x));
             return 0;
         }
-        if (PtInRect(&kToggleRect[0], pt)) {
+        for (int i = 0; i < NTOGGLES; i++) {
+            if (!PtInRect(&kToggleRect[i], pt)) continue;
             EnterCriticalSection(&g_cs);
-            g_cfg.enabled = !g_cfg.enabled;
-            Config c = g_cfg;
-            LeaveCriticalSection(&g_cs);
-            save_config(c);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
-        if (PtInRect(&kToggleRect[1], pt)) {
-            EnterCriticalSection(&g_cs);
-            g_cfg.game_pause = !g_cfg.game_pause;
+            if (i == 0)      g_cfg.enabled = !g_cfg.enabled;
+            else if (i == 1) g_cfg.game_pause = !g_cfg.game_pause;
+            else             g_cfg.exclusive = !g_cfg.exclusive;
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
@@ -1422,7 +1451,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 for (int i = 0; i < 3; i++)
                     g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
                                         g_tf_label, to_f(kLabelRect[i]), g_br_main_dim);
-                for (int i = 0; i < 2; i++)
+                for (int i = 0; i < NTOGGLES; i++)
                     g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
                 g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
@@ -1477,8 +1506,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Toggle switches: pill track + sliding white knob.
             Config c = get_cfg();
-            bool toggle_on[2] = {c.enabled, c.game_pause};
-            for (int i = 0; i < 2; i++) {
+            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause, c.exclusive};
+            for (int i = 0; i < NTOGGLES; i++) {
                 const RECT& r = kToggleRect[i];
                 float h = (float)(r.bottom - r.top);
                 g_rt_main->FillRoundedRectangle(
