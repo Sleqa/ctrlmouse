@@ -570,6 +570,9 @@ static USHORT   g_hid_inlen = 0;
 static PadState g_hid_state = {};
 static bool     g_hid_exclusive = false;   // did we actually get exclusive access?
 static bool     g_hid_bt = false;          // Bluetooth transport (vs USB)
+// Bumped on every (re)open. The worker uses it to tell that its edge-detection
+// state refers to a handle that no longer exists.
+static unsigned g_hid_gen = 0;
 
 static void hid_close() {
     if (g_hid != INVALID_HANDLE_VALUE) {
@@ -625,6 +628,7 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     g_hid_pending = false;
     memset(&g_hid_state, 0, sizeof(g_hid_state));
     g_hid_state.hat = -1;
+    g_hid_gen++;
     return true;
 }
 
@@ -849,6 +853,7 @@ static bool try_open(const GUID& guid) {
     set_axis_range(DIJOFS_RZ);
     g_dev->Acquire();   // may fail transiently; the poll loop retries
     g_open_guid = guid;
+    g_hid_gen++;
     return true;
 }
 
@@ -893,6 +898,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     // moment the mapping is switched off or pauses for a game.
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
+    unsigned hid_gen_seen = 0;             // handle generation our edges refer to
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -976,6 +982,21 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
         g_connected = true;
         unsigned mask = st.mask;
+
+        // A reopened handle starts with no history, so a button still held
+        // across the reopen would look like a brand new press. That is what
+        // made the toggle button fire twice: toggling changes the hide state,
+        // which rebuilds the device stack, which reopens the handle - all
+        // while the touchpad is still physically down. Treat everything as
+        // already-held; these clear themselves on the first poll that shows a
+        // button released.
+        if (g_hid_gen != hid_gen_seen) {
+            hid_gen_seen = g_hid_gen;
+            tri_prev = cross_prev = circ_prev = true;
+            tbtn_prev = true;
+            btn_mask_prev = 0xFFFFFFFFu;
+            dpad_prev = st.hat;
+        }
 
         if (g_capture) {
             // Bind capture: the first newly pressed button becomes the toggle.
