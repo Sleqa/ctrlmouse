@@ -2500,12 +2500,12 @@ static const RECT kToggleLabel[NTOGGLES] = {
 
 // Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
 // the right answer depends entirely on the app being used.
-static const RECT kFsLabelRect = {20, 406, 20 + 100, 406 + 18};
+static const RECT kFsLabelRect = {20, 376, 20 + 100, 376 + 18};
 #define NFSKEYS 3
 static const RECT kFsSeg[NFSKEYS] = {
-    {124, 402, 124 + 76, 402 + 26},
-    {206, 402, 206 + 76, 402 + 26},
-    {288, 402, 288 + 76, 402 + 26},
+    {124, 372, 124 + 76, 372 + 26},
+    {206, 372, 206 + 76, 372 + 26},
+    {288, 372, 288 + 76, 372 + 26},
 };
 static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
 
@@ -2528,11 +2528,11 @@ static const int kRowIcon[NROWS] = {
     IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB};
 static const wchar_t* kRowName[NROWS] = {
     L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
-    L"Fullscreen (hold)", L"App launcher (hold)", L"Toggle mapping",
+    L"Fullscreen (hold)", L"App launcher (hold)", L"Toggle CtrlMouse",
     L"Volume up / down", L"Seek / scrub"};
-static const wchar_t* kRowFixed[NROWS] = {
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    L"D-pad !91 !93", L"D-pad !90 !92"};
+// Fixed rows draw a D-pad glyph in place of a bind button: 0 = none,
+// 1 = vertical axis, 2 = horizontal axis.
+static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 1, 2};
 
 static RECT row_btn_rect(int i) {
     int y = ROW_Y0 + i * ROW_STEP;
@@ -2891,22 +2891,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 RECT br = row_btn_rect(i);
                 bool capturing = (g_capture && g_capture_feature == f && f >= 0);
-                if (f >= 0)
+                if (f >= 0) {
                     draw_control(g_rt_main, to_f(br), 6.0f,
                                  capturing ? g_br_main_armed : g_br_main_key,
                                  NULL);
-                if (g_tf_body) {
-                    const wchar_t* t = kRowFixed[i];
-                    wchar_t buf[32];
-                    if (f >= 0) {
-                        if (capturing) t = L"Press a button";
-                        else { button_name(c.bind[f], buf, 32); t = buf; }
+                    if (g_tf_body) {
+                        wchar_t buf[32];
+                        const wchar_t* t = L"Press a button";
+                        if (!capturing) { button_name(c.bind[f], buf, 32); t = buf; }
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body,
+                                            to_f(br), g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body,
-                                        to_f(br),
-                                        f >= 0 ? g_br_main_text : g_br_main_dim);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                } else if (kRowDpad[i]) {
+                    // Fixed to the D-pad: show the pad itself with the axis
+                    // that drives this action lit, rather than arrow glyphs.
+                    draw_dpad_icon(g_rt_main, (float)((br.left + br.right) / 2),
+                                   (float)((br.top + br.bottom) / 2),
+                                   kRowDpad[i] == 1, g_br_main_sel, g_br_main_key);
                 }
             }
 
