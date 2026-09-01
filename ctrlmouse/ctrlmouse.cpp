@@ -25,6 +25,9 @@
 #include <dwrite.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <wincodec.h>
+#include <commoncontrols.h>
+#include <shlobj.h>
 extern "C" {
 #include <hidsdi.h>
 }
@@ -48,6 +51,8 @@ extern "C" {
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -1853,6 +1858,55 @@ static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_onacc = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_face = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_border = NULL;
+// Icons are device-dependent, so they live and die with the render target.
+static ID2D1Bitmap*           g_lx_icon[LX_MAX_APPS] = {};
+static IWICImagingFactory*    g_wic = NULL;
+
+// Shell icon -> D2D bitmap. The jumbo list gives a 256px icon where one
+// exists, which matters on a high-DPI display; SHGetFileInfo's 32px icon is
+// the fallback.
+static HICON shell_icon(const wchar_t* path) {
+    SHFILEINFOW fi = {};
+    if (SHGetFileInfoW(path, 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX)) {
+        IImageList* il = NULL;
+        if (SUCCEEDED(SHGetImageList(SHIL_JUMBO, IID_IImageList, (void**)&il)) && il) {
+            HICON h = NULL;
+            il->GetIcon(fi.iIcon, ILD_TRANSPARENT, &h);
+            il->Release();
+            if (h) return h;
+        }
+    }
+    SHFILEINFOW fi2 = {};
+    if (SHGetFileInfoW(path, 0, &fi2, sizeof(fi2), SHGFI_ICON | SHGFI_LARGEICON))
+        return fi2.hIcon;
+    return NULL;
+}
+
+static ID2D1Bitmap* load_icon_bitmap(ID2D1RenderTarget* rt, const wchar_t* path) {
+    if (!rt || !g_wic) return NULL;
+    HICON ico = shell_icon(path);
+    if (!ico) return NULL;
+    IWICBitmap* wb = NULL;
+    ID2D1Bitmap* out = NULL;
+    if (SUCCEEDED(g_wic->CreateBitmapFromHICON(ico, &wb)) && wb) {
+        IWICFormatConverter* fc = NULL;
+        if (SUCCEEDED(g_wic->CreateFormatConverter(&fc)) && fc) {
+            if (SUCCEEDED(fc->Initialize(wb, GUID_WICPixelFormat32bppPBGRA,
+                                         WICBitmapDitherTypeNone, NULL, 0.0,
+                                         WICBitmapPaletteTypeMedianCut)))
+                rt->CreateBitmapFromWicBitmap(fc, NULL, &out);
+            fc->Release();
+        }
+        wb->Release();
+    }
+    DestroyIcon(ico);
+    return out;
+}
+
+static void lx_release_icons() {
+    for (int i = 0; i < LX_MAX_APPS; i++)
+        if (g_lx_icon[i]) { g_lx_icon[i]->Release(); g_lx_icon[i] = NULL; }
+}
 
 // One path per line, next to config.json - trivial to hand-edit, and avoids
 // teaching the minimal JSON writer about arrays.
@@ -1863,6 +1917,7 @@ static std::wstring apps_path() {
 }
 
 static void lx_load() {
+    lx_release_icons();
     g_lx_count = 0;
     FILE* f = _wfopen(apps_path().c_str(), L"rb, ccs=UTF-8");
     if (!f) return;
@@ -1908,11 +1963,86 @@ static std::wstring lx_label(const std::wstring& path) {
     return n;
 }
 
+// A .lnk points at the real executable, and that is what a running process
+// reports, so shortcuts have to be resolved before matching.
+static std::wstring resolve_target(const std::wstring& path) {
+    size_t d = path.find_last_of(L'.');
+    if (d == std::wstring::npos || _wcsicmp(path.c_str() + d, L".lnk") != 0)
+        return path;
+    std::wstring out = path;
+    IShellLinkW* sl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW, (void**)&sl)) && sl) {
+        IPersistFile* pf = NULL;
+        if (SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && pf) {
+            if (SUCCEEDED(pf->Load(path.c_str(), STGM_READ))) {
+                wchar_t buf[MAX_PATH] = L"";
+                if (SUCCEEDED(sl->GetPath(buf, MAX_PATH, NULL, 0)) && buf[0])
+                    out = buf;
+            }
+            pf->Release();
+        }
+        sl->Release();
+    }
+    return out;
+}
+
+struct FindAppCtx { const wchar_t* exe; const wchar_t* base; HWND found; };
+
+static const wchar_t* path_base(const wchar_t* p) {
+    const wchar_t* s = wcsrchr(p, L'\\');
+    return s ? s + 1 : p;
+}
+
+static BOOL CALLBACK find_app_cb(HWND h, LPARAM lp) {
+    FindAppCtx* c = (FindAppCtx*)lp;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    if (!GetWindowTextLengthW(h)) return TRUE;   // skip invisible helper windows
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return TRUE;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return TRUE;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD n = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(ph, 0, img, &n) != 0;
+    CloseHandle(ph);
+    if (!ok) return TRUE;
+    // Full path first; fall back to the file name, since a launcher stub may
+    // live somewhere other than the shortcut points to.
+    if (_wcsicmp(img, c->exe) == 0 || _wcsicmp(path_base(img), c->base) == 0) {
+        c->found = h;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// True if an existing window was brought forward.
+static bool activate_running(const std::wstring& path) {
+    std::wstring exe = resolve_target(path);
+    FindAppCtx c = {exe.c_str(), path_base(exe.c_str()), NULL};
+    EnumWindows(find_app_cb, (LPARAM)&c);
+    if (!c.found) return false;
+    if (IsIconic(c.found)) ShowWindow(c.found, SW_RESTORE);
+    if (!SetForegroundWindow(c.found)) {
+        // Windows refuses focus changes from a process that is not already in
+        // the foreground. SwitchToThisWindow is what the shell itself uses for
+        // alt-tab style switching; resolved dynamically as it is not in every
+        // SDK header.
+        typedef void(WINAPI * SwitchFn)(HWND, BOOL);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        SwitchFn f = u ? (SwitchFn)GetProcAddress(u, "SwitchToThisWindow") : NULL;
+        if (f) f(c.found, TRUE);
+    }
+    return true;
+}
+
 static void d2d_release_lx() {
     ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel,
                                    &g_br_lx_face, &g_br_lx_border, &g_br_lx_onacc};
     for (int i = 0; i < 6; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    lx_release_icons();
     if (g_rt_lx) { g_rt_lx->Release(); g_rt_lx = NULL; }
 }
 
@@ -1990,9 +2120,21 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_tf_key)
                         g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
                 } else if (g_tf_body) {
+                    if (!g_lx_icon[i])
+                        g_lx_icon[i] = load_icon_bitmap(g_rt_lx, g_lx_apps[i].c_str());
+                    if (g_lx_icon[i]) {
+                        float cx = (tf.left + tf.right) / 2;
+                        D2D1_RECT_F ir = D2D1::RectF(cx - 22, tf.top + 12,
+                                                     cx + 22, tf.top + 56);
+                        g_rt_lx->DrawBitmap(g_lx_icon[i], ir, 1.0f,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    }
                     std::wstring nm = lx_label(g_lx_apps[i]);
-                    D2D1_RECT_F lr = D2D1::RectF(tf.left + 10, tf.top + 10,
-                                                 tf.right - 10, tf.bottom - 10);
+                    D2D1_RECT_F lr = g_lx_icon[i]
+                        ? D2D1::RectF(tf.left + 8, tf.top + 60, tf.right - 8,
+                                      tf.bottom - 6)
+                        : D2D1::RectF(tf.left + 10, tf.top + 10, tf.right - 10,
+                                      tf.bottom - 10);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
                     g_rt_lx->DrawText(nm.c_str(), (UINT32)nm.size(),
@@ -2611,7 +2753,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_lx_sel < g_lx_count) {
                 std::wstring app = g_lx_apps[g_lx_sel];
                 lx_toggle();   // get out of the way before the app appears
-                ShellExecuteW(NULL, L"open", app.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                // Switch to it if it is already running, rather than starting
+                // a second copy.
+                if (!activate_running(app))
+                    ShellExecuteW(NULL, L"open", app.c_str(), NULL, NULL,
+                                  SW_SHOWNORMAL);
             }
             break;
         }
@@ -2771,6 +2917,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         if (mutex) CloseHandle(mutex);
         return 0;
     }
+
+    // COM for the shell APIs (icons, shortcut resolution) and WIC, which is
+    // how an HICON becomes something Direct2D can draw.
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                     IID_IWICImagingFactory, (void**)&g_wic);
 
     InitializeCriticalSection(&g_cs);
     g_cfg = load_config();
