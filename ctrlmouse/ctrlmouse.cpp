@@ -23,6 +23,10 @@
 #include <dwmapi.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
+#include <setupapi.h>
+extern "C" {
+#include <hidsdi.h>
+}
 #include <string>
 #include <cmath>
 #include <cstdio>
@@ -38,6 +42,8 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -241,6 +247,196 @@ static int pov_dir(DWORD pov) {
     return (int)(((pov + 4500) / 9000) % 4);
 }
 
+// --- Normalised pad state ---------------------------------------------------
+// Both input backends below fill this, so the worker loop does not care which
+// one is in use. Axes are [-1000, 1000]; button bit indices deliberately match
+// the DirectInput button order for a DualSense, so an existing
+// config.json "toggle_button" keeps meaning the same physical button.
+//   0 Square  1 Cross  2 Circle  3 Triangle  4 L1  5 R1  6 L2  7 R2
+//   8 Create  9 Options  10 L3  11 R3  12 PS  13 Touchpad
+struct PadState {
+    int      lx, ly, rx, ry;
+    unsigned mask;
+    int      hat;   // 0=up,1=right,2=down,3=left, -1 centred
+};
+
+// --- Raw HID backend (DualSense) --------------------------------------------
+// Why this exists: any app that takes direct HID control of a DualSense (game
+// streaming clients such as Artemis/Moonlight, DS4Windows, Steam) switches the
+// pad from its basic Bluetooth report (0x01) into the extended report (0x31).
+// The pad stays in that mode after the app exits, and Windows' own HID game
+// controller mapping cannot decode it - joy.cpl goes dead, DirectInput reports
+// nothing, and only re-pairing Bluetooth resets it. Reading the reports
+// ourselves sidesteps the whole problem: we understand both formats, so the
+// mode the pad happens to be in stops mattering.
+#define SONY_VID          0x054C
+#define PID_DUALSENSE     0x0CE6
+#define PID_DUALSENSE_EDGE 0x0DF2
+
+static HANDLE   g_hid = INVALID_HANDLE_VALUE;
+static OVERLAPPED g_hid_ov = {};
+static BYTE     g_hid_buf[256];
+static bool     g_hid_pending = false;
+static USHORT   g_hid_inlen = 0;
+static PadState g_hid_state = {};
+
+static void hid_close() {
+    if (g_hid != INVALID_HANDLE_VALUE) {
+        if (g_hid_pending) { CancelIo(g_hid); g_hid_pending = false; }
+        CloseHandle(g_hid);
+        g_hid = INVALID_HANDLE_VALUE;
+    }
+    if (g_hid_ov.hEvent) { CloseHandle(g_hid_ov.hEvent); g_hid_ov.hEvent = NULL; }
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+}
+
+static bool hid_try_path(const wchar_t* path) {
+    // Shared access: a streaming client or Steam may legitimately hold the pad
+    // at the same time, and we only ever read.
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    HIDD_ATTRIBUTES attr = {sizeof(attr)};
+    if (!HidD_GetAttributes(h, &attr) || attr.VendorID != SONY_VID ||
+        (attr.ProductID != PID_DUALSENSE && attr.ProductID != PID_DUALSENSE_EDGE)) {
+        CloseHandle(h);
+        return false;
+    }
+    PHIDP_PREPARSED_DATA pp = NULL;
+    HIDP_CAPS caps = {};
+    if (!HidD_GetPreparsedData(h, &pp)) { CloseHandle(h); return false; }
+    bool ok = HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS;
+    HidD_FreePreparsedData(pp);
+    // Skip the vendor-defined collections the DualSense also exposes; only the
+    // gamepad collection has input reports big enough to be the real thing.
+    if (!ok || caps.InputReportByteLength < 10) { CloseHandle(h); return false; }
+
+    g_hid = h;
+    g_hid_inlen = caps.InputReportByteLength;
+    if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
+    g_hid_ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hid_pending = false;
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+    return true;
+}
+
+static bool hid_open() {
+    if (g_hid != INVALID_HANDLE_VALUE) return true;
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return false;
+
+    SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, NULL) &&
+            hid_try_path(det->DevicePath)) {
+            free(det);
+            SetupDiDestroyDeviceInfoList(set);
+            return true;
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return false;
+}
+
+static inline int hid_axis(BYTE v) {   // 0..255 (128 centre) -> -1000..1000
+    int n = ((int)v - 128) * 1000 / 127;
+    if (n > 1000) n = 1000;
+    if (n < -1000) n = -1000;
+    return n;
+}
+
+// DualSense hat: 0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW,8+=centred.
+static inline int hid_hat(BYTE b) {
+    int h = b & 0x0F;
+    if (h > 7) return -1;
+    return ((h + 1) / 2) % 4;
+}
+
+static void hid_buttons(const BYTE* b, PadState& st) {
+    st.hat = hid_hat(b[0]);
+    unsigned m = 0;
+    if (b[0] & 0x10) m |= 1u << 0;    // Square
+    if (b[0] & 0x20) m |= 1u << 1;    // Cross
+    if (b[0] & 0x40) m |= 1u << 2;    // Circle
+    if (b[0] & 0x80) m |= 1u << 3;    // Triangle
+    if (b[1] & 0x01) m |= 1u << 4;    // L1
+    if (b[1] & 0x02) m |= 1u << 5;    // R1
+    if (b[1] & 0x04) m |= 1u << 6;    // L2
+    if (b[1] & 0x08) m |= 1u << 7;    // R2
+    if (b[1] & 0x10) m |= 1u << 8;    // Create
+    if (b[1] & 0x20) m |= 1u << 9;    // Options
+    if (b[1] & 0x40) m |= 1u << 10;   // L3
+    if (b[1] & 0x80) m |= 1u << 11;   // R3
+    if (b[2] & 0x01) m |= 1u << 12;   // PS
+    if (b[2] & 0x02) m |= 1u << 13;   // Touchpad click
+    st.mask = m;
+}
+
+// The three report layouts the pad can be in. USB 0x01 and Bluetooth extended
+// 0x31 share a payload that differs only by a one-byte header shift; the short
+// Bluetooth 0x01 report orders its fields differently.
+static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
+    if (len < 10) return false;
+    if (buf[0] == 0x01 && len < 40) {          // Bluetooth basic (10 bytes)
+        st.lx = hid_axis(buf[1]);
+        st.ly = hid_axis(buf[2]);
+        st.rx = hid_axis(buf[3]);
+        st.ry = hid_axis(buf[4]);
+        hid_buttons(buf + 5, st);
+        return true;
+    }
+    int off;
+    if (buf[0] == 0x01) off = 1;               // USB full report
+    else if (buf[0] == 0x31) off = 2;          // Bluetooth extended
+    else return false;
+    if (len < (DWORD)off + 10) return false;
+    st.lx = hid_axis(buf[off + 0]);
+    st.ly = hid_axis(buf[off + 1]);
+    st.rx = hid_axis(buf[off + 2]);
+    st.ry = hid_axis(buf[off + 3]);
+    hid_buttons(buf + off + 7, st);
+    return true;
+}
+
+// Drain every report queued since the last call and keep the newest, so input
+// never lags behind a pad that reports faster than this loop runs.
+static bool hid_poll(PadState& out) {
+    if (g_hid == INVALID_HANDLE_VALUE) return false;
+    bool alive = true;
+    for (int guard = 0; guard < 64; guard++) {
+        if (!g_hid_pending) {
+            ResetEvent(g_hid_ov.hEvent);
+            if (!ReadFile(g_hid, g_hid_buf, g_hid_inlen, NULL, &g_hid_ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) { alive = false; break; }
+            }
+            g_hid_pending = true;
+        }
+        if (WaitForSingleObject(g_hid_ov.hEvent, 0) != WAIT_OBJECT_0) break;
+        DWORD got = 0;
+        if (!GetOverlappedResult(g_hid, &g_hid_ov, &got, FALSE)) { alive = false; break; }
+        g_hid_pending = false;
+        hid_parse(g_hid_buf, got, g_hid_state);
+    }
+    if (!alive) { hid_close(); return false; }
+    out = g_hid_state;
+    return true;
+}
+
 // --- DirectInput controller worker -----------------------------------------
 // DirectInput axes are mapped (after SetProperty below) to [-1000, 1000]:
 //   lX  = left stick X     lY  = left stick Y     lRz = right stick Y
@@ -356,30 +552,64 @@ static DWORD WINAPI worker_thread(LPVOID) {
         Config cfg = get_cfg();
         bool a = false, b = false;
 
-        if (!ensure_device()) {
-            g_connected = false;
-            scroll_accum = 0.0;
-            edge_click_release_all(a_down, b_down);
-            Sleep(400);
-            continue;
+        // Prefer raw HID (a DualSense we can read in any report mode); fall
+        // back to DirectInput for every other pad.
+        PadState st = {};
+        st.hat = -1;
+        bool got = false;
+
+        if (g_hid != INVALID_HANDLE_VALUE || (!g_dev && hid_open()))
+            got = hid_poll(st);
+
+        if (!got && g_hid == INVALID_HANDLE_VALUE) {
+            if (!ensure_device()) {
+                g_connected = false;
+                scroll_accum = 0.0;
+                edge_click_release_all(a_down, b_down);
+                Sleep(400);
+                continue;
+            }
+            DIJOYSTATE2 js;
+            HRESULT hr = g_dev->Poll();
+            if (FAILED(hr)) {
+                hr = g_dev->Acquire();
+                if (SUCCEEDED(hr)) hr = g_dev->Poll();  // fresh data after re-acquiring
+            }
+            if (SUCCEEDED(hr)) hr = g_dev->GetDeviceState(sizeof(js), &js);
+
+            if (FAILED(hr)) {  // unplugged, or another app took the device
+                drop_device();
+                g_connected = false;
+                scroll_accum = 0.0;
+                // Let go of anything we are holding down. Without this an
+                // injected LEFTDOWN outlives the app: the desktop is stuck
+                // mid-drag, and even killing the process cannot clear it,
+                // because the button state lives in the OS input stack
+                // rather than in here.
+                edge_click_release_all(a_down, b_down);
+                tri_prev = cross_prev = circ_prev = false;
+                tbtn_prev = false;
+                dpad_prev = -1;
+                btn_mask_prev = 0;
+                Sleep(300);
+                continue;
+            }
+            st.lx = js.lX;
+            st.ly = js.lY;
+            st.ry = js.lRz;
+            st.hat = pov_dir(js.rgdwPOV[0]);
+            for (int bi = 0; bi < 32; bi++)
+                if (js.rgbButtons[bi] & 0x80) st.mask |= (1u << bi);
+            if (st.mask || st.lx || st.ly || st.ry || st.hat != -1) {
+                g_last_good = g_open_guid;   // remember the real pad, not a virtual one
+                g_have_last_good = true;
+            }
+            got = true;
         }
 
-        DIJOYSTATE2 js;
-        HRESULT hr = g_dev->Poll();
-        if (FAILED(hr)) {
-            hr = g_dev->Acquire();
-            if (SUCCEEDED(hr)) hr = g_dev->Poll();  // fresh data after re-acquiring
-        }
-        if (SUCCEEDED(hr)) hr = g_dev->GetDeviceState(sizeof(js), &js);
-
-        if (FAILED(hr)) {  // unplugged, or another app took the device
-            drop_device();
+        if (!got) {   // HID pad went away mid-read
             g_connected = false;
             scroll_accum = 0.0;
-            // Let go of anything we are holding down. Without this an injected
-            // LEFTDOWN outlives the app: the desktop is stuck mid-drag, and
-            // even killing the process cannot clear it, because the button
-            // state lives in the OS input stack rather than in here.
             edge_click_release_all(a_down, b_down);
             tri_prev = cross_prev = circ_prev = false;
             tbtn_prev = false;
@@ -390,19 +620,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         }
 
         g_connected = true;
-
-        // Pressed-button mask (cheap; also drives bind capture).
-        unsigned mask = 0;
-        for (int bi = 0; bi < 32; bi++)
-            if (js.rgbButtons[bi] & 0x80) mask |= (1u << bi);
-
-        // Once a pad actually reports something, remember it as the real one
-        // so we re-open it (not a virtual pad) after a game exits.
-        if (mask || js.lX || js.lY || js.lRz ||
-            LOWORD(js.rgdwPOV[0]) != 0xFFFF) {
-            g_last_good = g_open_guid;
-            g_have_last_good = true;
-        }
+        unsigned mask = st.mask;
 
         if (g_capture) {
             // Bind capture: the first newly pressed button becomes the toggle.
@@ -440,6 +658,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // again - which looked like a soft lock that only replugging fixed.
         if (game_prev && !g_game_active) {
             drop_device();
+            hid_close();   // reopened next iteration, in whatever mode it is now in
             edge_click_release_all(a_down, b_down);
             tri_prev = cross_prev = circ_prev = false;
             tbtn_prev = false;
@@ -455,13 +674,13 @@ static DWORD WINAPI worker_thread(LPVOID) {
                           !(cfg.game_pause && g_game_active && !g_override);
 
         if (mapping_on && !g_capture) {
-            double nlx = norm(js.lX, cfg.deadzone);
-            double nly = norm(js.lY, cfg.deadzone);  // DInput Y is screen-oriented
+            double nlx = norm(st.lx, cfg.deadzone);
+            double nly = norm(st.ly, cfg.deadzone);  // Y is screen-oriented
             LONG dx = (LONG)std::lround(nlx * cfg.mouse_sensitivity);
             LONG dy = (LONG)std::lround(nly * cfg.mouse_sensitivity);
             if (dx || dy) mouse_move(dx, dy);
 
-            double nrz = norm(js.lRz, cfg.deadzone);  // right stick Y
+            double nrz = norm(st.ry, cfg.deadzone);  // right stick Y
             if (nrz != 0.0) {
                 scroll_accum += -nrz * cfg.scroll_sensitivity;  // stick up -> scroll up
                 int steps = (int)scroll_accum;
@@ -473,9 +692,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 scroll_accum = 0.0;
             }
 
-            bool cross = (js.rgbButtons[1] & 0x80) != 0;   // Cross
-            bool circle = (js.rgbButtons[2] & 0x80) != 0;  // Circle
-            bool tri = (js.rgbButtons[3] & 0x80) != 0;     // Triangle
+            bool cross  = (mask >> 1) & 1;
+            bool circle = (mask >> 2) & 1;
+            bool tri    = (mask >> 3) & 1;
 
             if (tri && !tri_prev)
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
@@ -489,7 +708,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_BACKSPACE, 0);
                 // D-pad with hold-to-repeat: first move immediately, then
                 // after 400ms repeat every 110ms while held.
-                int dir = pov_dir(js.rgdwPOV[0]);
+                int dir = st.hat;
                 ULONGLONG tnow = GetTickCount64();
                 if (dir != dpad_prev) {
                     if (dir != -1) {
@@ -524,6 +743,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     // Never exit holding a button: an unmatched LEFTDOWN would leave the whole
     // desktop stuck in a drag after we are gone.
     edge_click_release_all(a_down, b_down);
+    hid_close();
     drop_device();
     if (g_di) {
         g_di->Release();
