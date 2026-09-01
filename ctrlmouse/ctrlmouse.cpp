@@ -24,6 +24,7 @@
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 extern "C" {
 #include <hidsdi.h>
 }
@@ -45,6 +46,7 @@ extern "C" {
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -268,10 +270,15 @@ static int          g_pad_inst_count = 0;
 #define HH_CTL(n)      CTL_CODE(32769, (n), METHOD_BUFFERED, FILE_READ_DATA)
 #define HH_GET_WHITELIST          HH_CTL(2048)
 #define HH_SET_WHITELIST          HH_CTL(2049)
+#define HH_GET_BLACKLIST          HH_CTL(2050)
+#define HH_SET_BLACKLIST          HH_CTL(2051)
 #define HH_GET_ACTIVE             HH_CTL(2052)
 #define HH_SET_ACTIVE             HH_CTL(2053)
-#define HH_ADD_SESSION_BLACKLIST  HH_CTL(2056)
-#define HH_CLR_SESSION_BLACKLIST  HH_CTL(2057)
+// NOTE: the session blacklist (2056/2057) exists only on HidHide's master
+// branch - no released build implements it - so the persistent blacklist is
+// the only option that works on an installable version. That means the change
+// has to be rolled back explicitly, including after a crash; see
+// hh_restore_file().
 #define HH_RELEASES_URL L"https://github.com/nefarius/HidHide/releases/latest"
 
 static HANDLE g_hh = INVALID_HANDLE_VALUE;
@@ -384,14 +391,87 @@ static bool hh_whitelist_self() {
 // exit or crash, so the pad can never be left hidden.
 static BOOLEAN g_hh_prev_active = FALSE;
 static bool    g_hh_changed_active = false;
+static std::wstring g_hh_saved_blacklist;   // caller's list, before we touched it
+static bool         g_hh_have_saved = false;
+
+static bool hh_read_multi_sz(DWORD code, std::wstring& out) {
+    DWORD need = 0;
+    DeviceIoControl(g_hh, code, NULL, 0, NULL, 0, &need, NULL);
+    out.clear();
+    if (need < sizeof(wchar_t)) { out.push_back(L'\0'); return true; }
+    out.resize(need / sizeof(wchar_t));
+    DWORD got = 0;
+    if (!DeviceIoControl(g_hh, code, NULL, 0, &out[0],
+                         (DWORD)(out.size() * sizeof(wchar_t)), &got, NULL))
+        return false;
+    out.resize(got / sizeof(wchar_t));
+    if (out.empty()) out.push_back(L'\0');
+    return true;
+}
+
+// Because we have to mutate HidHide's persistent blacklist, a crash between
+// hiding and restoring would leave the user's pad hidden with no obvious
+// cause. So the original list is written to disk before the first change and
+// replayed on the next start if it is still there.
+static std::wstring hh_restore_file() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"hidhide_restore.bin";
+}
+
+static void hh_write_restore(const std::wstring& list) {
+    HANDLE f = CreateFileW(hh_restore_file().c_str(), GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(f, list.data(), (DWORD)(list.size() * sizeof(wchar_t)), &w, NULL);
+    CloseHandle(f);
+}
+
+static void hh_clear_restore() { DeleteFileW(hh_restore_file().c_str()); }
+
+// Replay a blacklist left behind by a previous run that did not shut down
+// cleanly. Runs before we touch anything else.
+static void hh_recover_blacklist() {
+    HANDLE f = CreateFileW(hh_restore_file().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD sz = GetFileSize(f, NULL);
+    if (sz && sz != INVALID_FILE_SIZE && (sz % sizeof(wchar_t)) == 0) {
+        std::wstring list;
+        list.resize(sz / sizeof(wchar_t));
+        DWORD r = 0;
+        if (ReadFile(f, &list[0], sz, &r, NULL) && r == sz)
+            hh_ioctl(HH_SET_BLACKLIST, list);
+    }
+    CloseHandle(f);
+    hh_clear_restore();
+}
+
+// Rebuild the device stack so HidHide's filter re-evaluates it. Without this
+// the blacklist only takes effect the next time the pad is reconnected, which
+// is what HidHide's own documentation tells users to do by hand.
+static void hh_restart_devices() {
+    for (int i = 0; i < g_pad_inst_count; i++) {
+        DEVINST inst;
+        if (CM_Locate_DevNodeW(&inst, (DEVINSTID_W)g_pad_inst[i].c_str(),
+                               CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+            continue;
+        PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
+        CM_Query_And_Remove_SubTreeW(inst, &veto, NULL, 0, CM_REMOVE_NO_RESTART);
+        CM_Setup_DevNode(inst, CM_SETUP_DEVNODE_READY);
+    }
+}
 
 static bool hh_hide(bool on) {
     if (g_hh == INVALID_HANDLE_VALUE || on == g_hh_hiding) return true;
     DWORD ret = 0;
     if (!on) {
-        std::wstring empty;
-        empty.push_back(L'\0');
-        hh_ioctl(HH_CLR_SESSION_BLACKLIST, empty);
+        if (g_hh_have_saved) {
+            hh_ioctl(HH_SET_BLACKLIST, g_hh_saved_blacklist);
+            g_hh_have_saved = false;
+            hh_clear_restore();
+        }
         // Only put the global switch back if we were the ones who turned it
         // on. The user may be hiding other devices with it, and forcing it off
         // would silently break their own HidHide setup.
@@ -401,11 +481,34 @@ static bool hh_hide(bool on) {
             g_hh_changed_active = false;
         }
         g_hh_hiding = false;
+        hh_restart_devices();
         return true;
     }
     if (!g_hh_whitelisted || !g_pad_inst_count) return false;
-    std::wstring payload = hh_multi_sz(g_pad_inst, g_pad_inst_count);
-    if (!hh_ioctl(HH_ADD_SESSION_BLACKLIST, payload)) return false;
+
+    // Append our pad to whatever the user already hides, never replace it.
+    if (!g_hh_have_saved) {
+        if (!hh_read_multi_sz(HH_GET_BLACKLIST, g_hh_saved_blacklist))
+            return false;   // never overwrite a list we could not read
+        hh_write_restore(g_hh_saved_blacklist);
+        g_hh_have_saved = true;
+    }
+    std::wstring items[MAX_INST + 64];
+    int n = 0;
+    for (size_t i = 0; i < g_hh_saved_blacklist.size() && n < 64;) {
+        size_t e = g_hh_saved_blacklist.find(L'\0', i);
+        if (e == std::wstring::npos || e == i) break;
+        items[n++] = g_hh_saved_blacklist.substr(i, e - i);
+        i = e + 1;
+    }
+    for (int i = 0; i < g_pad_inst_count && n < MAX_INST + 64; i++) {
+        bool dup = false;
+        for (int j = 0; j < n; j++)
+            if (_wcsicmp(items[j].c_str(), g_pad_inst[i].c_str()) == 0) dup = true;
+        if (!dup) items[n++] = g_pad_inst[i];
+    }
+    std::wstring payload = hh_multi_sz(items, n);
+    if (!hh_ioctl(HH_SET_BLACKLIST, payload)) return false;
 
     // HidHide has a global on/off switch, and a blacklist means nothing while
     // it is off. Read the old value if we can - purely so we can put it back -
@@ -429,6 +532,7 @@ static bool hh_hide(bool on) {
         return false;
 
     g_hh_hiding = true;
+    hh_restart_devices();   // make the filter re-evaluate the pad right away
     return true;
 }
 
@@ -2042,6 +2146,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // only ever enabled if that worked, so we can't hide the pad from
     // ourselves. Requires elevation, and failing is not fatal.
     if (hh_open()) {
+        hh_recover_blacklist();   // undo a previous run that died while hiding
         g_hh_whitelisted = hh_whitelist_self();
         // Writing HidHide's whitelist needs elevation. Rather than force a UAC
         // prompt on every launch with a manifest, ask only when we actually

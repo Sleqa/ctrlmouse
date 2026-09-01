@@ -21,4 +21,5 @@ target_link_libraries(ctrlmouse PRIVATE
     hid
     setupapi
     advapi32
+    cfgmgr32
 )
