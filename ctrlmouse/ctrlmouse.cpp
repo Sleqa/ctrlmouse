@@ -1385,25 +1385,22 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 // Dark theme palette. Keys are not flat fills: each is a soft vertical
 // gradient with a lit top edge and a faint sheen falling away from it, which
 // is what gives a physical, raised look without any transparency.
-// Selection does not recolour the key. The face stays dark and instead gains a
-// glow around it and a coloured glyph, so the keyboard keeps an even tone and
-// the highlight reads as light rather than paint.
-#define KB_CLR_BG    RGB(5, 5, 6)        // window background - near black
-// KB_CLR_KEY stays a mid tone: it is the settings window's slider channel and
-// button fill, which would disappear at the keyboard's near-black values.
-#define KB_CLR_KEY   RGB(40, 40, 46)
-#define KB_CLR_SEL   RGB(72, 158, 255)   // accent - blue, used for glow + glyph
-#define KB_CLR_ARMED RGB(46, 60, 82)     // Shift key while armed
-#define KB_CLR_TEXT  RGB(232, 232, 238)  // key labels
-
-// The whole key is near black, top included, with only a slight fall from top
-// to bottom. Almost all of the separation from the card comes from the lit top
-// edge rather than from the fill being lighter.
-#define KB_KEY_TOP   RGB(16, 16, 19)     // key gradient, lit top
-#define KB_KEY_BOT   RGB(11, 11, 14)     // key gradient, shaded bottom
-#define KB_ARM_TOP   RGB(24, 33, 48)
-#define KB_ARM_BOT   RGB(14, 19, 29)
-#define KB_RADIUS    17.0f               // generous corners - deliberately bubbly
+// Windows 11 Fluent dark theme. Values follow the documented WinUI resources
+// so the popups read as part of the OS rather than as a lookalike: flat fills,
+// a single hairline border, small corner radii, and accent-filled selection
+// with black text - which is what dark-theme Windows does, because the dark
+// accent is a light blue.
+#define KB_CLR_BG     RGB(32, 32, 32)    // SolidBackgroundFillColorBase
+#define KB_CLR_KEY    RGB(59, 59, 59)    // ControlFillColorDefault over the base
+#define KB_CLR_SEL    RGB(76, 194, 255)  // AccentFillColorDefault (dark theme)
+#define KB_CLR_ARMED  RGB(90, 90, 90)    // toggled control, kept neutral so it
+                                         // does not compete with selection
+#define KB_CLR_TEXT   RGB(255, 255, 255) // TextFillColorPrimary
+#define KB_CLR_TEXT2  RGB(200, 200, 200) // TextFillColorSecondary (~78.6%)
+#define KB_CLR_ONACC  RGB(0, 0, 0)       // TextOnAccentFillColorPrimary
+#define KB_BORDER_A   0.08f              // ControlStrokeColorDefault (~7%)
+#define KB_RADIUS     6.0f               // control corner radius
+#define KB_CARD_RADIUS 8.0f              // flyout / container corner radius
 
 static HWND   g_kb = NULL;
 static int    g_kb_row = 1, g_kb_col = 0;
@@ -1421,7 +1418,6 @@ static int       g_kb_x = 0, g_kb_y = 0;  // resting position
 #define KB_ANIM_MS  160
 #define KB_PULSE_MS 140
 #define KB_SLIDE    26
-#define KB_BREATH_MS 2200   // glow breathing cycle
 
 static void init_theme() {
     g_kb_bg = CreateSolidBrush(KB_CLR_BG);
@@ -1458,6 +1454,7 @@ static ID2D1SolidColorBrush*  g_br_main_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_main_white = NULL;
 static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
 static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
+static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
 
 static ID2D1HwndRenderTarget* g_rt_kb = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_key = NULL;
@@ -1465,13 +1462,8 @@ static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
-// Depth: a vertical gradient per key, a sheen falling from the top edge, and a
-// stroke that is bright at the top and fades out before the sides.
-static ID2D1LinearGradientBrush* g_br_kb_face_g = NULL;
-static ID2D1LinearGradientBrush* g_br_kb_arm_g = NULL;
-static ID2D1LinearGradientBrush* g_br_kb_sheen = NULL;
-static ID2D1LinearGradientBrush* g_br_kb_edge = NULL;
-static ID2D1LinearGradientBrush* g_br_kb_card = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_onacc = NULL;   // label on an accent fill
+static ID2D1SolidColorBrush*  g_br_kb_border = NULL;  // hairline control stroke
 
 static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
@@ -1539,48 +1531,26 @@ static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd, bool grayscale_text) {
 // a few progressively larger, progressively fainter rounded rects behind the
 // shape. Cheap, and reads as a real blur at these sizes. Only valid over an
 // opaque background - see the note on the keyboard geometry above.
-// Vertical gradient brush. Endpoints are moved per shape at draw time, so one
-// brush serves every key.
-static ID2D1LinearGradientBrush* make_vgrad(ID2D1RenderTarget* rt,
-                                            const D2D1_GRADIENT_STOP* stops,
-                                            UINT32 count) {
-    ID2D1GradientStopCollection* col = NULL;
-    if (FAILED(rt->CreateGradientStopCollection(stops, count, &col))) return NULL;
-    ID2D1LinearGradientBrush* br = NULL;
-    rt->CreateLinearGradientBrush(
-        D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, 0), D2D1::Point2F(0, 1)),
-        col, &br);
-    col->Release();
-    return br;
-}
-
-static inline void set_vgrad(ID2D1LinearGradientBrush* b, float x, float top, float bot) {
-    if (!b) return;
-    b->SetStartPoint(D2D1::Point2F(x, top));
-    b->SetEndPoint(D2D1::Point2F(x, bot));
-}
-
-static void d2d_soft_glow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
-                          D2D1_RECT_F r, float radius, float spread,
-                          float alpha, int layers) {
-    for (int i = layers; i >= 1; i--) {
-        float o = spread * i / layers;
-        br->SetOpacity(alpha / (i * 1.35f));
-        rt->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(r.left - o, r.top - o,
-                                          r.right + o, r.bottom + o),
-                              radius + o, radius + o),
-            br);
-    }
-    br->SetOpacity(1.0f);
+// One rounded control, Fluent style: a flat fill plus a hairline stroke drawn
+// inside the bounds, so adjacent controls keep an even 1px line between them.
+static void draw_control(ID2D1RenderTarget* rt, D2D1_RECT_F r, float radius,
+                         ID2D1Brush* fill, ID2D1Brush* border) {
+    rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), fill);
+    if (border)
+        rt->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(r.left + 0.5f, r.top + 0.5f,
+                                          r.right - 0.5f, r.bottom - 0.5f),
+                              radius, radius),
+            border, 1.0f);
 }
 
 static void d2d_release_main() {
     ID2D1SolidColorBrush** bs[] = {&g_br_main_key, &g_br_main_sel, &g_br_main_armed,
                                    &g_br_main_toggle_off, &g_br_main_text,
                                    &g_br_main_dim, &g_br_main_white,
-                                   &g_br_main_status, &g_br_main_glow};
-    for (int i = 0; i < 9; i++)
+                                   &g_br_main_status, &g_br_main_glow,
+                                   &g_br_main_onacc};
+    for (int i = 0; i < 10; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
@@ -1597,19 +1567,16 @@ static bool d2d_create_main(HWND hwnd) {
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(255, 255, 255)), &g_br_main_white);
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_glow);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
     return true;
 }
 
 static void d2d_release_kb() {
     ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
-                                   &g_br_kb_text, &g_br_kb_flash};
-    for (int i = 0; i < 5; i++)
+                                   &g_br_kb_text, &g_br_kb_flash,
+                                   &g_br_kb_onacc, &g_br_kb_border};
+    for (int i = 0; i < 7; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    ID2D1LinearGradientBrush** gs[] = {&g_br_kb_face_g, &g_br_kb_arm_g,
-                                       &g_br_kb_sheen, &g_br_kb_edge,
-                                       &g_br_kb_card};
-    for (int i = 0; i < 5; i++)
-        if (*gs[i]) { (*gs[i])->Release(); *gs[i] = NULL; }
     if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
 }
 
@@ -1620,29 +1587,10 @@ static bool d2d_create_kb(HWND hwnd) {
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_flash);
-
-    D2D1_GRADIENT_STOP face[2] = {{0.0f, d2d_clr(KB_KEY_TOP)},
-                                  {1.0f, d2d_clr(KB_KEY_BOT)}};
-    D2D1_GRADIENT_STOP arm[2]  = {{0.0f, d2d_clr(KB_ARM_TOP)},
-                                  {1.0f, d2d_clr(KB_ARM_BOT)}};
-    // Sheen and edge are white at low alpha, fading to nothing well before the
-    // bottom - that asymmetry is what reads as "lit from above".
-    D2D1_GRADIENT_STOP sheen[3] = {
-        {0.0f, D2D1::ColorF(1, 1, 1, 0.085f)},
-        {0.42f, D2D1::ColorF(1, 1, 1, 0.018f)},
-        {1.0f, D2D1::ColorF(1, 1, 1, 0.0f)}};
-    D2D1_GRADIENT_STOP edge[3] = {
-        {0.0f, D2D1::ColorF(1, 1, 1, 0.32f)},
-        {0.30f, D2D1::ColorF(1, 1, 1, 0.05f)},
-        {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
-    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(12, 12, 15))},
-                                  {1.0f, d2d_clr(KB_CLR_BG)}};
-    g_br_kb_face_g = make_vgrad(g_rt_kb, face, 2);
-    g_br_kb_arm_g  = make_vgrad(g_rt_kb, arm, 2);
-    g_br_kb_sheen  = make_vgrad(g_rt_kb, sheen, 3);
-    g_br_kb_edge   = make_vgrad(g_rt_kb, edge, 3);
-    g_br_kb_card   = make_vgrad(g_rt_kb, card, 2);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_kb_onacc);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_flash);
+    g_rt_kb->CreateSolidColorBrush(
+        D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_kb_border);
     return true;
 }
 
@@ -1726,15 +1674,9 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else g_kb_pulse_t0 = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        // While the keyboard is up, keep ticking so the selection glow can
-        // breathe; drop to a slower rate once the open/close animation and the
-        // key flash are done, since nothing else needs frame-rate updates.
-        if (!active && g_kb_visible) {
-            SetTimer(hwnd, KB_TIMER, 33, NULL);
-            InvalidateRect(hwnd, NULL, FALSE);
-        } else if (!active) {
-            KillTimer(hwnd, KB_TIMER);
-        }
+        // Nothing animates while the keyboard merely sits open, so the timer
+        // stops once the open/close slide and the key flash are done.
+        if (!active) KillTimer(hwnd, KB_TIMER);
         return 0;
     }
     case WM_ERASEBKGND:
@@ -1752,16 +1694,15 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rt_kb->BeginDraw();
             g_rt_kb->Clear(d2d_clr(KB_CLR_BG));
 
-            // The card itself gets the same treatment as the keys: a slightly
-            // lifted top fading into the background, plus a lit top edge.
+            // Flyout surface: flat base colour, a hairline border and the
+            // 8px radius Windows uses for menus and flyouts.
             {
                 D2D1_SIZE_F sz = g_rt_kb->GetSize();
-                D2D1_RECT_F cr = D2D1::RectF(0, 0, sz.width, sz.height);
-                set_vgrad(g_br_kb_card, 0, 0, sz.height * 0.6f);
-                g_rt_kb->FillRectangle(cr, g_br_kb_card);
-                set_vgrad(g_br_kb_edge, 0, 0, 26.0f);
-                g_rt_kb->DrawRoundedRectangle(D2D1::RoundedRect(cr, 16.0f, 16.0f),
-                                              g_br_kb_edge, 1.4f);
+                D2D1_RECT_F cr = D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                             sz.height - 0.5f);
+                g_rt_kb->DrawRoundedRectangle(
+                    D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                    g_br_kb_border, 1.0f);
             }
 
             for (int r = 0; r < KB_NROWS; r++) {
@@ -1769,61 +1710,36 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     RECT kr = kb_key_rect(r, i);
                     D2D1_RECT_F kf = D2D1::RectF((float)kr.left, (float)kr.top,
                                                  (float)kr.right, (float)kr.bottom);
-                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(kf, KB_RADIUS, KB_RADIUS);
                     bool sel = (r == g_kb_row && i == g_kb_col);
                     bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
 
-                    // Press flash brightens the highlight rather than the key,
-                    // since the key face no longer changes colour at all.
-                    float flash = 0.0f;
-                    if (sel && g_kb_pulse_t0) {
-                        double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
-                                           / KB_PULSE_MS;
-                        if (f > 0.0) flash = (float)f;
-                    }
-
-                    // Glow sits outside the key, so the selection reads as
-                    // light spilling around it rather than a repaint. It
-                    // breathes: the spread eases down and back to full size on
-                    // a slow cycle, which keeps the eye on the cursor without
-                    // anything moving.
-                    if (sel) {
-                        double ph = (double)(GetTickCount64() % KB_BREATH_MS)
-                                    / KB_BREATH_MS;
-                        float b = 0.72f + 0.28f * (float)((1.0 + cos(ph * 6.2831853)) * 0.5);
-                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, KB_RADIUS,
-                                      10.0f * b, (0.26f + 0.40f * flash) * b, 4);
-                    }
-
-                    // Face: same dark gradient whether selected or not.
-                    ID2D1LinearGradientBrush* fill =
-                        armed ? g_br_kb_arm_g : g_br_kb_face_g;
-                    set_vgrad(fill, kf.left, kf.top, kf.bottom);
-                    g_rt_kb->FillRoundedRectangle(rr, fill);
-
-                    // Sheen falling away from the top, then the edge. Both fade
-                    // out before the bottom, which is what sells the raised
-                    // look without any transparency.
-                    set_vgrad(g_br_kb_sheen, kf.left, kf.top, kf.bottom);
-                    g_rt_kb->FillRoundedRectangle(rr, g_br_kb_sheen);
-                    if (sel) {
-                        g_br_kb_sel->SetOpacity(0.80f + 0.20f * flash);
-                        g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_sel, 1.9f);
-                        g_br_kb_sel->SetOpacity(1.0f);
-                    } else {
-                        set_vgrad(g_br_kb_edge, kf.left, kf.top, kf.bottom);
-                        g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_edge, 1.3f);
-                    }
-
-                    // The glyph carries the colour, not the key.
+                    // Selection is an accent-filled control with black text,
+                    // which is how dark-theme Windows shows a default or
+                    // selected button - the dark accent is a light blue, so
+                    // white text on it would fail contrast.
+                    ID2D1Brush* fill = g_br_kb_key;
+                    ID2D1Brush* border = g_br_kb_border;
                     ID2D1Brush* tb = g_br_kb_text;
                     if (sel) {
-                        g_br_kb_flash->SetColor(d2d_clr(
-                            lerp_clr(KB_CLR_SEL, RGB(240, 248, 255), flash)));
-                        tb = g_br_kb_flash;
+                        fill = g_br_kb_sel;
+                        border = NULL;
+                        tb = g_br_kb_onacc;
+                        // Press feedback: briefly wash the fill toward white,
+                        // matching the momentary lightening Windows uses.
+                        if (g_kb_pulse_t0) {
+                            double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
+                                               / KB_PULSE_MS;
+                            if (f > 0.0) {
+                                g_br_kb_flash->SetColor(d2d_clr(lerp_clr(
+                                    KB_CLR_SEL, RGB(255, 255, 255), f * 0.65)));
+                                fill = g_br_kb_flash;
+                            }
+                        }
                     } else if (armed) {
-                        tb = g_br_kb_sel;
+                        fill = g_br_kb_armed;
                     }
+                    draw_control(g_rt_kb, kf, KB_RADIUS, fill, border);
+
                     // Letters follow the Shift state, so the keyboard shows
                     // what will actually be typed.
                     const wchar_t* lab = KB_ROWS[r][i].label;
@@ -1934,10 +1850,9 @@ static ID2D1HwndRenderTarget* g_rt_lx = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_text = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
-static ID2D1LinearGradientBrush* g_br_lx_face = NULL;
-static ID2D1LinearGradientBrush* g_br_lx_sheen = NULL;
-static ID2D1LinearGradientBrush* g_br_lx_edge = NULL;
-static ID2D1LinearGradientBrush* g_br_lx_card = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_onacc = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_face = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_border = NULL;
 
 // One path per line, next to config.json - trivial to hand-edit, and avoids
 // teaching the minimal JSON writer about arrays.
@@ -1994,13 +1909,10 @@ static std::wstring lx_label(const std::wstring& path) {
 }
 
 static void d2d_release_lx() {
-    ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel};
-    for (int i = 0; i < 3; i++)
+    ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel,
+                                   &g_br_lx_face, &g_br_lx_border, &g_br_lx_onacc};
+    for (int i = 0; i < 6; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    ID2D1LinearGradientBrush** gs[] = {&g_br_lx_face, &g_br_lx_sheen,
-                                       &g_br_lx_edge, &g_br_lx_card};
-    for (int i = 0; i < 4; i++)
-        if (*gs[i]) { (*gs[i])->Release(); *gs[i] = NULL; }
     if (g_rt_lx) { g_rt_lx->Release(); g_rt_lx = NULL; }
 }
 
@@ -2008,24 +1920,13 @@ static bool d2d_create_lx(HWND hwnd) {
     g_rt_lx = d2d_create_rt(hwnd, true);
     if (!g_rt_lx) return false;
     g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_lx_text);
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(RGB(150, 150, 160)), &g_br_lx_dim);
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_lx_dim);
     g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_sel);
-    D2D1_GRADIENT_STOP face[2] = {{0.0f, d2d_clr(KB_KEY_TOP)},
-                                  {1.0f, d2d_clr(KB_KEY_BOT)}};
-    D2D1_GRADIENT_STOP sheen[3] = {
-        {0.0f, D2D1::ColorF(1, 1, 1, 0.085f)},
-        {0.42f, D2D1::ColorF(1, 1, 1, 0.018f)},
-        {1.0f, D2D1::ColorF(1, 1, 1, 0.0f)}};
-    D2D1_GRADIENT_STOP edge[3] = {
-        {0.0f, D2D1::ColorF(1, 1, 1, 0.32f)},
-        {0.30f, D2D1::ColorF(1, 1, 1, 0.05f)},
-        {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
-    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(12, 12, 15))},
-                                  {1.0f, d2d_clr(KB_CLR_BG)}};
-    g_br_lx_face  = make_vgrad(g_rt_lx, face, 2);
-    g_br_lx_sheen = make_vgrad(g_rt_lx, sheen, 3);
-    g_br_lx_edge  = make_vgrad(g_rt_lx, edge, 3);
-    g_br_lx_card  = make_vgrad(g_rt_lx, card, 2);
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_lx_onacc);
+    // CardBackgroundFillColorDefault sits a little above the flyout base.
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(RGB(45, 45, 45)), &g_br_lx_face);
+    g_rt_lx->CreateSolidColorBrush(
+        D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_lx_border);
     return true;
 }
 
@@ -2050,12 +1951,7 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 active = true;
             }
         }
-        if (!active && g_lx_visible) {
-            SetTimer(hwnd, LX_TIMER, 33, NULL);   // keep the glow breathing
-            InvalidateRect(hwnd, NULL, FALSE);
-        } else if (!active) {
-            KillTimer(hwnd, LX_TIMER);
-        }
+        if (!active) KillTimer(hwnd, LX_TIMER);
         return 0;
     }
     case WM_ERASEBKGND:
@@ -2071,49 +1967,32 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rt_lx->BeginDraw();
             g_rt_lx->Clear(d2d_clr(KB_CLR_BG));
             D2D1_SIZE_F sz = g_rt_lx->GetSize();
-            D2D1_RECT_F cr = D2D1::RectF(0, 0, sz.width, sz.height);
-            set_vgrad(g_br_lx_card, 0, 0, sz.height * 0.6f);
-            g_rt_lx->FillRectangle(cr, g_br_lx_card);
-            set_vgrad(g_br_lx_edge, 0, 0, 26.0f);
-            g_rt_lx->DrawRoundedRectangle(D2D1::RoundedRect(cr, 16.0f, 16.0f),
-                                          g_br_lx_edge, 1.4f);
+            g_rt_lx->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                              sz.height - 0.5f),
+                                  KB_CARD_RADIUS, KB_CARD_RADIUS),
+                g_br_lx_border, 1.0f);
             if (g_tf_header) {
                 D2D1_RECT_F hr = D2D1::RectF((float)LX_M, 14.0f,
                                              sz.width - LX_M, 14.0f + 24.0f);
                 g_rt_lx->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
             }
 
-            double ph = (double)(GetTickCount64() % KB_BREATH_MS) / KB_BREATH_MS;
-            float breath = 0.72f + 0.28f * (float)((1.0 + cos(ph * 6.2831853)) * 0.5);
-
             for (int i = 0; i < lx_tiles(); i++) {
                 RECT tr = lx_tile_rect(i);
                 D2D1_RECT_F tf = to_f(tr);
-                D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(tf, KB_RADIUS, KB_RADIUS);
                 bool sel = (i == g_lx_sel);
-                if (sel)
-                    d2d_soft_glow(g_rt_lx, g_br_lx_sel, tf, KB_RADIUS,
-                                  11.0f * breath, 0.28f * breath, 4);
-                set_vgrad(g_br_lx_face, tf.left, tf.top, tf.bottom);
-                g_rt_lx->FillRoundedRectangle(rr, g_br_lx_face);
-                set_vgrad(g_br_lx_sheen, tf.left, tf.top, tf.bottom);
-                g_rt_lx->FillRoundedRectangle(rr, g_br_lx_sheen);
-                if (sel) {
-                    g_br_lx_sel->SetOpacity(0.80f);
-                    g_rt_lx->DrawRoundedRectangle(rr, g_br_lx_sel, 1.9f);
-                    g_br_lx_sel->SetOpacity(1.0f);
-                } else {
-                    set_vgrad(g_br_lx_edge, tf.left, tf.top, tf.bottom);
-                    g_rt_lx->DrawRoundedRectangle(rr, g_br_lx_edge, 1.3f);
-                }
-                ID2D1Brush* tb = sel ? (ID2D1Brush*)g_br_lx_sel : g_br_lx_text;
+                draw_control(g_rt_lx, tf, KB_CARD_RADIUS,
+                             sel ? (ID2D1Brush*)g_br_lx_sel : g_br_lx_face,
+                             sel ? NULL : (ID2D1Brush*)g_br_lx_border);
+                ID2D1Brush* tb = sel ? (ID2D1Brush*)g_br_lx_onacc : g_br_lx_text;
                 if (i == g_lx_count) {
                     if (g_tf_key)
                         g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
                 } else if (g_tf_body) {
                     std::wstring nm = lx_label(g_lx_apps[i]);
-                    D2D1_RECT_F lr = D2D1::RectF(tf.left + 8, tf.top + 8,
-                                                 tf.right - 8, tf.bottom - 8);
+                    D2D1_RECT_F lr = D2D1::RectF(tf.left + 10, tf.top + 10,
+                                                 tf.right - 10, tf.bottom - 10);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
                     g_rt_lx->DrawText(nm.c_str(), (UINT32)nm.size(),
@@ -2612,9 +2491,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     toggle_on[i] ? g_br_main_sel : g_br_main_toggle_off);
                 float d = h - 6;
                 float kx = toggle_on[i] ? (float)r.right - 3 - d : (float)r.left + 3;
+                // Windows 11 dark theme puts a black knob on the accent fill
+                // and a white one on the off state, since the dark accent is a
+                // light blue.
                 g_rt_main->FillEllipse(
                     D2D1::Ellipse(D2D1::Point2F(kx + d / 2, (float)r.top + 3 + d / 2), d / 2, d / 2),
-                    g_br_main_white);
+                    toggle_on[i] ? (ID2D1Brush*)g_br_main_onacc : g_br_main_white);
             }
 
             // Bind button + its value text.
@@ -2652,7 +2534,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_rt_main->DrawText(kFsName[i], (UINT32)wcslen(kFsName[i]),
                                         g_tf_body, to_f(kFsSeg[i]),
-                                        on ? g_br_main_white : g_br_main_dim);
+                                        on ? (ID2D1Brush*)g_br_main_onacc
+                                           : g_br_main_dim);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             }
