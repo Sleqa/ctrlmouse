@@ -1306,19 +1306,20 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 // Dark theme palette. Keys are not flat fills: each is a soft vertical
 // gradient with a lit top edge and a faint sheen falling away from it, which
 // is what gives a physical, raised look without any transparency.
-#define KB_CLR_BG    RGB(18, 18, 21)     // window background
-#define KB_CLR_KEY   RGB(48, 48, 55)     // key face (mid tone / flat fallback)
-#define KB_CLR_SEL   RGB(228, 170, 66)   // accent - warm amber
-#define KB_CLR_ARMED RGB(92, 72, 40)     // Shift key while armed
-#define KB_CLR_TEXT  RGB(238, 238, 242)  // key labels
+// Selection does not recolour the key. The face stays dark and instead gains a
+// glow around it and a coloured glyph, so the keyboard keeps an even tone and
+// the highlight reads as light rather than paint.
+#define KB_CLR_BG    RGB(13, 13, 15)     // window background
+#define KB_CLR_KEY   RGB(38, 38, 44)     // key face (mid tone / flat fallback)
+#define KB_CLR_SEL   RGB(72, 158, 255)   // accent - blue, used for glow + glyph
+#define KB_CLR_ARMED RGB(46, 60, 82)     // Shift key while armed
+#define KB_CLR_TEXT  RGB(232, 232, 238)  // key labels
 
-#define KB_KEY_TOP   RGB(60, 60, 68)     // key gradient, lit top
-#define KB_KEY_BOT   RGB(36, 36, 42)     // key gradient, shaded bottom
-#define KB_SEL_TOP   RGB(244, 190, 86)
-#define KB_SEL_BOT   RGB(204, 138, 36)
-#define KB_ARM_TOP   RGB(104, 82, 44)
-#define KB_ARM_BOT   RGB(70, 54, 28)
-#define KB_TEXT_ON_SEL RGB(32, 22, 6)    // dark label on a bright amber key
+#define KB_KEY_TOP   RGB(48, 48, 55)     // key gradient, lit top
+#define KB_KEY_BOT   RGB(28, 28, 33)     // key gradient, shaded bottom
+#define KB_ARM_TOP   RGB(54, 68, 92)
+#define KB_ARM_BOT   RGB(34, 44, 62)
+#define KB_RADIUS    17.0f               // generous corners - deliberately bubbly
 
 static HWND   g_kb = NULL;
 static int    g_kb_row = 1, g_kb_col = 0;
@@ -1379,11 +1380,9 @@ static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
-static ID2D1SolidColorBrush*  g_br_kb_text_dark = NULL;  // label on a bright key
 // Depth: a vertical gradient per key, a sheen falling from the top edge, and a
 // stroke that is bright at the top and fades out before the sides.
 static ID2D1LinearGradientBrush* g_br_kb_face_g = NULL;
-static ID2D1LinearGradientBrush* g_br_kb_sel_g = NULL;
 static ID2D1LinearGradientBrush* g_br_kb_arm_g = NULL;
 static ID2D1LinearGradientBrush* g_br_kb_sheen = NULL;
 static ID2D1LinearGradientBrush* g_br_kb_edge = NULL;
@@ -1514,14 +1513,13 @@ static bool d2d_create_main(HWND hwnd) {
 
 static void d2d_release_kb() {
     ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
-                                   &g_br_kb_text, &g_br_kb_flash,
-                                   &g_br_kb_text_dark};
-    for (int i = 0; i < 6; i++)
+                                   &g_br_kb_text, &g_br_kb_flash};
+    for (int i = 0; i < 5; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    ID2D1LinearGradientBrush** gs[] = {&g_br_kb_face_g, &g_br_kb_sel_g,
-                                       &g_br_kb_arm_g, &g_br_kb_sheen,
-                                       &g_br_kb_edge, &g_br_kb_card};
-    for (int i = 0; i < 6; i++)
+    ID2D1LinearGradientBrush** gs[] = {&g_br_kb_face_g, &g_br_kb_arm_g,
+                                       &g_br_kb_sheen, &g_br_kb_edge,
+                                       &g_br_kb_card};
+    for (int i = 0; i < 5; i++)
         if (*gs[i]) { (*gs[i])->Release(); *gs[i] = NULL; }
     if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
 }
@@ -1533,13 +1531,10 @@ static bool d2d_create_kb(HWND hwnd) {
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_TEXT_ON_SEL), &g_br_kb_text_dark);
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_flash);
 
     D2D1_GRADIENT_STOP face[2] = {{0.0f, d2d_clr(KB_KEY_TOP)},
                                   {1.0f, d2d_clr(KB_KEY_BOT)}};
-    D2D1_GRADIENT_STOP sel[2]  = {{0.0f, d2d_clr(KB_SEL_TOP)},
-                                  {1.0f, d2d_clr(KB_SEL_BOT)}};
     D2D1_GRADIENT_STOP arm[2]  = {{0.0f, d2d_clr(KB_ARM_TOP)},
                                   {1.0f, d2d_clr(KB_ARM_BOT)}};
     // Sheen and edge are white at low alpha, fading to nothing well before the
@@ -1555,7 +1550,6 @@ static bool d2d_create_kb(HWND hwnd) {
     D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(30, 30, 35))},
                                   {1.0f, d2d_clr(KB_CLR_BG)}};
     g_br_kb_face_g = make_vgrad(g_rt_kb, face, 2);
-    g_br_kb_sel_g  = make_vgrad(g_rt_kb, sel, 2);
     g_br_kb_arm_g  = make_vgrad(g_rt_kb, arm, 2);
     g_br_kb_sheen  = make_vgrad(g_rt_kb, sheen, 3);
     g_br_kb_edge   = make_vgrad(g_rt_kb, edge, 3);
@@ -1678,46 +1672,58 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     RECT kr = kb_key_rect(r, i);
                     D2D1_RECT_F kf = D2D1::RectF((float)kr.left, (float)kr.top,
                                                  (float)kr.right, (float)kr.bottom);
-                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(kf, 12.0f, 12.0f);
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(kf, KB_RADIUS, KB_RADIUS);
                     bool sel = (r == g_kb_row && i == g_kb_col);
                     bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
 
-                    // Base: a vertical gradient, lit at the top edge.
-                    ID2D1Brush* fill = g_br_kb_face_g;
-                    if (sel)        fill = g_br_kb_sel_g;
-                    else if (armed) fill = g_br_kb_arm_g;
-                    set_vgrad((ID2D1LinearGradientBrush*)fill, kf.left, kf.top, kf.bottom);
-
+                    // Press flash brightens the highlight rather than the key,
+                    // since the key face no longer changes colour at all.
+                    float flash = 0.0f;
                     if (sel && g_kb_pulse_t0) {
-                        // key-press flash: bright at press, decaying back to accent
                         double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
                                            / KB_PULSE_MS;
-                        if (f > 0.0) {
-                            g_br_kb_flash->SetColor(
-                                d2d_clr(lerp_clr(KB_CLR_SEL, RGB(255, 236, 190), f)));
-                            fill = g_br_kb_flash;
-                        }
+                        if (f > 0.0) flash = (float)f;
                     }
-                    // Gentle glow around the selected key so it reads at a
-                    // distance (this is a couch/TV UI).
-                    if (sel)
-                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, 12.0f, 7.0f, 0.26f, 3);
 
+                    // Glow sits outside the key, so the selection reads as
+                    // light spilling around it rather than a repaint.
+                    if (sel)
+                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, KB_RADIUS, 10.0f,
+                                      0.30f + 0.40f * flash, 4);
+
+                    // Face: same dark gradient whether selected or not.
+                    ID2D1LinearGradientBrush* fill =
+                        armed ? g_br_kb_arm_g : g_br_kb_face_g;
+                    set_vgrad(fill, kf.left, kf.top, kf.bottom);
                     g_rt_kb->FillRoundedRectangle(rr, fill);
 
-                    // Sheen falling away from the top, then the lit top edge.
-                    // Both fade out before the bottom, which is what sells the
-                    // raised look without any transparency.
+                    // Sheen falling away from the top, then the edge. Both fade
+                    // out before the bottom, which is what sells the raised
+                    // look without any transparency.
                     set_vgrad(g_br_kb_sheen, kf.left, kf.top, kf.bottom);
                     g_rt_kb->FillRoundedRectangle(rr, g_br_kb_sheen);
-                    set_vgrad(g_br_kb_edge, kf.left, kf.top, kf.bottom);
-                    g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_edge, 1.3f);
+                    if (sel) {
+                        g_br_kb_sel->SetOpacity(0.80f + 0.20f * flash);
+                        g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_sel, 1.9f);
+                        g_br_kb_sel->SetOpacity(1.0f);
+                    } else {
+                        set_vgrad(g_br_kb_edge, kf.left, kf.top, kf.bottom);
+                        g_rt_kb->DrawRoundedRectangle(rr, g_br_kb_edge, 1.3f);
+                    }
 
+                    // The glyph carries the colour, not the key.
+                    ID2D1Brush* tb = g_br_kb_text;
+                    if (sel) {
+                        g_br_kb_flash->SetColor(d2d_clr(
+                            lerp_clr(KB_CLR_SEL, RGB(240, 248, 255), flash)));
+                        tb = g_br_kb_flash;
+                    } else if (armed) {
+                        tb = g_br_kb_sel;
+                    }
                     if (g_tf_key)
                         g_rt_kb->DrawText(KB_ROWS[r][i].label,
                                           (UINT32)wcslen(KB_ROWS[r][i].label),
-                                          g_tf_key, kf,
-                                          sel ? g_br_kb_text_dark : g_br_kb_text);
+                                          g_tf_key, kf, tb);
                 }
             }
 
