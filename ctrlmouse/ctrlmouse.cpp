@@ -68,8 +68,6 @@ static volatile bool    g_connected = false;
 static HANDLE           g_worker = NULL;
 static HWND             g_hwnd = NULL;
 static NOTIFYICONDATAW  g_nid = {};
-static HFONT            g_font = NULL;
-static HFONT            g_font_hdr = NULL;
 static int              g_status_state = -1;
 static wchar_t          g_status_txt[64] = L"Controller: ...";
 static wchar_t          g_mouse_val_txt[32] = L"";
@@ -484,7 +482,15 @@ static const KbKey* KB_ROWS[] = {KB_ROW0, KB_ROW1, KB_ROW2, KB_ROW3, KB_ROW4};
 static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 #define KB_NROWS 5
 
-// Geometry: 48px unit keys, 6px gaps, 12px margin.
+// Geometry, in DIPs: 48 unit keys, 6 gaps, 12 margin.
+//
+// No drop shadow around the card: this window is WS_EX_LAYERED with a single
+// constant alpha (that is what the open/close fade animates), which gives no
+// per-pixel alpha, and ID2D1HwndRenderTarget is opaque - so anything drawn
+// outside the card would composite as solid black rather than as a soft
+// shadow. Depth comes from DWM's rounded corners plus the in-card key glow
+// instead. Real per-pixel shadows would need UpdateLayeredWindow with a WIC
+// bitmap target, which is incompatible with the constant-alpha fade.
 #define KB_KU 48
 #define KB_GAP 6
 #define KB_M 12
@@ -501,9 +507,9 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 static HWND   g_kb = NULL;
 static int    g_kb_row = 1, g_kb_col = 0;
 static bool   g_kb_shift = false;
-static HFONT  g_kb_font = NULL;
-static HBRUSH g_kb_bg = NULL, g_kb_key = NULL, g_kb_sel = NULL, g_kb_armed = NULL;
-static HBRUSH g_toggle_off = NULL;
+// The only GDI object left: the window-class background brush, which just
+// prevents a white flash between window creation and the first D2D paint.
+static HBRUSH g_kb_bg = NULL;
 
 // Open/close + key-press animation state.
 static int       g_kb_anim = 0;           // 0 idle, 1 opening, 2 closing
@@ -515,40 +521,48 @@ static int       g_kb_x = 0, g_kb_y = 0;  // resting position
 #define KB_PULSE_MS 140
 #define KB_SLIDE    26
 
-// Shared dark-theme resources (used by the keyboard AND the settings window).
 static void init_theme() {
-    g_kb_font = CreateFontW(-17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_font_hdr = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_kb_bg     = CreateSolidBrush(KB_CLR_BG);
-    g_kb_key    = CreateSolidBrush(KB_CLR_KEY);
-    g_kb_sel    = CreateSolidBrush(KB_CLR_SEL);
-    g_kb_armed  = CreateSolidBrush(KB_CLR_ARMED);
-    g_toggle_off = CreateSolidBrush(RGB(62, 62, 72));
+    g_kb_bg = CreateSolidBrush(KB_CLR_BG);
 }
 
 // --- Direct2D / DirectWrite --------------------------------------------------
-// The main settings window is fully D2D-drawn (see wnd_proc's WM_PAINT). The
-// keyboard popup still uses its original GDI paint path for now; it moves to
-// D2D in a later pass.
+// Both windows are fully D2D-drawn. All layout in this file is expressed in
+// DIPs (device-independent pixels, 1 DIP = 1px at 96 DPI); each render target
+// is told the real monitor DPI, so Direct2D scales every shape and glyph to
+// physical pixels itself. That is what keeps the UI sharp on a 4K display
+// instead of being bitmap-stretched by the compositor.
+static UINT g_dpi = 96;
+
+static inline float  dpi_scale()          { return g_dpi / 96.0f; }
+static inline int    dip_to_px(int dip)   { return MulDiv(dip, (int)g_dpi, 96); }
+static inline int    px_to_dip(int px)    { return MulDiv(px, 96, (int)g_dpi); }
+
 static ID2D1Factory1*     g_d2d_factory = NULL;
 static IDWriteFactory*    g_dwrite_factory = NULL;
-static IDWriteTextFormat* g_tf_body = NULL;    // Segoe UI 12
-static IDWriteTextFormat* g_tf_header = NULL;  // Segoe UI 14 semibold
-static IDWriteTextFormat* g_tf_key = NULL;     // Segoe UI 17 semibold (keyboard, future use)
+// Sizes are DIPs, and a touch larger than the old GDI fonts: this is often
+// driven from a couch, so the text needs to hold up at a distance.
+static IDWriteTextFormat* g_tf_body = NULL;    // 13, values
+static IDWriteTextFormat* g_tf_label = NULL;   // 13, dim labels
+static IDWriteTextFormat* g_tf_header = NULL;  // 15 semibold, status line
+static IDWriteTextFormat* g_tf_key = NULL;     // 18 semibold, keyboard keys
 
 static ID2D1HwndRenderTarget* g_rt_main = NULL;
-static ID2D1SolidColorBrush*  g_br_main_bg = NULL;
 static ID2D1SolidColorBrush*  g_br_main_key = NULL;
 static ID2D1SolidColorBrush*  g_br_main_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_main_armed = NULL;
 static ID2D1SolidColorBrush*  g_br_main_toggle_off = NULL;
 static ID2D1SolidColorBrush*  g_br_main_text = NULL;
+static ID2D1SolidColorBrush*  g_br_main_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_main_white = NULL;
 static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
+static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
+
+static ID2D1HwndRenderTarget* g_rt_kb = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_key = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
 
 static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
@@ -563,63 +577,111 @@ static void d2d_init_process() {
     if (!g_dwrite_factory) return;
     g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
         DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_tf_body);
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &g_tf_body);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &g_tf_label);
     g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_tf_header);
+        DWRITE_FONT_STRETCH_NORMAL, 15.0f, L"en-us", &g_tf_header);
     g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"en-us", &g_tf_key);
-    if (g_tf_body) {
-        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_tf_body->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    }
-    if (g_tf_header) {
-        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_tf_header->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", &g_tf_key);
+    IDWriteTextFormat* left[] = {g_tf_body, g_tf_label, g_tf_header};
+    for (int i = 0; i < 3; i++) {
+        if (!left[i]) continue;
+        left[i]->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        left[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        left[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
     if (g_tf_key) {
         g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         g_tf_key->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_tf_key->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
 }
 
-static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd) {
+// grayscale = the correct AA mode for a layered (per-window alpha) popup;
+// ClearType's subpixel weights are wrong once the window is composited
+// translucently, which is what makes GDI text look fringed there today.
+static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd, bool grayscale_text) {
     if (!g_d2d_factory) return NULL;
     RECT rc;
     GetClientRect(hwnd, &rc);
     ID2D1HwndRenderTarget* rt = NULL;
-    g_d2d_factory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(hwnd,
-            D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
-        &rt);
+    if (FAILED(g_d2d_factory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(),
+            D2D1::HwndRenderTargetProperties(hwnd,
+                D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
+            &rt)))
+        return NULL;
+    rt->SetDpi((float)g_dpi, (float)g_dpi);   // draw in DIPs from here on
+    rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    rt->SetTextAntialiasMode(grayscale_text ? D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+                                            : D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
     return rt;
 }
 
+// Soft glow without ID2D1Effect (which would need a full ID2D1Device): stack
+// a few progressively larger, progressively fainter rounded rects behind the
+// shape. Cheap, and reads as a real blur at these sizes. Only valid over an
+// opaque background - see the note on the keyboard geometry above.
+static void d2d_soft_glow(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* br,
+                          D2D1_RECT_F r, float radius, float spread,
+                          float alpha, int layers) {
+    for (int i = layers; i >= 1; i--) {
+        float o = spread * i / layers;
+        br->SetOpacity(alpha / (i * 1.35f));
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(r.left - o, r.top - o,
+                                          r.right + o, r.bottom + o),
+                              radius + o, radius + o),
+            br);
+    }
+    br->SetOpacity(1.0f);
+}
+
 static void d2d_release_main() {
-    if (g_br_main_bg) { g_br_main_bg->Release(); g_br_main_bg = NULL; }
-    if (g_br_main_key) { g_br_main_key->Release(); g_br_main_key = NULL; }
-    if (g_br_main_sel) { g_br_main_sel->Release(); g_br_main_sel = NULL; }
-    if (g_br_main_armed) { g_br_main_armed->Release(); g_br_main_armed = NULL; }
-    if (g_br_main_toggle_off) { g_br_main_toggle_off->Release(); g_br_main_toggle_off = NULL; }
-    if (g_br_main_text) { g_br_main_text->Release(); g_br_main_text = NULL; }
-    if (g_br_main_white) { g_br_main_white->Release(); g_br_main_white = NULL; }
-    if (g_br_main_status) { g_br_main_status->Release(); g_br_main_status = NULL; }
+    ID2D1SolidColorBrush** bs[] = {&g_br_main_key, &g_br_main_sel, &g_br_main_armed,
+                                   &g_br_main_toggle_off, &g_br_main_text,
+                                   &g_br_main_dim, &g_br_main_white,
+                                   &g_br_main_status, &g_br_main_glow};
+    for (int i = 0; i < 9; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
 
 static bool d2d_create_main(HWND hwnd) {
-    g_rt_main = d2d_create_rt(hwnd);
+    g_rt_main = d2d_create_rt(hwnd, false);
     if (!g_rt_main) return false;
-    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_bg);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_main_key);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_sel);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_main_armed);
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(62, 62, 72)), &g_br_main_toggle_off);
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(235, 235, 240)), &g_br_main_text);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(158, 158, 170)), &g_br_main_dim);
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(255, 255, 255)), &g_br_main_white);
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_glow);
+    return true;
+}
+
+static void d2d_release_kb() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
+                                   &g_br_kb_text, &g_br_kb_flash};
+    for (int i = 0; i < 5; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
+}
+
+static bool d2d_create_kb(HWND hwnd) {
+    g_rt_kb = d2d_create_rt(hwnd, true);
+    if (!g_rt_kb) return false;
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_key);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_flash);
     return true;
 }
 
@@ -689,7 +751,7 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             double a = (g_kb_anim == 1) ? e : 1.0 - e;         // opening / closing
             SetLayeredWindowAttributes(hwnd, 0, (BYTE)(255 * a), LWA_ALPHA);
             SetWindowPos(hwnd, NULL, g_kb_x,
-                         g_kb_y + (int)(KB_SLIDE * (1.0 - a)), 0, 0,
+                         g_kb_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
                          SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
             if (t >= 1.0) {
                 if (g_kb_anim == 2) ShowWindow(hwnd, SW_HIDE);
@@ -708,57 +770,62 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_SIZE:
+        if (g_rt_kb) g_rt_kb->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        HDC win = BeginPaint(hwnd, &ps);
-        RECT client;
-        GetClientRect(hwnd, &client);
+        BeginPaint(hwnd, &ps);
+        if (!g_rt_kb) d2d_create_kb(hwnd);
+        if (g_rt_kb) {
+            // No manual double-buffering needed: ID2D1HwndRenderTarget is
+            // already back-buffered.
+            g_rt_kb->BeginDraw();
+            g_rt_kb->Clear(d2d_clr(KB_CLR_BG));
 
-        // Double-buffer so hold-to-repeat navigation stays flicker-free.
-        HDC hdc = CreateCompatibleDC(win);
-        HBITMAP bmp = CreateCompatibleBitmap(win, client.right, client.bottom);
-        HGDIOBJ oldbmp = SelectObject(hdc, bmp);
+            for (int r = 0; r < KB_NROWS; r++) {
+                for (int i = 0; i < KB_COUNT[r]; i++) {
+                    RECT kr = kb_key_rect(r, i);
+                    D2D1_RECT_F kf = D2D1::RectF((float)kr.left, (float)kr.top,
+                                                 (float)kr.right, (float)kr.bottom);
+                    bool sel = (r == g_kb_row && i == g_kb_col);
+                    bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
 
-        FillRect(hdc, &client, g_kb_bg);
-        HGDIOBJ oldfont = SelectObject(hdc, g_kb_font);
-        HGDIOBJ oldpen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, KB_CLR_TEXT);
-        for (int r = 0; r < KB_NROWS; r++) {
-            for (int i = 0; i < KB_COUNT[r]; i++) {
-                RECT kr = kb_key_rect(r, i);
-                bool sel = (r == g_kb_row && i == g_kb_col);
-                bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
-                HBRUSH flash = NULL;
-                if (sel && g_kb_pulse_t0) {
-                    // key-press flash: bright at press, decaying back to accent
-                    double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
-                                       / KB_PULSE_MS;
-                    if (f > 0.0)
-                        flash = CreateSolidBrush(
-                            lerp_clr(KB_CLR_SEL, RGB(150, 205, 255), f));
-                }
-                SelectObject(hdc, flash ? flash
-                                        : (sel ? g_kb_sel
-                                               : (armed ? g_kb_armed : g_kb_key)));
-                RoundRect(hdc, kr.left, kr.top, kr.right + 1, kr.bottom + 1, 12, 12);
-                DrawTextW(hdc, KB_ROWS[r][i].label, -1, &kr,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                if (flash) {
-                    SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    DeleteObject(flash);
+                    ID2D1SolidColorBrush* fill =
+                        sel ? g_br_kb_sel : (armed ? g_br_kb_armed : g_br_kb_key);
+                    if (sel && g_kb_pulse_t0) {
+                        // key-press flash: bright at press, decaying back to accent
+                        double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
+                                           / KB_PULSE_MS;
+                        if (f > 0.0) {
+                            g_br_kb_flash->SetColor(
+                                d2d_clr(lerp_clr(KB_CLR_SEL, RGB(150, 205, 255), f)));
+                            fill = g_br_kb_flash;
+                        }
+                    }
+                    // Gentle glow around the selected key so it reads at a
+                    // distance (this is a couch/TV UI).
+                    if (sel)
+                        d2d_soft_glow(g_rt_kb, g_br_kb_sel, kf, 12.0f, 7.0f, 0.30f, 3);
+
+                    g_rt_kb->FillRoundedRectangle(
+                        D2D1::RoundedRect(kf, 12.0f, 12.0f), fill);
+                    if (g_tf_key)
+                        g_rt_kb->DrawText(KB_ROWS[r][i].label,
+                                          (UINT32)wcslen(KB_ROWS[r][i].label),
+                                          g_tf_key, kf, g_br_kb_text);
                 }
             }
+
+            HRESULT hr = g_rt_kb->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) d2d_release_kb();
         }
-        SelectObject(hdc, oldpen);
-        SelectObject(hdc, oldfont);
-        BitBlt(win, 0, 0, client.right, client.bottom, hdc, 0, 0, SRCCOPY);
-        SelectObject(hdc, oldbmp);
-        DeleteObject(bmp);
-        DeleteDC(hdc);
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_DESTROY:
+        d2d_release_kb();
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -775,14 +842,15 @@ static void kb_ensure() {
 
     DWORD style = WS_POPUP;   // borderless; the dark surface is the chrome
     DWORD ex = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
-    RECT r = {0, 0, KB_W, KB_H};
+    // Window size is physical pixels; the layout above is DIPs.
+    RECT r = {0, 0, dip_to_px(KB_W), dip_to_px(KB_H)};
     AdjustWindowRectEx(&r, style, FALSE, ex);
     int ww = r.right - r.left, wh = r.bottom - r.top;
 
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;   // bottom-centre of screen
-    g_kb_y = wa.bottom - wh - 12;
+    g_kb_y = wa.bottom - wh - dip_to_px(12);
 
     g_kb = CreateWindowExW(ex, L"ControllerMouseKB", L"", style,
                            g_kb_x, g_kb_y, ww, wh, g_hwnd, NULL,
@@ -809,7 +877,7 @@ static void kb_toggle() {
     } else {
         g_kb_shift = false;
         SetLayeredWindowAttributes(g_kb, 0, 0, LWA_ALPHA);
-        SetWindowPos(g_kb, HWND_TOPMOST, g_kb_x, g_kb_y + KB_SLIDE, 0, 0,
+        SetWindowPos(g_kb, HWND_TOPMOST, g_kb_x, g_kb_y + dip_to_px(KB_SLIDE), 0, 0,
                      SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_kb_visible = true;
         g_kb_anim = 1;          // fade in + slide up to rest
@@ -862,13 +930,23 @@ enum { TRK_MOUSE = 0, TRK_SCROLL = 1, TRK_DEADZONE = 2 };
 static const int kTrackLo[3] = {1, 1, 0};
 static const int kTrackHi[3] = {60, 50, 50};
 
-// Fixed layout for the D2D-drawn controls (was previously native child HWNDs
-// via TRACKBAR_CLASSW / BS_OWNERDRAW buttons; geometry unchanged).
+// Client size, and the whole layout below, in DIPs. Nothing here is a native
+// child control any more - every label, slider, toggle and button is drawn by
+// Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
+// whatever DPI the monitor reports.
+#define WIN_W 384
+#define WIN_H 360
+
 static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
 static const RECT kTrackRect[3] = {
     {20, 78, 20 + 344, 78 + 28},
     {20, 140, 20 + 344, 140 + 28},
     {20, 202, 20 + 344, 202 + 28},
+};
+static const RECT kLabelRect[3] = {
+    {20, 56, 20 + 200, 56 + 18},
+    {20, 118, 20 + 200, 118 + 18},
+    {20, 180, 20 + 200, 180 + 18},
 };
 static const RECT kValRect[3] = {
     {284, 56, 284 + 80, 56 + 18},
@@ -879,21 +957,35 @@ static const RECT kToggleRect[2] = {
     {20, 244, 20 + 46, 244 + 22},
     {196, 244, 196 + 46, 244 + 22},
 };
+static const RECT kToggleLabel[2] = {
+    {74, 246, 74 + 110, 246 + 18},
+    {250, 246, 250 + 114, 246 + 18},
+};
+static const RECT kBindLabelRect = {20, 282, 20 + 100, 282 + 18};
 static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
 static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
+static const RECT kHelpRect[2] = {
+    {20, 314, 20 + 352, 314 + 18},
+    {20, 332, 20 + 352, 332 + 18},
+};
+
+static const wchar_t* kTrackLabel[3] = {
+    L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
+static const wchar_t* kToggleText[2] = {L"Enabled", L"Pause in games"};
+static const wchar_t* kHelpText[2] = {
+    L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
+    L"Circle backspace).  Close sends to tray; tray icon to quit."};
 
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
 
-static void apply_font(HWND h) {
-    if (h && g_font) SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+static inline D2D1_RECT_F to_f(const RECT& r) {
+    return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
 }
 
-static HWND make_text(HWND parent, const wchar_t* text, DWORD style,
-                      int x, int y, int w, int h) {
-    HWND c = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | style,
-                           x, y, w, h, parent, NULL, GetModuleHandleW(NULL), NULL);
-    apply_font(c);
-    return c;
+// Mouse messages arrive in physical pixels; the layout is in DIPs.
+static POINT lparam_to_dip(LPARAM lp) {
+    POINT pt = {px_to_dip((int)(short)LOWORD(lp)), px_to_dip((int)(short)HIWORD(lp))};
+    return pt;
 }
 
 static void update_value(int idx) {
@@ -905,10 +997,7 @@ static void update_value(int idx) {
     } else if (idx == TRK_DEADZONE) {
         swprintf(g_dz_val_txt, 32, L"%d%%", (int)std::lround(c.deadzone * 100));
     }
-    if (g_hwnd) {
-        InvalidateRect(g_hwnd, &kTrackRect[idx], FALSE);
-        InvalidateRect(g_hwnd, &kValRect[idx], FALSE);
-    }
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
 static void update_bind_text() {
@@ -919,7 +1008,7 @@ static void update_bind_text() {
     int b = get_cfg().toggle_button;
     if (b >= 0 && b < 14) swprintf(g_bind_val_txt, 32, L"%s", names[b]);
     else swprintf(g_bind_val_txt, 32, L"Button %d", b);
-    if (g_hwnd) InvalidateRect(g_hwnd, &kBindValRect, FALSE);
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
 // Current trackbar position (in the same integer units the old TBM_* range
@@ -959,23 +1048,7 @@ static int hit_test_track(POINT pt) {
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        g_font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-
-        make_text(hwnd, L"Mouse sensitivity", 0, 20, 56, 200, 18);
-        make_text(hwnd, L"Scroll sensitivity", 0, 20, 118, 200, 18);
-        make_text(hwnd, L"Deadzone", 0, 20, 180, 200, 18);
-        make_text(hwnd, L"Enabled", 0, 74, 246, 100, 18);
-        make_text(hwnd, L"Pause in games", 0, 250, 246, 114, 18);
-        make_text(hwnd, L"Toggle button", 0, 20, 282, 100, 18);
-        make_text(hwnd, L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
-                  0, 20, 316, 352, 16);
-        make_text(hwnd, L"Circle backspace).  Close sends to tray; tray icon to quit.",
-                  0, 20, 334, 352, 16);
-
         d2d_create_main(hwnd);
-
         update_value(TRK_MOUSE);
         update_value(TRK_SCROLL);
         update_value(TRK_DEADZONE);
@@ -986,14 +1059,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         if (g_rt_main) g_rt_main->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
         return 0;
-    case WM_CTLCOLORSTATIC: {
-        HDC hdc = (HDC)wp;
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(165, 165, 175));      // remaining labels: dim grey
-        return (LRESULT)g_kb_bg;
-    }
+    case WM_ERASEBKGND:
+        return 1;   // WM_PAINT clears the whole client area itself
     case WM_LBUTTONDOWN: {
-        POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        POINT pt = lparam_to_dip(lp);
         int idx = hit_test_track(pt);
         if (idx >= 0) {
             g_drag_track = idx;
@@ -1007,7 +1076,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
-            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
         if (PtInRect(&kToggleRect[1], pt)) {
@@ -1016,19 +1085,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
-            InvalidateRect(hwnd, &kToggleRect[1], FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
         if (PtInRect(&kBindBtnRect, pt)) {
             g_capture = true;   // worker reports the next pressed button
-            InvalidateRect(hwnd, &kBindBtnRect, FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
         return 0;
     }
     case WM_MOUSEMOVE: {
         if (g_drag_track >= 0) {
-            POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            POINT pt = lparam_to_dip(lp);
             apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
         }
         return 0;
@@ -1054,11 +1123,24 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (g_status_state == 2) sc = RGB(235, 180, 80);
             else if (g_status_state == 3) sc = RGB(150, 150, 158);
             if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
-            if (g_tf_header && g_br_main_status) {
-                D2D1_RECT_F r = D2D1::RectF((float)kStatusRect.left, (float)kStatusRect.top,
-                                            (float)kStatusRect.right, (float)kStatusRect.bottom);
+            if (g_tf_header && g_br_main_status)
                 g_rt_main->DrawText(g_status_txt, (UINT32)wcslen(g_status_txt),
-                                    g_tf_header, r, g_br_main_status);
+                                    g_tf_header, to_f(kStatusRect), g_br_main_status);
+
+            // Section labels (were native STATIC controls; now DirectWrite so
+            // they stay sharp at any DPI).
+            if (g_tf_label) {
+                for (int i = 0; i < 3; i++)
+                    g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
+                                        g_tf_label, to_f(kLabelRect[i]), g_br_main_dim);
+                for (int i = 0; i < 2; i++)
+                    g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
+                                        g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
+                g_rt_main->DrawText(L"Toggle button", 13, g_tf_label,
+                                    to_f(kBindLabelRect), g_br_main_dim);
+                for (int i = 0; i < 2; i++)
+                    g_rt_main->DrawText(kHelpText[i], (UINT32)wcslen(kHelpText[i]),
+                                        g_tf_label, to_f(kHelpRect[i]), g_br_main_dim);
             }
 
             // Trackbars: rounded channel + accent fill + round thumb.
@@ -1067,29 +1149,40 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 float left = (float)r.left, right = (float)r.right;
                 float cy = (float)((r.top + r.bottom) / 2);
                 g_rt_main->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 4.0f, 4.0f),
+                    D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 2.5f, 2.5f),
                     g_br_main_key);
                 int pos = track_current_pos(i);
                 double frac = (double)(pos - kTrackLo[i]) / (double)(kTrackHi[i] - kTrackLo[i]);
                 float tx = left + (float)(frac * (right - left));
                 if (tx > left + 4)
                     g_rt_main->FillRoundedRectangle(
-                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 4.0f, 4.0f),
+                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 2.5f, 2.5f),
                         g_br_main_sel);
-                g_rt_main->FillEllipse(D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f),
-                                       g_br_main_sel);
+                // Glow under the thumb while dragging - feedback the old flat
+                // GDI Ellipse couldn't give.
+                D2D1_ELLIPSE thumb = D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f);
+                if (g_drag_track == i && g_br_main_glow) {
+                    for (int k = 3; k >= 1; k--) {
+                        g_br_main_glow->SetOpacity(0.22f / k);
+                        g_rt_main->FillEllipse(
+                            D2D1::Ellipse(thumb.point, 8.0f + 3.5f * k, 8.0f + 3.5f * k),
+                            g_br_main_glow);
+                    }
+                    g_br_main_glow->SetOpacity(1.0f);
+                }
+                g_rt_main->FillEllipse(thumb, g_br_main_sel);
+                // Small white centre so the thumb reads against the fill.
+                g_rt_main->FillEllipse(D2D1::Ellipse(thumb.point, 3.0f, 3.0f),
+                                       g_br_main_white);
             }
 
             // Value readouts, right-aligned like the old SS_RIGHT statics.
             if (g_tf_body) {
                 const wchar_t* vals[3] = {g_mouse_val_txt, g_scroll_val_txt, g_dz_val_txt};
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                for (int i = 0; i < 3; i++) {
-                    D2D1_RECT_F r = D2D1::RectF((float)kValRect[i].left, (float)kValRect[i].top,
-                                                (float)kValRect[i].right, (float)kValRect[i].bottom);
+                for (int i = 0; i < 3; i++)
                     g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
-                                        g_tf_body, r, g_br_main_text);
-                }
+                                        g_tf_body, to_f(kValRect[i]), g_br_main_text);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
 
@@ -1151,8 +1244,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (st != g_status_state) {
             g_status_state = st;
             wcscpy(g_status_txt, txt);
-            InvalidateRect(hwnd, &kStatusRect, FALSE);
-            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
     }
@@ -1174,7 +1266,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
-            InvalidateRect(hwnd, &kToggleRect[0], FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
         case GP_CAPTURED: {
@@ -1185,7 +1277,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             save_config(c);
             g_capture = false;
             update_bind_text();
-            InvalidateRect(hwnd, &kBindBtnRect, FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
         }
@@ -1208,13 +1300,36 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (cmd == ID_TRAY_QUIT) DestroyWindow(hwnd);
         }
         return 0;
+    case WM_DPICHANGED: {
+        // Per-monitor-v2: re-point both render targets at the new DPI (all
+        // drawing is in DIPs, so nothing else changes), resize the keyboard
+        // popup to match, and take the window rect Windows suggests.
+        g_dpi = HIWORD(wp);
+        if (g_rt_main) g_rt_main->SetDpi((float)g_dpi, (float)g_dpi);
+        if (g_rt_kb)   g_rt_kb->SetDpi((float)g_dpi, (float)g_dpi);
+        if (g_kb) {
+            RECT wa;
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            int ww = dip_to_px(KB_W), wh = dip_to_px(KB_H);
+            g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;
+            g_kb_y = wa.bottom - wh - dip_to_px(12);
+            SetWindowPos(g_kb, NULL, g_kb_x, g_kb_y, ww, wh,
+                         SWP_NOACTIVATE | SWP_NOZORDER);
+            InvalidateRect(g_kb, NULL, FALSE);
+        }
+        const RECT* sug = (const RECT*)lp;
+        SetWindowPos(hwnd, NULL, sug->left, sug->top,
+                     sug->right - sug->left, sug->bottom - sug->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
     case WM_CLOSE:
         hide_to_tray(hwnd);  // close button -> tray, keep running
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, ID_TIMER);
         remove_tray_icon();
-        if (g_font) { DeleteObject(g_font); g_font = NULL; }
         d2d_release_main();
         g_running = false;
         if (g_worker) {
@@ -1228,7 +1343,30 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// Per-monitor-v2 DPI awareness, resolved dynamically so this still builds and
+// runs on SDKs/OS versions without it (same defensive approach as the DWM
+// attribute constants above). Without this Windows silently bitmap-stretches
+// the whole window on a high-DPI display, which would throw away everything
+// Direct2D just bought us.
+static void enable_dpi_awareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    typedef BOOL(WINAPI * SetCtxFn)(HANDLE);
+    SetCtxFn fn = (SetCtxFn)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    if (fn && fn((HANDLE)-4))   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        return;
+    // Older Windows 10 / 8.1 fallback.
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    if (shcore) {
+        typedef HRESULT(WINAPI * SetAwareFn)(int);
+        SetAwareFn sa = (SetAwareFn)GetProcAddress(shcore, "SetProcessDpiAwareness");
+        if (sa) sa(2);   // PROCESS_PER_MONITOR_DPI_AWARE
+        FreeLibrary(shcore);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    enable_dpi_awareness();
     HANDLE mutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(CLASS_NAME, NULL);
@@ -1245,9 +1383,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     init_theme();
     d2d_init_process();
 
-    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES};
-    InitCommonControlsEx(&icc);
-
     WNDCLASSW wc = {};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = hInst;
@@ -1255,11 +1390,27 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                  0, 0, LR_DEFAULTSIZE);
     if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wc.hbrBackground = g_kb_bg;   // shared dark theme
+    wc.hbrBackground = g_kb_bg;   // avoids a white flash before the first paint
     wc.lpszClassName = CLASS_NAME;
     RegisterClassW(&wc);
 
-    RECT r = {0, 0, 384, 360};
+    // Pick up the DPI of the monitor the window will open on, so the very
+    // first frame is already correctly scaled.
+    {
+        POINT origin = {0, 0};
+        HMONITOR mon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        if (shcore) {
+            typedef HRESULT(WINAPI * GetDpiFn)(HMONITOR, int, UINT*, UINT*);
+            GetDpiFn get = (GetDpiFn)GetProcAddress(shcore, "GetDpiForMonitor");
+            UINT dx = 96, dy = 96;
+            if (get && SUCCEEDED(get(mon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx)
+                g_dpi = dx;
+            FreeLibrary(shcore);
+        }
+    }
+
+    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(WIN_H)};
     DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     g_hwnd = CreateWindowW(
