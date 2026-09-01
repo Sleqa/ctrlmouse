@@ -22,6 +22,9 @@ XInput pads.
 | D-pad *(launcher open)* | Move between apps |
 | Cross *(launcher open)* | Launch the highlighted app |
 | Circle *(launcher open)* | Close the launcher |
+| D-pad up *(launcher, app running)* | Ask whether to close that app |
+| Cross *(close prompt)* | Close the app |
+| D-pad down / Circle *(close prompt)* | Back out |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |
 | Circle *(keyboard open)* | Backspace |
@@ -80,7 +83,9 @@ a version resource. Win32 + DirectInput + GDI only — no third-party libraries.
 
 ## Configuration
 
-Settings are saved automatically to `config.json` beside the exe:
+Settings are saved automatically to `config.json` in
+`%APPDATA%\ctrlmouse`, alongside `apps.txt` (the launcher list, one path per
+line). Settings written by older builds are moved there on first run.
 
 | Key | Meaning | Default |
 |---|---|---|

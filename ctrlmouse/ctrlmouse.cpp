@@ -103,12 +103,48 @@ static Config get_cfg() {
 }
 
 // --- config.json (next to the exe) -----------------------------------------
-static std::wstring config_path() {
+// Settings live in %APPDATA%\ctrlmouse, not beside the exe: people run this
+// straight out of Downloads, and clearing that folder was taking the settings
+// with it.
+static std::wstring exe_dir() {
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(NULL, buf, MAX_PATH);
     std::wstring p(buf);
-    size_t slash = p.find_last_of(L"\\/");
-    return p.substr(0, slash + 1) + L"config.json";
+    return p.substr(0, p.find_last_of(L"\\/") + 1);
+}
+
+static std::wstring data_dir() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
+    PWSTR base = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, NULL, &base)) &&
+        base) {
+        std::wstring d(base);
+        CoTaskMemFree(base);
+        d += L"\\ctrlmouse";
+        if (CreateDirectoryW(d.c_str(), NULL) ||
+            GetLastError() == ERROR_ALREADY_EXISTS) {
+            cached = d + L"\\";
+            return cached;
+        }
+    }
+    cached = exe_dir();   // fall back to the old location rather than fail
+    return cached;
+}
+
+static std::wstring config_path() { return data_dir() + L"config.json"; }
+
+// Bring settings written by an older build across, once.
+static void migrate_old_data() {
+    if (data_dir() == exe_dir()) return;
+    const wchar_t* names[] = {L"config.json", L"apps.txt", L"hidhide_declined"};
+    for (int i = 0; i < 3; i++) {
+        std::wstring dst = data_dir() + names[i];
+        std::wstring src = exe_dir() + names[i];
+        if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES)
+            MoveFileW(src.c_str(), dst.c_str());
+    }
 }
 
 static void save_config(const Config& c) {
@@ -1850,6 +1886,11 @@ static ULONGLONG   g_lx_anim_t0 = 0;
 static int         g_lx_x = 0, g_lx_y = 0;
 static std::wstring g_lx_apps[LX_MAX_APPS];
 static int         g_lx_count = 0;
+// Close prompt: D-pad up on a running app slides its icon out of the tile and
+// a confirmation in from below. Only the selected tile can be in this state.
+static bool        g_lx_close_mode = false;
+static int         g_lx_close_anim = 0;    // 1 sliding in, 2 sliding out
+static ULONGLONG   g_lx_close_t0 = 0;
 
 static ID2D1HwndRenderTarget* g_rt_lx = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_text = NULL;
@@ -1858,6 +1899,7 @@ static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_onacc = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_face = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_border = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_warn = NULL;   // colour set per-draw
 // Icons are device-dependent, so they live and die with the render target.
 static ID2D1Bitmap*           g_lx_icon[LX_MAX_APPS] = {};
 static IWICImagingFactory*    g_wic = NULL;
@@ -2017,11 +2059,39 @@ static BOOL CALLBACK find_app_cb(HWND h, LPARAM lp) {
     return TRUE;
 }
 
-// True if an existing window was brought forward.
-static bool activate_running(const std::wstring& path) {
+static HWND find_app_window(const std::wstring& path) {
     std::wstring exe = resolve_target(path);
     FindAppCtx c = {exe.c_str(), path_base(exe.c_str()), NULL};
     EnumWindows(find_app_cb, (LPARAM)&c);
+    return c.found;
+}
+
+// Ask politely, then insist. Done on its own thread so the wait does not
+// freeze the UI - an app showing a "save changes?" prompt would otherwise
+// block us for the full timeout.
+static DWORD WINAPI close_proc(LPVOID param) {
+    DWORD pid = (DWORD)(ULONG_PTR)param;
+    HANDLE ph = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+    if (!ph) return 0;
+    if (WaitForSingleObject(ph, 3000) == WAIT_TIMEOUT) TerminateProcess(ph, 0);
+    CloseHandle(ph);
+    return 0;
+}
+
+static void force_close_app(const std::wstring& path) {
+    HWND h = find_app_window(path);
+    if (!h) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    PostMessageW(h, WM_CLOSE, 0, 0);
+    if (pid)
+        CloseHandle(CreateThread(NULL, 0, close_proc,
+                                 (LPVOID)(ULONG_PTR)pid, 0, NULL));
+}
+
+// True if an existing window was brought forward.
+static bool activate_running(const std::wstring& path) {
+    FindAppCtx c = {NULL, NULL, find_app_window(path)};
     if (!c.found) return false;
     if (IsIconic(c.found)) ShowWindow(c.found, SW_RESTORE);
     if (!SetForegroundWindow(c.found)) {
@@ -2039,8 +2109,9 @@ static bool activate_running(const std::wstring& path) {
 
 static void d2d_release_lx() {
     ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel,
-                                   &g_br_lx_face, &g_br_lx_border, &g_br_lx_onacc};
-    for (int i = 0; i < 6; i++)
+                                   &g_br_lx_face, &g_br_lx_border,
+                                   &g_br_lx_onacc, &g_br_lx_warn};
+    for (int i = 0; i < 7; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     lx_release_icons();
     if (g_rt_lx) { g_rt_lx->Release(); g_rt_lx = NULL; }
@@ -2057,6 +2128,7 @@ static bool d2d_create_lx(HWND hwnd) {
     g_rt_lx->CreateSolidColorBrush(d2d_clr(RGB(45, 45, 45)), &g_br_lx_face);
     g_rt_lx->CreateSolidColorBrush(
         D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_lx_border);
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_warn);
     return true;
 }
 
@@ -2080,6 +2152,11 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 active = true;
             }
+        }
+        if (g_lx_close_anim) {
+            if (now - g_lx_close_t0 >= KB_ANIM_MS) g_lx_close_anim = 0;
+            else active = true;
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         if (!active) KillTimer(hwnd, LX_TIMER);
         return 0;
@@ -2112,36 +2189,90 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT tr = lx_tile_rect(i);
                 D2D1_RECT_F tf = to_f(tr);
                 bool sel = (i == g_lx_sel);
-                draw_control(g_rt_lx, tf, KB_CARD_RADIUS,
-                             sel ? (ID2D1Brush*)g_br_lx_sel : g_br_lx_face,
+
+                // How far this tile is through the close prompt: 0 shows the
+                // app, 1 shows the confirmation.
+                float cp = 0.0f;
+                if (sel) {
+                    if (g_lx_close_anim) {
+                        double t = (double)(GetTickCount64() - g_lx_close_t0)
+                                   / KB_ANIM_MS;
+                        if (t > 1.0) t = 1.0;
+                        double e = 1.0 - pow(1.0 - t, 3);
+                        cp = (g_lx_close_anim == 1) ? (float)e : (float)(1.0 - e);
+                    } else if (g_lx_close_mode) {
+                        cp = 1.0f;
+                    }
+                }
+
+                // The tile washes from accent to the close red as the prompt
+                // arrives, so the destructive state is obvious before reading
+                // any text. Black label on accent, white on red.
+                ID2D1Brush* fill = g_br_lx_face;
+                ID2D1Brush* tb = g_br_lx_text;
+                if (sel) {
+                    if (cp > 0.0f) {
+                        g_br_lx_warn->SetColor(d2d_clr(
+                            lerp_clr(KB_CLR_SEL, RGB(196, 43, 28), cp)));
+                        fill = g_br_lx_warn;
+                        tb = (cp >= 0.5f) ? (ID2D1Brush*)g_br_lx_text
+                                          : (ID2D1Brush*)g_br_lx_onacc;
+                    } else {
+                        fill = g_br_lx_sel;
+                        tb = g_br_lx_onacc;
+                    }
+                }
+                draw_control(g_rt_lx, tf, KB_CARD_RADIUS, fill,
                              sel ? NULL : (ID2D1Brush*)g_br_lx_border);
-                ID2D1Brush* tb = sel ? (ID2D1Brush*)g_br_lx_onacc : g_br_lx_text;
+
+                float th = tf.bottom - tf.top;
+                if (cp > 0.0f)
+                    g_rt_lx->PushAxisAlignedClip(tf, D2D1_ANTIALIAS_MODE_ALIASED);
+
                 if (i == g_lx_count) {
                     if (g_tf_key)
                         g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
                 } else if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+                    float dy = -cp * th;   // app content slides up and out
                     if (!g_lx_icon[i])
                         g_lx_icon[i] = load_icon_bitmap(g_rt_lx, g_lx_apps[i].c_str());
                     if (g_lx_icon[i]) {
                         float cx = (tf.left + tf.right) / 2;
-                        D2D1_RECT_F ir = D2D1::RectF(cx - 22, tf.top + 12,
-                                                     cx + 22, tf.top + 56);
+                        D2D1_RECT_F ir = D2D1::RectF(cx - 22, tf.top + 12 + dy,
+                                                     cx + 22, tf.top + 56 + dy);
                         g_rt_lx->DrawBitmap(g_lx_icon[i], ir, 1.0f,
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     }
                     std::wstring nm = lx_label(g_lx_apps[i]);
                     D2D1_RECT_F lr = g_lx_icon[i]
-                        ? D2D1::RectF(tf.left + 8, tf.top + 60, tf.right - 8,
-                                      tf.bottom - 6)
-                        : D2D1::RectF(tf.left + 10, tf.top + 10, tf.right - 10,
-                                      tf.bottom - 10);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                        ? D2D1::RectF(tf.left + 8, tf.top + 60 + dy, tf.right - 8,
+                                      tf.bottom - 6 + dy)
+                        : D2D1::RectF(tf.left + 10, tf.top + 10 + dy, tf.right - 10,
+                                      tf.bottom - 10 + dy);
                     g_rt_lx->DrawText(nm.c_str(), (UINT32)nm.size(),
                                       g_tf_body, lr, tb);
+
+                    // Confirmation rises from the bottom edge as the app leaves.
+                    if (cp > 0.0f) {
+                        float uy = (1.0f - cp) * th;
+                        if (g_tf_key) {
+                            D2D1_RECT_F xr = D2D1::RectF(tf.left, tf.top + 10 + uy,
+                                                         tf.right, tf.top + 58 + uy);
+                            // U+2715 as an escape: a literal here would depend
+                            // on the compiler's source codepage.
+                            g_rt_lx->DrawText(L"\x2715", 1, g_tf_key, xr, tb);
+                        }
+                        D2D1_RECT_F qr = D2D1::RectF(tf.left + 8, tf.top + 60 + uy,
+                                                     tf.right - 8, tf.bottom - 6 + uy);
+                        g_rt_lx->DrawText(L"Close?", 6, g_tf_body, qr, tb);
+                    }
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
+                if (cp > 0.0f) g_rt_lx->PopAxisAlignedClip();
             }
             HRESULT hr = g_rt_lx->EndDraw();
             if (hr == D2DERR_RECREATE_TARGET) d2d_release_lx();
@@ -2199,6 +2330,8 @@ static void lx_toggle() {
         SetTimer(g_lx, LX_TIMER, 15, NULL);
     } else {
         lx_load();
+        g_lx_close_mode = false;
+        g_lx_close_anim = 0;
         if (g_lx_sel >= lx_tiles()) g_lx_sel = lx_tiles() - 1;
         lx_relayout();
         SetLayeredWindowAttributes(g_lx, 0, 0, LWA_ALPHA);
@@ -2212,9 +2345,31 @@ static void lx_toggle() {
     }
 }
 
+static void lx_set_close_mode(bool on) {
+    if (g_lx_close_mode == on) return;
+    g_lx_close_mode = on;
+    g_lx_close_anim = on ? 1 : 2;
+    g_lx_close_t0 = GetTickCount64();
+    if (g_lx) {
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+        InvalidateRect(g_lx, NULL, FALSE);
+    }
+}
+
 static void lx_nav(int dir) {
     int n = lx_tiles();
     if (n <= 0) return;
+    if (g_lx_close_mode) {
+        // Anything except another "up" backs out of the prompt.
+        if (dir != 0) lx_set_close_mode(false);
+        return;
+    }
+    // Up on a running app asks whether to close it, instead of moving a row.
+    if (dir == 0 && g_lx_sel < g_lx_count &&
+        find_app_window(g_lx_apps[g_lx_sel])) {
+        lx_set_close_mode(true);
+        return;
+    }
     if (dir == 1)      g_lx_sel = (g_lx_sel + 1) % n;
     else if (dir == 3) g_lx_sel = (g_lx_sel + n - 1) % n;
     else if (dir == 2) g_lx_sel = (g_lx_sel + LX_COLS) % n;
@@ -2730,9 +2885,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case GP_KB_NAV:       kb_nav((int)lp); break;
         case GP_LX_TOGGLE:    lx_toggle(); break;
         case GP_LX_NAV:       lx_nav((int)lp); break;
-        case GP_LX_CLOSE:     if (g_lx_visible) lx_toggle(); break;
+        case GP_LX_CLOSE:
+            if (g_lx_close_mode) lx_set_close_mode(false);
+            else if (g_lx_visible) lx_toggle();
+            break;
         case GP_LX_SELECT: {
             if (!g_lx_visible) break;
+            if (g_lx_close_mode) {
+                if (g_lx_sel < g_lx_count) force_close_app(g_lx_apps[g_lx_sel]);
+                lx_set_close_mode(false);
+                break;
+            }
             if (g_lx_sel == g_lx_count) {
                 // "+" tile: pick an executable. The launcher never takes
                 // focus, so it is dismissed first and the dialog is put up
@@ -2924,6 +3087,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                      IID_IWICImagingFactory, (void**)&g_wic);
 
+    migrate_old_data();
     InitializeCriticalSection(&g_cs);
     g_cfg = load_config();
     init_theme();
