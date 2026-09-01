@@ -1309,16 +1309,20 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 // Selection does not recolour the key. The face stays dark and instead gains a
 // glow around it and a coloured glyph, so the keyboard keeps an even tone and
 // the highlight reads as light rather than paint.
-#define KB_CLR_BG    RGB(13, 13, 15)     // window background
-#define KB_CLR_KEY   RGB(38, 38, 44)     // key face (mid tone / flat fallback)
+#define KB_CLR_BG    RGB(6, 6, 8)        // window background - near black
+// KB_CLR_KEY stays a mid tone: it is the settings window's slider channel and
+// button fill, which would disappear at the keyboard's near-black values.
+#define KB_CLR_KEY   RGB(40, 40, 46)
 #define KB_CLR_SEL   RGB(72, 158, 255)   // accent - blue, used for glow + glyph
 #define KB_CLR_ARMED RGB(46, 60, 82)     // Shift key while armed
 #define KB_CLR_TEXT  RGB(232, 232, 238)  // key labels
 
-#define KB_KEY_TOP   RGB(48, 48, 55)     // key gradient, lit top
-#define KB_KEY_BOT   RGB(28, 28, 33)     // key gradient, shaded bottom
-#define KB_ARM_TOP   RGB(54, 68, 92)
-#define KB_ARM_BOT   RGB(34, 44, 62)
+// Keys bottom out at near black; only the top of the gradient and the lit edge
+// separate them from the card behind.
+#define KB_KEY_TOP   RGB(33, 33, 38)     // key gradient, lit top
+#define KB_KEY_BOT   RGB(11, 11, 14)     // key gradient, shaded bottom
+#define KB_ARM_TOP   RGB(38, 50, 72)
+#define KB_ARM_BOT   RGB(16, 22, 33)
 #define KB_RADIUS    17.0f               // generous corners - deliberately bubbly
 
 static HWND   g_kb = NULL;
@@ -1547,7 +1551,7 @@ static bool d2d_create_kb(HWND hwnd) {
         {0.0f, D2D1::ColorF(1, 1, 1, 0.50f)},
         {0.30f, D2D1::ColorF(1, 1, 1, 0.07f)},
         {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
-    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(30, 30, 35))},
+    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(17, 17, 20))},
                                   {1.0f, d2d_clr(KB_CLR_BG)}};
     g_br_kb_face_g = make_vgrad(g_rt_kb, face, 2);
     g_br_kb_arm_g  = make_vgrad(g_rt_kb, arm, 2);
