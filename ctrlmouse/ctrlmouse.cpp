@@ -59,11 +59,10 @@ struct Config {
     bool   enabled;
     int    toggle_button;       // controller button that toggles enable/disable
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
-    bool   exclusive;           // hold the pad exclusively while the mapping is on
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true, true};
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, 13, true};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -110,13 +109,11 @@ static void save_config(const Config& c) {
             "  \"deadzone\": %.3f,\n"
             "  \"enabled\": %s,\n"
             "  \"toggle_button\": %d,\n"
-            "  \"game_pause\": %s,\n"
-            "  \"exclusive\": %s\n"
+            "  \"game_pause\": %s\n"
             "}\n",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false", c.toggle_button,
-            c.game_pause ? "true" : "false",
-            c.exclusive ? "true" : "false");
+            c.game_pause ? "true" : "false");
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -160,7 +157,6 @@ static Config load_config() {
     double tb;
     if (parse_double(s, "toggle_button", tb)) c.toggle_button = (int)tb;
     parse_bool(s, "game_pause", c.game_pause);
-    parse_bool(s, "exclusive", c.exclusive);
     return c;
 }
 
@@ -761,7 +757,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // handle is what hands the controller back to other apps, so this is
         // also what makes the toggle button work as a "give me my pad back"
         // gesture mid-stream.
-        bool now_exclusive = cfg.exclusive && mapping_on && !g_capture;
+        bool now_exclusive = mapping_on && !g_capture;
         if (now_exclusive != want_exclusive) {
             want_exclusive = now_exclusive;
             if (g_hid != INVALID_HANDLE_VALUE && g_hid_exclusive != now_exclusive)
@@ -1255,7 +1251,7 @@ static const int kTrackHi[3] = {60, 50, 50};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 392
+#define WIN_H 360
 
 static const RECT kStatusRect  = {20, 16, 20 + 344, 16 + 22};
 static const RECT kTrackRect[3] = {
@@ -1273,29 +1269,26 @@ static const RECT kValRect[3] = {
     {284, 118, 284 + 80, 118 + 18},
     {284, 180, 284 + 80, 180 + 18},
 };
-#define NTOGGLES 3
+#define NTOGGLES 2
 static const RECT kToggleRect[NTOGGLES] = {
     {20, 244, 20 + 46, 244 + 22},
     {196, 244, 196 + 46, 244 + 22},
-    {20, 276, 20 + 46, 276 + 22},
 };
 static const RECT kToggleLabel[NTOGGLES] = {
     {74, 246, 74 + 110, 246 + 18},
     {250, 246, 250 + 114, 246 + 18},
-    {74, 278, 74 + 260, 278 + 18},
 };
-static const RECT kBindLabelRect = {20, 314, 20 + 100, 314 + 18};
-static const RECT kBindValRect = {124, 314, 124 + 150, 314 + 18};
-static const RECT kBindBtnRect = {284, 310, 284 + 80, 310 + 24};
+static const RECT kBindLabelRect = {20, 282, 20 + 100, 282 + 18};
+static const RECT kBindValRect = {124, 282, 124 + 150, 282 + 18};
+static const RECT kBindBtnRect = {284, 278, 284 + 80, 278 + 24};
 static const RECT kHelpRect[2] = {
-    {20, 346, 20 + 352, 346 + 18},
-    {20, 364, 20 + 352, 364 + 18},
+    {20, 314, 20 + 352, 314 + 18},
+    {20, 332, 20 + 352, 332 + 18},
 };
 
 static const wchar_t* kTrackLabel[3] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
-static const wchar_t* kToggleText[NTOGGLES] = {
-    L"Enabled", L"Pause in games", L"Take exclusive control of the pad"};
+static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
 static const wchar_t* kHelpText[2] = {
     L"Triangle: on-screen keyboard  (D-pad move, Cross type,",
     L"Circle backspace).  Close sends to tray; tray icon to quit."};
@@ -1397,9 +1390,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (int i = 0; i < NTOGGLES; i++) {
             if (!PtInRect(&kToggleRect[i], pt)) continue;
             EnterCriticalSection(&g_cs);
-            if (i == 0)      g_cfg.enabled = !g_cfg.enabled;
-            else if (i == 1) g_cfg.game_pause = !g_cfg.game_pause;
-            else             g_cfg.exclusive = !g_cfg.exclusive;
+            if (i == 0) g_cfg.enabled = !g_cfg.enabled;
+            else        g_cfg.game_pause = !g_cfg.game_pause;
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
@@ -1506,7 +1498,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Toggle switches: pill track + sliding white knob.
             Config c = get_cfg();
-            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause, c.exclusive};
+            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause};
             for (int i = 0; i < NTOGGLES; i++) {
                 const RECT& r = kToggleRect[i];
                 float h = (float)(r.bottom - r.top);
