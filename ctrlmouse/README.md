@@ -18,6 +18,10 @@ XInput pads.
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
+| Options *(hold)* | Open the app launcher |
+| D-pad *(launcher open)* | Move between apps |
+| Cross *(launcher open)* | Launch the highlighted app |
+| Circle *(launcher open)* | Close the launcher |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |
 | Circle *(keyboard open)* | Backspace |

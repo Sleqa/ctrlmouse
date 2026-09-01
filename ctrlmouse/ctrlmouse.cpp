@@ -47,6 +47,7 @@ extern "C" {
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 // Enable Windows visual styles (themed common controls v6) so the UI uses the
 // modern look instead of the classic grey Win95 controls.
@@ -249,9 +250,11 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 // window/state manipulation happens on the UI thread.
 #define WM_GAMEPAD (WM_APP + 2)
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
-       GP_TOGGLE, GP_CAPTURED };
+       GP_TOGGLE, GP_CAPTURED,
+       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE };
 
 static volatile bool g_kb_visible = false;
+static volatile bool g_lx_visible = false;   // app launcher popup
 
 // --- Game detection / toggle-bind state (shared with the worker) -----------
 static volatile bool g_game_active = false;  // fullscreen game detected
@@ -982,6 +985,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool      sq_prev = false;             // Square edge state
     ULONGLONG sq_t0 = 0;                   // when Square went down
     bool      sq_fired = false;            // hold already sent fullscreen
+    bool      opt_prev = false;            // Options edge state
+    ULONGLONG opt_t0 = 0;
+    bool      opt_fired = false;           // hold already opened the launcher
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -1085,6 +1091,8 @@ static DWORD WINAPI worker_thread(LPVOID) {
             tbtn_prev  = (tbi >= 0 && tbi < 32) && ((mask >> tbi) & 1);
             sq_prev    = (mask >> 0) & 1;
             sq_fired   = true;
+            opt_prev   = (mask >> 9) & 1;
+            opt_fired  = true;
             cross_prev = (mask >> 1) & 1;
             circ_prev  = (mask >> 2) & 1;
             tri_prev   = (mask >> 3) & 1;
@@ -1178,7 +1186,40 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
             tri_prev = tri;
 
-            if (g_kb_visible) {
+            // Options held opens the app launcher. Checked before the popups
+            // so it works whichever of them is up.
+            bool opt = (mask >> 9) & 1;
+            ULONGLONG opt_now = GetTickCount64();
+            if (opt && !opt_prev) { opt_t0 = opt_now; opt_fired = false; }
+            if (opt && !opt_fired && opt_now - opt_t0 >= 500) {
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_TOGGLE, 0);
+                opt_fired = true;
+            }
+            opt_prev = opt;
+
+            if (g_lx_visible) {
+                // Launcher owns the D-pad and Cross while it is up.
+                media_dir = st.hat;
+                sq_prev = (mask >> 0) & 1;
+                sq_fired = true;
+                if (cross && !cross_prev)
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_SELECT, 0);
+                if (circle && !circ_prev)
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_CLOSE, 0);
+                int dir = st.hat;
+                ULONGLONG tnow = GetTickCount64();
+                if (dir != dpad_prev) {
+                    if (dir != -1) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
+                        dpad_t0 = dpad_last = tnow;
+                    }
+                    dpad_prev = dir;
+                } else if (dir != -1 && tnow - dpad_t0 >= 400 &&
+                           tnow - dpad_last >= 110) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
+                    dpad_last = tnow;
+                }
+            } else if (g_kb_visible) {
                 // Keep the media state in step while the keyboard owns the
                 // D-pad, so closing it with a direction held doesn't fire.
                 media_dir = st.hat;
@@ -1358,7 +1399,7 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 // The whole key is near black, top included, with only a slight fall from top
 // to bottom. Almost all of the separation from the card comes from the lit top
 // edge rather than from the fill being lighter.
-#define KB_KEY_TOP   RGB(20, 20, 24)     // key gradient, lit top
+#define KB_KEY_TOP   RGB(16, 16, 19)     // key gradient, lit top
 #define KB_KEY_BOT   RGB(11, 11, 14)     // key gradient, shaded bottom
 #define KB_ARM_TOP   RGB(24, 33, 48)
 #define KB_ARM_BOT   RGB(14, 19, 29)
@@ -1435,6 +1476,10 @@ static ID2D1LinearGradientBrush* g_br_kb_card = NULL;
 static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
                          GetBValue(c) / 255.0f, a);
+}
+
+static inline D2D1_RECT_F to_f(const RECT& r) {
+    return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
 }
 
 static void d2d_init_process() {
@@ -1863,6 +1908,299 @@ static void kb_toggle() {
     }
 }
 
+// --- App launcher -----------------------------------------------------------
+// A second popup built on the same pattern as the keyboard: non-activating,
+// topmost, D2D-drawn, driven entirely from the pad. Held Options opens it,
+// the D-pad moves between tiles and Cross launches. The last tile is always a
+// "+" placeholder that adds another app, so the grid grows with the list.
+#define LX_TW   132      // tile size and spacing, in DIPs
+#define LX_TH   100
+#define LX_GAP  14
+#define LX_M    22
+#define LX_HDR  38       // room for the title above the grid
+#define LX_COLS 4
+#define LX_MAX_APPS 24
+#define LX_TIMER 2
+
+static HWND        g_lx = NULL;
+static int         g_lx_sel = 0;
+static int         g_lx_anim = 0;          // 0 idle, 1 opening, 2 closing
+static ULONGLONG   g_lx_anim_t0 = 0;
+static int         g_lx_x = 0, g_lx_y = 0;
+static std::wstring g_lx_apps[LX_MAX_APPS];
+static int         g_lx_count = 0;
+
+static ID2D1HwndRenderTarget* g_rt_lx = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_text = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_dim = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
+static ID2D1LinearGradientBrush* g_br_lx_face = NULL;
+static ID2D1LinearGradientBrush* g_br_lx_sheen = NULL;
+static ID2D1LinearGradientBrush* g_br_lx_edge = NULL;
+static ID2D1LinearGradientBrush* g_br_lx_card = NULL;
+
+// One path per line, next to config.json - trivial to hand-edit, and avoids
+// teaching the minimal JSON writer about arrays.
+static std::wstring apps_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"apps.txt";
+}
+
+static void lx_load() {
+    g_lx_count = 0;
+    FILE* f = _wfopen(apps_path().c_str(), L"rb, ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[MAX_PATH];
+    while (g_lx_count < LX_MAX_APPS && fgetws(line, MAX_PATH, f)) {
+        size_t n = wcslen(line);
+        while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r')) line[--n] = 0;
+        if (n) g_lx_apps[g_lx_count++] = line;
+    }
+    fclose(f);
+}
+
+static void lx_save() {
+    FILE* f = _wfopen(apps_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_lx_count; i++) fwprintf(f, L"%s\n", g_lx_apps[i].c_str());
+    fclose(f);
+}
+
+static int lx_tiles() { return g_lx_count + 1; }   // apps plus the "+" tile
+static int lx_rows()  { return (lx_tiles() + LX_COLS - 1) / LX_COLS; }
+static int lx_width() { return LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + 2 * LX_M; }
+static int lx_height() {
+    int r = lx_rows();
+    return LX_HDR + r * LX_TH + (r - 1) * LX_GAP + 2 * LX_M;
+}
+
+static RECT lx_tile_rect(int i) {
+    int col = i % LX_COLS, row = i / LX_COLS;
+    int x = LX_M + col * (LX_TW + LX_GAP);
+    int y = LX_M + LX_HDR + row * (LX_TH + LX_GAP);
+    RECT r = {x, y, x + LX_TW, y + LX_TH};
+    return r;
+}
+
+// Display name for a tile: the file name without extension is what people
+// recognise, and the full path rarely fits.
+static std::wstring lx_label(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    std::wstring n = (s == std::wstring::npos) ? path : path.substr(s + 1);
+    size_t d = n.find_last_of(L'.');
+    if (d != std::wstring::npos && d > 0) n = n.substr(0, d);
+    return n;
+}
+
+static void d2d_release_lx() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel};
+    for (int i = 0; i < 3; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    ID2D1LinearGradientBrush** gs[] = {&g_br_lx_face, &g_br_lx_sheen,
+                                       &g_br_lx_edge, &g_br_lx_card};
+    for (int i = 0; i < 4; i++)
+        if (*gs[i]) { (*gs[i])->Release(); *gs[i] = NULL; }
+    if (g_rt_lx) { g_rt_lx->Release(); g_rt_lx = NULL; }
+}
+
+static bool d2d_create_lx(HWND hwnd) {
+    g_rt_lx = d2d_create_rt(hwnd, true);
+    if (!g_rt_lx) return false;
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_lx_text);
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(RGB(150, 150, 160)), &g_br_lx_dim);
+    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_sel);
+    D2D1_GRADIENT_STOP face[2] = {{0.0f, d2d_clr(KB_KEY_TOP)},
+                                  {1.0f, d2d_clr(KB_KEY_BOT)}};
+    D2D1_GRADIENT_STOP sheen[3] = {
+        {0.0f, D2D1::ColorF(1, 1, 1, 0.085f)},
+        {0.42f, D2D1::ColorF(1, 1, 1, 0.018f)},
+        {1.0f, D2D1::ColorF(1, 1, 1, 0.0f)}};
+    D2D1_GRADIENT_STOP edge[3] = {
+        {0.0f, D2D1::ColorF(1, 1, 1, 0.32f)},
+        {0.30f, D2D1::ColorF(1, 1, 1, 0.05f)},
+        {0.65f, D2D1::ColorF(1, 1, 1, 0.0f)}};
+    D2D1_GRADIENT_STOP card[2] = {{0.0f, d2d_clr(RGB(12, 12, 15))},
+                                  {1.0f, d2d_clr(KB_CLR_BG)}};
+    g_br_lx_face  = make_vgrad(g_rt_lx, face, 2);
+    g_br_lx_sheen = make_vgrad(g_rt_lx, sheen, 3);
+    g_br_lx_edge  = make_vgrad(g_rt_lx, edge, 3);
+    g_br_lx_card  = make_vgrad(g_rt_lx, card, 2);
+    return true;
+}
+
+static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_TIMER: {
+        ULONGLONG now = GetTickCount64();
+        bool active = false;
+        if (g_lx_anim) {
+            double t = (double)(now - g_lx_anim_t0) / KB_ANIM_MS;
+            if (t > 1.0) t = 1.0;
+            double e = 1.0 - pow(1.0 - t, 3);
+            double a = (g_lx_anim == 1) ? e : 1.0 - e;
+            SetLayeredWindowAttributes(hwnd, 0, (BYTE)(255 * a), LWA_ALPHA);
+            SetWindowPos(hwnd, NULL, g_lx_x,
+                         g_lx_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            if (t >= 1.0) {
+                if (g_lx_anim == 2) ShowWindow(hwnd, SW_HIDE);
+                g_lx_anim = 0;
+            } else {
+                active = true;
+            }
+        }
+        if (!active && g_lx_visible) {
+            SetTimer(hwnd, LX_TIMER, 33, NULL);   // keep the glow breathing
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (!active) {
+            KillTimer(hwnd, LX_TIMER);
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (g_rt_lx) g_rt_lx->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        if (!g_rt_lx) d2d_create_lx(hwnd);
+        if (g_rt_lx) {
+            g_rt_lx->BeginDraw();
+            g_rt_lx->Clear(d2d_clr(KB_CLR_BG));
+            D2D1_SIZE_F sz = g_rt_lx->GetSize();
+            D2D1_RECT_F cr = D2D1::RectF(0, 0, sz.width, sz.height);
+            set_vgrad(g_br_lx_card, 0, 0, sz.height * 0.6f);
+            g_rt_lx->FillRectangle(cr, g_br_lx_card);
+            set_vgrad(g_br_lx_edge, 0, 0, 26.0f);
+            g_rt_lx->DrawRoundedRectangle(D2D1::RoundedRect(cr, 16.0f, 16.0f),
+                                          g_br_lx_edge, 1.4f);
+            if (g_tf_header) {
+                D2D1_RECT_F hr = D2D1::RectF((float)LX_M, 14.0f,
+                                             sz.width - LX_M, 14.0f + 24.0f);
+                g_rt_lx->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
+            }
+
+            double ph = (double)(GetTickCount64() % KB_BREATH_MS) / KB_BREATH_MS;
+            float breath = 0.72f + 0.28f * (float)((1.0 + cos(ph * 6.2831853)) * 0.5);
+
+            for (int i = 0; i < lx_tiles(); i++) {
+                RECT tr = lx_tile_rect(i);
+                D2D1_RECT_F tf = to_f(tr);
+                D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(tf, KB_RADIUS, KB_RADIUS);
+                bool sel = (i == g_lx_sel);
+                if (sel)
+                    d2d_soft_glow(g_rt_lx, g_br_lx_sel, tf, KB_RADIUS,
+                                  11.0f * breath, 0.28f * breath, 4);
+                set_vgrad(g_br_lx_face, tf.left, tf.top, tf.bottom);
+                g_rt_lx->FillRoundedRectangle(rr, g_br_lx_face);
+                set_vgrad(g_br_lx_sheen, tf.left, tf.top, tf.bottom);
+                g_rt_lx->FillRoundedRectangle(rr, g_br_lx_sheen);
+                if (sel) {
+                    g_br_lx_sel->SetOpacity(0.80f);
+                    g_rt_lx->DrawRoundedRectangle(rr, g_br_lx_sel, 1.9f);
+                    g_br_lx_sel->SetOpacity(1.0f);
+                } else {
+                    set_vgrad(g_br_lx_edge, tf.left, tf.top, tf.bottom);
+                    g_rt_lx->DrawRoundedRectangle(rr, g_br_lx_edge, 1.3f);
+                }
+                ID2D1Brush* tb = sel ? (ID2D1Brush*)g_br_lx_sel : g_br_lx_text;
+                if (i == g_lx_count) {
+                    if (g_tf_key)
+                        g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
+                } else if (g_tf_body) {
+                    std::wstring nm = lx_label(g_lx_apps[i]);
+                    D2D1_RECT_F lr = D2D1::RectF(tf.left + 8, tf.top + 8,
+                                                 tf.right - 8, tf.bottom - 8);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                    g_rt_lx->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                      g_tf_body, lr, tb);
+                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+            HRESULT hr = g_rt_lx->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) d2d_release_lx();
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        d2d_release_lx();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void lx_ensure() {
+    if (g_lx) return;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = lx_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = L"ControllerMouseLauncher";
+    RegisterClassW(&wc);
+    DWORD style = WS_POPUP;
+    DWORD ex = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    g_lx = CreateWindowExW(ex, L"ControllerMouseLauncher", L"", style,
+                           0, 0, dip_to_px(lx_width()), dip_to_px(lx_height()),
+                           g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (g_lx) {
+        SetLayeredWindowAttributes(g_lx, 0, 255, LWA_ALPHA);
+        DWORD pref = 2;  // DWMWCP_ROUND
+        DwmSetWindowAttribute(g_lx, 33, &pref, sizeof(pref));
+    }
+}
+
+// Re-centre and resize: the grid grows a row at a time as apps are added.
+static void lx_relayout() {
+    if (!g_lx) return;
+    int ww = dip_to_px(lx_width()), wh = dip_to_px(lx_height());
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_lx_x = wa.left + (wa.right - wa.left - ww) / 2;
+    g_lx_y = wa.top + (wa.bottom - wa.top - wh) / 2;
+    SetWindowPos(g_lx, NULL, g_lx_x, g_lx_y, ww, wh,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+}
+
+static void lx_toggle() {
+    lx_ensure();
+    if (!g_lx) return;
+    ULONGLONG now = GetTickCount64();
+    if (g_lx_visible) {
+        g_lx_visible = false;
+        g_lx_anim = 2;
+        g_lx_anim_t0 = now;
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+    } else {
+        lx_load();
+        if (g_lx_sel >= lx_tiles()) g_lx_sel = lx_tiles() - 1;
+        lx_relayout();
+        SetLayeredWindowAttributes(g_lx, 0, 0, LWA_ALPHA);
+        SetWindowPos(g_lx, HWND_TOPMOST, g_lx_x, g_lx_y + dip_to_px(KB_SLIDE),
+                     0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g_lx_visible = true;
+        g_lx_anim = 1;
+        g_lx_anim_t0 = now;
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+        InvalidateRect(g_lx, NULL, FALSE);
+    }
+}
+
+static void lx_nav(int dir) {
+    int n = lx_tiles();
+    if (n <= 0) return;
+    if (dir == 1)      g_lx_sel = (g_lx_sel + 1) % n;
+    else if (dir == 3) g_lx_sel = (g_lx_sel + n - 1) % n;
+    else if (dir == 2) g_lx_sel = (g_lx_sel + LX_COLS) % n;
+    else if (dir == 0) g_lx_sel = (g_lx_sel - LX_COLS + n * 2) % n;
+    if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+}
+
 // --- System tray -----------------------------------------------------------
 #define WM_TRAYICON   (WM_APP + 1)
 #define ID_TRAY_SHOW  2001
@@ -1993,10 +2331,6 @@ static const wchar_t* hide_status_text() {
 }
 
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
-
-static inline D2D1_RECT_F to_f(const RECT& r) {
-    return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
-}
 
 // --- Control legend icons ---------------------------------------------------
 // Drawn rather than shipped as bitmaps: they stay sharp at any DPI, and a
@@ -2369,6 +2703,35 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case GP_KB_SELECT:    kb_select(); break;
         case GP_KB_BACKSPACE: kb_send_vk(VK_BACK, false); break;
         case GP_KB_NAV:       kb_nav((int)lp); break;
+        case GP_LX_TOGGLE:    lx_toggle(); break;
+        case GP_LX_NAV:       lx_nav((int)lp); break;
+        case GP_LX_CLOSE:     if (g_lx_visible) lx_toggle(); break;
+        case GP_LX_SELECT: {
+            if (!g_lx_visible) break;
+            if (g_lx_sel == g_lx_count) {
+                // "+" tile: pick an executable. The launcher never takes
+                // focus, so it is dismissed first and the dialog is put up
+                // from the settings window, which can.
+                lx_toggle();
+                wchar_t file[MAX_PATH] = L"";
+                OPENFILENAMEW ofn = {sizeof(ofn)};
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = L"Programs and shortcuts\0*.exe;*.lnk\0All files\0*.*\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Add an app to the launcher";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+                if (GetOpenFileNameW(&ofn) && g_lx_count < LX_MAX_APPS) {
+                    g_lx_apps[g_lx_count++] = file;
+                    lx_save();
+                }
+            } else if (g_lx_sel < g_lx_count) {
+                std::wstring app = g_lx_apps[g_lx_sel];
+                lx_toggle();   // get out of the way before the app appears
+                ShellExecuteW(NULL, L"open", app.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            }
+            break;
+        }
         case GP_TOGGLE: {
             // Controller keybind: toggles whatever the user perceives. If the
             // mapping is effectively off (disabled OR game-paused), turn it on
