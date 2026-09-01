@@ -11,3 +11,6 @@ config.json
 
 # Local tooling
 .claude/
+
+# Sibling project (separate git repo, not part of ctrlmouse)
+GBAPal/
