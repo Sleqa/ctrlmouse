@@ -247,8 +247,6 @@ static int pov_dir(DWORD pov) {
 // Buttons (DualSense / DualShock layout): [1] = Cross, [2] = Circle.
 static LPDIRECTINPUT8       g_di = NULL;
 static LPDIRECTINPUTDEVICE8 g_dev = NULL;
-static GUID                 g_dev_guid;
-static bool                 g_found = false;
 
 static double apply_deadzone(double value, double dz) {
     double a = fabs(value);
@@ -265,10 +263,16 @@ static double norm(LONG raw, double dz) {
     return apply_deadzone(n, dz);
 }
 
+#define MAX_PADS 8
+static GUID g_pad_guids[MAX_PADS];
+static int  g_pad_count = 0;
+static GUID g_open_guid = {};        // pad we currently have open
+static GUID g_last_good = {};        // last pad that actually produced input
+static bool g_have_last_good = false;
+
 static BOOL CALLBACK enum_cb(const DIDEVICEINSTANCEW* inst, void*) {
-    g_dev_guid = inst->guidInstance;
-    g_found = true;
-    return DIENUM_STOP;  // take the first attached game controller
+    if (g_pad_count < MAX_PADS) g_pad_guids[g_pad_count++] = inst->guidInstance;
+    return DIENUM_CONTINUE;   // collect them all; ensure_device() picks
 }
 
 static void set_axis_range(DWORD offset) {
@@ -282,6 +286,36 @@ static void set_axis_range(DWORD offset) {
     g_dev->SetProperty(DIPROP_RANGE, &pr.diph);
 }
 
+static void drop_device() {
+    if (g_dev) {
+        g_dev->Unacquire();
+        g_dev->Release();
+        g_dev = NULL;
+    }
+}
+
+// Open one specific pad. Returns false (leaving no device open) unless it was
+// configured completely - a half-configured device polls fine but reports
+// nothing, which is indistinguishable from a dead controller.
+static bool try_open(const GUID& guid) {
+    if (FAILED(g_di->CreateDevice(guid, &g_dev, NULL))) {
+        g_dev = NULL;
+        return false;
+    }
+    if (FAILED(g_dev->SetDataFormat(&c_dfDIJoystick2)) ||
+        FAILED(g_dev->SetCooperativeLevel(g_hwnd,
+                                          DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))) {
+        drop_device();
+        return false;
+    }
+    set_axis_range(DIJOFS_X);
+    set_axis_range(DIJOFS_Y);
+    set_axis_range(DIJOFS_RZ);
+    g_dev->Acquire();   // may fail transiently; the poll loop retries
+    g_open_guid = guid;
+    return true;
+}
+
 static bool ensure_device() {
     if (g_dev) return true;
     if (!g_di) {
@@ -289,28 +323,22 @@ static bool ensure_device() {
                                       IID_IDirectInput8, (void**)&g_di, NULL)))
             return false;
     }
-    g_found = false;
+    g_pad_count = 0;
     g_di->EnumDevices(DI8DEVCLASS_GAMECTRL, enum_cb, NULL, DIEDFL_ATTACHEDONLY);
-    if (!g_found) return false;
-    if (FAILED(g_di->CreateDevice(g_dev_guid, &g_dev, NULL))) {
-        g_dev = NULL;
-        return false;
-    }
-    g_dev->SetDataFormat(&c_dfDIJoystick2);
-    g_dev->SetCooperativeLevel(g_hwnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
-    set_axis_range(DIJOFS_X);
-    set_axis_range(DIJOFS_Y);
-    set_axis_range(DIJOFS_RZ);
-    g_dev->Acquire();
-    return true;
-}
+    if (!g_pad_count) return false;
 
-static void drop_device() {
-    if (g_dev) {
-        g_dev->Unacquire();
-        g_dev->Release();
-        g_dev = NULL;
-    }
+    // Prefer the pad we last actually received input from. Games (and Steam
+    // Input) can register virtual controllers that enumerate ahead of the real
+    // one; binding to a virtual pad looks exactly like a dead controller, and
+    // it persists across app restarts because the enumeration order does.
+    if (g_have_last_good)
+        for (int i = 0; i < g_pad_count; i++)
+            if (IsEqualGUID(g_pad_guids[i], g_last_good) && try_open(g_pad_guids[i]))
+                return true;
+
+    for (int i = 0; i < g_pad_count; i++)
+        if (try_open(g_pad_guids[i])) return true;
+    return false;
 }
 
 static DWORD WINAPI worker_thread(LPVOID) {
@@ -322,6 +350,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     unsigned btn_mask_prev = 0;            // all-button mask (bind capture)
     bool tbtn_prev = false;                // toggle-button edge state
     ULONGLONG gamechk_last = 0;            // last fullscreen-game check
+    bool game_prev = false;                // previous fullscreen-game state
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -337,13 +366,25 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
         DIJOYSTATE2 js;
         HRESULT hr = g_dev->Poll();
-        if (FAILED(hr)) hr = g_dev->Acquire();
+        if (FAILED(hr)) {
+            hr = g_dev->Acquire();
+            if (SUCCEEDED(hr)) hr = g_dev->Poll();  // fresh data after re-acquiring
+        }
         if (SUCCEEDED(hr)) hr = g_dev->GetDeviceState(sizeof(js), &js);
 
-        if (FAILED(hr)) {  // unplugged or lost
+        if (FAILED(hr)) {  // unplugged, or another app took the device
             drop_device();
             g_connected = false;
             scroll_accum = 0.0;
+            // Let go of anything we are holding down. Without this an injected
+            // LEFTDOWN outlives the app: the desktop is stuck mid-drag, and
+            // even killing the process cannot clear it, because the button
+            // state lives in the OS input stack rather than in here.
+            edge_click_release_all(a_down, b_down);
+            tri_prev = cross_prev = circ_prev = false;
+            tbtn_prev = false;
+            dpad_prev = -1;
+            btn_mask_prev = 0;
             Sleep(300);
             continue;
         }
@@ -354,6 +395,14 @@ static DWORD WINAPI worker_thread(LPVOID) {
         unsigned mask = 0;
         for (int bi = 0; bi < 32; bi++)
             if (js.rgbButtons[bi] & 0x80) mask |= (1u << bi);
+
+        // Once a pad actually reports something, remember it as the real one
+        // so we re-open it (not a virtual pad) after a game exits.
+        if (mask || js.lX || js.lY || js.lRz ||
+            LOWORD(js.rgdwPOV[0]) != 0xFFFF) {
+            g_last_good = g_open_guid;
+            g_have_last_good = true;
+        }
 
         if (g_capture) {
             // Bind capture: the first newly pressed button becomes the toggle.
@@ -384,6 +433,23 @@ static DWORD WINAPI worker_thread(LPVOID) {
             g_game_active = false;
         }
         if (!g_game_active) g_override = false;  // override lasts one game session
+
+        // A fullscreen game just exited. Re-open the pad from scratch: an
+        // acquisition held across a game that grabbed the device can survive
+        // in a state where it polls and reads fine but never reports input
+        // again - which looked like a soft lock that only replugging fixed.
+        if (game_prev && !g_game_active) {
+            drop_device();
+            edge_click_release_all(a_down, b_down);
+            tri_prev = cross_prev = circ_prev = false;
+            tbtn_prev = false;
+            dpad_prev = -1;
+            btn_mask_prev = 0;
+            game_prev = false;
+            Sleep(150);
+            continue;
+        }
+        game_prev = g_game_active;
 
         bool mapping_on = cfg.enabled &&
                           !(cfg.game_pause && g_game_active && !g_override);
@@ -455,6 +521,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
         Sleep(8);  // ~120 Hz
     }
 
+    // Never exit holding a button: an unmatched LEFTDOWN would leave the whole
+    // desktop stuck in a drag after we are gone.
+    edge_click_release_all(a_down, b_down);
     drop_device();
     if (g_di) {
         g_di->Release();
