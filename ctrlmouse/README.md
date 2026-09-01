@@ -16,12 +16,16 @@ XInput pads.
 | Circle / B | Right click |
 | Square / X | Play / pause |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
-| D-pad left / right | Previous / next track |
+| D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |
 | Circle *(keyboard open)* | Backspace |
 | Touchpad click *(customizable)* | Toggle the mapping on / off |
+
+Volume and play/pause use the system media keys, so they reach whichever app
+owns playback even in the background. Seeking sends left/right arrow keys —
+the way video players expect — so it applies to the focused window.
 
 ## Features
 

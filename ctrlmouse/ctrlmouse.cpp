@@ -1132,24 +1132,33 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 if (square && !sq_prev) tap_key(VK_MEDIA_PLAY_PAUSE);
                 sq_prev = square;
 
+                // Up/down are system-wide volume keys. Left/right send arrow
+                // keys, which is how players (YouTube, VLC, Netflix) seek -
+                // there is no system-wide seek key, so unlike volume these go
+                // to the focused window.
                 int dir = st.hat;
+                WORD mk = 0;
+                if (dir == 0)      mk = VK_VOLUME_UP;
+                else if (dir == 2) mk = VK_VOLUME_DOWN;
+                else if (dir == 1) mk = VK_RIGHT;
+                else if (dir == 3) mk = VK_LEFT;
+
                 ULONGLONG tnow = GetTickCount64();
                 if (dir != media_dir) {
                     media_dir = dir;
                     media_t0 = media_last = tnow;
                     media_reps = 0;
-                    if (dir == 0)      tap_key(VK_VOLUME_UP);
-                    else if (dir == 2) tap_key(VK_VOLUME_DOWN);
-                    else if (dir == 1) tap_key(VK_MEDIA_NEXT_TRACK);
-                    else if (dir == 3) tap_key(VK_MEDIA_PREV_TRACK);
-                } else if ((dir == 0 || dir == 2) && tnow - media_t0 >= 350) {
-                    // Hold to keep changing volume, speeding up the longer it
-                    // is held: 140ms between steps down to 40ms. Track skip
-                    // deliberately does not repeat.
-                    ULONGLONG gap = 140 - (ULONGLONG)media_reps * 8;
+                    if (mk) tap_key(mk);
+                } else if (mk && tnow - media_t0 >= 350) {
+                    // Hold to keep going, speeding up the longer it is held:
+                    // 140ms between steps down to 40ms. Signed on purpose -
+                    // computing this in unsigned made it wrap to a huge value
+                    // once the subtraction went negative, which silently
+                    // stalled the repeat after ~18 steps.
+                    int gap = 140 - media_reps * 8;
                     if (gap < 40) gap = 40;
-                    if (tnow - media_last >= gap) {
-                        tap_key(dir == 0 ? VK_VOLUME_UP : VK_VOLUME_DOWN);
+                    if (tnow - media_last >= (ULONGLONG)gap) {
+                        tap_key(mk);
                         media_last = tnow;
                         media_reps++;
                     }
@@ -1717,7 +1726,7 @@ static const wchar_t* kTrackLabel[3] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone"};
 static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
 static const wchar_t* kHelpText[NHELP] = {
-    L"D-pad: volume up / down (hold), skip track.   Square: play / pause.",
+    L"D-pad: up/down volume, left/right scrub (hold).   Square: play/pause.",
     L"Triangle: on-screen keyboard - then D-pad moves, Cross types,",
     L"Circle backspaces.   Close sends to tray; tray icon to quit."};
 
