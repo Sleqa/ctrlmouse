@@ -75,7 +75,7 @@ struct Config {
     double deadzone;            // fraction of stick travel ignored near centre
     bool   enabled;
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
-    int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F
+    int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial pick
     double mouse_curve;         // 1 = linear; higher = finer near centre
     int    bind[F_COUNT];       // controller button per action
 };
@@ -269,7 +269,7 @@ static Config load_config() {
     double fk;
     if (parse_double(s, "fullscreen_key", fk)) {
         c.fullscreen_key = (int)fk;
-        if (c.fullscreen_key < 0 || c.fullscreen_key > 2) c.fullscreen_key = 0;
+        if (c.fullscreen_key < 0 || c.fullscreen_key > 3) c.fullscreen_key = 0;
     }
     parse_double(s, "mouse_curve", c.mouse_curve);
     if (c.mouse_curve < 1.0) c.mouse_curve = 1.0;
@@ -353,10 +353,17 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 #define WM_GAMEPAD (WM_APP + 2)
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE, GP_CAPTURED,
-       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH };
+       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
+       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
+static volatile bool g_rad_visible = false;  // radial fullscreen picker
+// Radial option layout: top, lower-right, lower-left. Declared here because
+// the worker maps stick direction onto these angles.
+#define NRADIAL 3
+static const float kRadAngle[NRADIAL] = {-1.5707963f, 0.5235988f, 2.6179939f};
+static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
 
 // --- Game detection / toggle-bind state (shared with the worker) -----------
 static volatile bool g_game_active = false;  // fullscreen game detected
@@ -1082,6 +1089,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     // moment the mapping is switched off or pauses for a game.
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
+    bool radial_up = false;                // radial picker is on screen
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Media controls (D-pad + Square) while the on-screen keyboard is closed.
     int       media_dir = -1;              // D-pad direction being held
@@ -1213,10 +1221,13 @@ static DWORD WINAPI worker_thread(LPVOID) {
         };
 
         ULONGLONG bnow = GetTickCount64();
-        for (int f = 0; f < F_COUNT; f++) {
+        // Cleared on press, not on release: the release-edge checks below run
+        // in this same iteration and rely on hold_fired still saying whether a
+        // hold already ran. Clearing it here made every hold look like a tap
+        // as well, which closed the search keyboard the moment the button came
+        // up and fired play/pause on top of a fullscreen hold.
+        for (int f = 0; f < F_COUNT; f++)
             if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
-            if (went_up(f))   { hold_fired[f] = false; }
-        }
 
         if (g_capture) {
             // Rebinding: the first newly pressed button is the new binding.
@@ -1288,6 +1299,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             double rx = st.lx / 1000.0, ry = st.ly / 1000.0;
             double m = sqrt(rx * rx + ry * ry);
             if (m > 1.0) { rx /= m; ry /= m; m = 1.0; }
+            if (radial_up) m = 0.0;   // stick is steering the wheel
             if (m > cfg.deadzone) {
                 double t = (m - cfg.deadzone) / (1.0 - cfg.deadzone);
                 double speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
@@ -1377,9 +1389,38 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 b = is_down(F_RCLICK);
                 dpad_prev = -1;
 
-                // Fullscreen is a hold.
-                if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
-                    bnow - hold_t0[F_FULLSCREEN] >= 600) {
+                // Fullscreen is a hold. With the radial picker selected the
+                // hold instead opens the wheel, the left stick swings the
+                // selection round, and releasing fires it.
+                if (cfg.fullscreen_key == 3) {
+                    if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
+                        bnow - hold_t0[F_FULLSCREEN] >= 300) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
+                        hold_fired[F_FULLSCREEN] = true;
+                        radial_up = true;
+                    }
+                    if (radial_up && is_down(F_FULLSCREEN)) {
+                        // Pick by stick direction, ignoring small deflections
+                        // so a resting stick does not swing the selection.
+                        double sx = st.lx / 1000.0, sy = st.ly / 1000.0;
+                        if (sqrt(sx * sx + sy * sy) > 0.45) {
+                            double ang = atan2(sy, sx);
+                            int best = 0;
+                            double bestd = 99.0;
+                            for (int i = 0; i < NRADIAL; i++) {
+                                double d = fabs(atan2(sin(ang - kRadAngle[i]),
+                                                      cos(ang - kRadAngle[i])));
+                                if (d < bestd) { bestd = d; best = i; }
+                            }
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, best);
+                        }
+                    }
+                    if (radial_up && went_up(F_FULLSCREEN)) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
+                        radial_up = false;
+                    }
+                } else if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
+                           bnow - hold_t0[F_FULLSCREEN] >= 600) {
                     send_fullscreen(cfg.fullscreen_key);
                     hold_fired[F_FULLSCREEN] = true;
                 }
@@ -2714,6 +2755,144 @@ static void lx_nav(int dir) {
     if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
 }
 
+// --- Radial fullscreen picker -----------------------------------------------
+// Shown only while the fullscreen button is held: the left stick swings the
+// selection round and letting go fires it. Transient by design, unlike the
+// keyboard and launcher which toggle.
+#define RAD_W    280
+#define RAD_H    280
+#define RAD_R    88.0f    // distance from centre to each option
+#define RAD_BW   104      // option bubble size
+#define RAD_BH   42
+static HWND g_rad = NULL;
+static int  g_rad_sel = 0;
+static ID2D1HwndRenderTarget* g_rt_rad = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_face = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_dim = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_onacc = NULL;
+
+static D2D1_RECT_F rad_bubble(int i) {
+    float cx = RAD_W / 2.0f + cosf(kRadAngle[i]) * RAD_R;
+    float cy = RAD_H / 2.0f + sinf(kRadAngle[i]) * RAD_R;
+    return D2D1::RectF(cx - RAD_BW / 2.0f, cy - RAD_BH / 2.0f,
+                       cx + RAD_BW / 2.0f, cy + RAD_BH / 2.0f);
+}
+
+static void d2d_release_rad() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_rad_face, &g_br_rad_sel, &g_br_rad_text,
+                                   &g_br_rad_dim, &g_br_rad_border, &g_br_rad_onacc};
+    for (int i = 0; i < 6; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
+}
+
+static bool d2d_create_rad(HWND hwnd) {
+    g_rt_rad = d2d_create_rt(hwnd, true);
+    if (!g_rt_rad) return false;
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_rad_face);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_rad_onacc);
+    g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                    &g_br_rad_border);
+    return true;
+}
+
+static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (g_rt_rad) g_rt_rad->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        if (!g_rt_rad) d2d_create_rad(hwnd);
+        if (g_rt_rad) {
+            g_rt_rad->BeginDraw();
+            g_rt_rad->Clear(d2d_clr(KB_CLR_BG));
+            D2D1_SIZE_F sz = g_rt_rad->GetSize();
+            g_rt_rad->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                              sz.height - 0.5f),
+                                  KB_CARD_RADIUS, KB_CARD_RADIUS),
+                g_br_rad_border, 1.0f);
+            if (g_tf_body) {
+                D2D1_RECT_F t = D2D1::RectF(0, sz.height / 2 - 10, sz.width,
+                                            sz.height / 2 + 10);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t, g_br_rad_dim);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            for (int i = 0; i < NRADIAL; i++) {
+                D2D1_RECT_F b = rad_bubble(i);
+                bool sel = (i == g_rad_sel);
+                draw_control(g_rt_rad, b, KB_RADIUS,
+                             sel ? (ID2D1Brush*)g_br_rad_sel : g_br_rad_face,
+                             sel ? NULL : (ID2D1Brush*)g_br_rad_border);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
+                                       g_tf_body, b,
+                                       sel ? (ID2D1Brush*)g_br_rad_onacc
+                                           : g_br_rad_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+            HRESULT hr = g_rt_rad->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) d2d_release_rad();
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        d2d_release_rad();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void rad_show(bool on) {
+    if (on) {
+        if (!g_rad) {
+            WNDCLASSW wc = {};
+            wc.lpfnWndProc = rad_proc;
+            wc.hInstance = GetModuleHandleW(NULL);
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wc.lpszClassName = L"ControllerMouseRadial";
+            RegisterClassW(&wc);
+            g_rad = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                L"ControllerMouseRadial", L"", WS_POPUP, 0, 0,
+                dip_to_px(RAD_W), dip_to_px(RAD_H), g_hwnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            if (g_rad) {
+                SetLayeredWindowAttributes(g_rad, 0, 245, LWA_ALPHA);
+                DWORD pref = 2;  // DWMWCP_ROUND
+                DwmSetWindowAttribute(g_rad, 33, &pref, sizeof(pref));
+            }
+        }
+        if (!g_rad) return;
+        RECT wa;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
+        SetWindowPos(g_rad, HWND_TOPMOST,
+                     wa.left + (wa.right - wa.left - w) / 2,
+                     wa.top + (wa.bottom - wa.top - h) / 2, w, h,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g_rad_visible = true;
+        InvalidateRect(g_rad, NULL, FALSE);
+    } else if (g_rad) {
+        ShowWindow(g_rad, SW_HIDE);
+        g_rad_visible = false;
+    }
+}
+
 // --- System tray -----------------------------------------------------------
 #define WM_TRAYICON   (WM_APP + 1)
 #define ID_TRAY_SHOW  2001
@@ -2801,14 +2980,15 @@ static const RECT kToggleLabel[NTOGGLES] = {
 
 // Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
 // the right answer depends entirely on the app being used.
-static const RECT kFsLabelRect = {20, 408, 20 + 100, 408 + 18};
-#define NFSKEYS 3
+static const RECT kFsLabelRect = {20, 408, 20 + 80, 408 + 18};
+#define NFSKEYS 4
 static const RECT kFsSeg[NFSKEYS] = {
-    {124, 404, 124 + 76, 404 + 26},
-    {206, 404, 206 + 76, 404 + 26},
-    {288, 404, 288 + 76, 404 + 26},
+    {106, 404, 106 + 60, 404 + 26},
+    {172, 404, 172 + 60, 404 + 26},
+    {238, 404, 238 + 60, 404 + 26},
+    {304, 404, 304 + 60, 404 + 26},
 };
-static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
+static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Ent", L"F", L"Radial"};
 
 // Feature list. Each row is an icon for what the action does, its name, and a
 // button showing the control bound to it - click to rebind. The two D-pad
@@ -3350,6 +3530,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case GP_KB_TOGGLE:
             if (g_kb_visible && g_kb_search) g_kb_search = false;
             kb_toggle();
+            break;
+        case GP_RAD_SHOW: rad_show(true); break;
+        case GP_RAD_SEL:
+            if (g_rad_sel != (int)lp) {
+                g_rad_sel = (int)lp;
+                if (g_rad) InvalidateRect(g_rad, NULL, FALSE);
+            }
+            break;
+        case GP_RAD_PICK:
+            rad_show(false);
+            send_fullscreen(g_rad_sel);
             break;
         case GP_KB_SEARCH:
             // Hold: open straight into search, or switch an already-open
