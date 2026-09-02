@@ -49,6 +49,10 @@ the way video players expect — so it applies to the focused window.
   the mapping from the couch.
 - **Run at login** — an optional toggle registers a `Run` entry that starts
   ctrlmouse minimised to the tray.
+- **App launcher** — hold Options for a grid of apps with their real icons.
+  Launching one that is already open switches to it instead of starting a
+  second copy, and D-pad up on a running app offers to close it. A Settings
+  tile opens Windows Settings.
 - **System tray** — closing the window sends it to the tray; the mapping keeps
   running. Right-click the tray icon to restore or quit.
 - **Settings window** — sensitivity, scroll speed, and deadzone sliders with
@@ -65,6 +69,33 @@ the way video players expect — so it applies to the focused window.
 > *More info → Run anyway*), and some antivirus products may flag it — an app
 > that synthesizes mouse input looks suspicious to heuristics by nature. The
 > full source is in this repo; if in doubt, build it yourself (below).
+
+## Drawing above the Start menu (optional)
+
+The on-screen keyboard is topmost, but the Start menu sits in a higher z-order
+band that only a **uiAccess** process may enter — which matters if you want to
+type into Start's search box. Windows grants uiAccess only to an executable
+that is *both* signed by a trusted certificate *and* installed in a protected
+folder, so the portable exe cannot qualify.
+
+If you want it, build the uiAccess variant and install it:
+
+```bat
+compile.bat uiaccess
+```
+
+```powershell
+.\install-uiaccess.ps1
+```
+
+The script creates a self-signed code-signing certificate, trusts it on this
+machine, signs the exe and installs it to `Program Files`. Run it with
+`-Remove` to undo all of that.
+
+> Trusting a self-signed certificate means this machine will accept any binary
+> signed with that key as coming from a trusted publisher. That is a fair trade
+> on your own PC and a poor one on a shared or work machine. Everything else in
+> ctrlmouse works without this.
 
 ## Build from source
 
