@@ -21,6 +21,7 @@ beside it and press a controller button. The D-pad media bindings are fixed.
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
+| Triangle *(hold)* | Open the keyboard with an app search bar |
 | Options *(hold)* | Open the app launcher |
 | D-pad *(launcher open)* | Move between apps |
 | Cross *(launcher open)* | Launch the highlighted app |
@@ -41,6 +42,10 @@ the way video players expect — so it applies to the focused window.
 
 - **On-screen keyboard** — dark themed, animated, driven entirely by the
   controller. It never steals focus, so keys go to the app you're working in.
+- **App search** — hold the keyboard button and it opens with a search bar
+  instead. Typing filters your installed applications; D-pad up from the top
+  key row moves into the results, Cross launches. It searches the same Start
+  Menu shortcuts Windows does.
 - **Game auto-pause** — detects fullscreen games (exclusive and borderless)
   and pauses the mapping so your sticks don't fight the game. Checked at most
   every 2 seconds with a couple of API calls; effectively zero cost. Can be
@@ -69,33 +74,6 @@ the way video players expect — so it applies to the focused window.
 > *More info → Run anyway*), and some antivirus products may flag it — an app
 > that synthesizes mouse input looks suspicious to heuristics by nature. The
 > full source is in this repo; if in doubt, build it yourself (below).
-
-## Drawing above the Start menu (optional)
-
-The on-screen keyboard is topmost, but the Start menu sits in a higher z-order
-band that only a **uiAccess** process may enter — which matters if you want to
-type into Start's search box. Windows grants uiAccess only to an executable
-that is *both* signed by a trusted certificate *and* installed in a protected
-folder, so the portable exe cannot qualify.
-
-If you want it, build the uiAccess variant and install it:
-
-```bat
-compile.bat uiaccess
-```
-
-```powershell
-.\install-uiaccess.ps1
-```
-
-The script creates a self-signed code-signing certificate, trusts it on this
-machine, signs the exe and installs it to `Program Files`. Run it with
-`-Remove` to undo all of that.
-
-> Trusting a self-signed certificate means this machine will accept any binary
-> signed with that key as coming from a trusted publisher. That is a fair trade
-> on your own PC and a poor one on a shared or work machine. Everything else in
-> ctrlmouse works without this.
 
 ## Build from source
 

@@ -353,7 +353,7 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 #define WM_GAMEPAD (WM_APP + 2)
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE, GP_CAPTURED,
-       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE };
+       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -1315,7 +1315,12 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 scroll_accum = 0.0;
             }
 
-            if (went_down(F_KEYBOARD))
+            if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
+                bnow - hold_t0[F_KEYBOARD] >= 500) {
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SEARCH, 0);
+                hold_fired[F_KEYBOARD] = true;
+            }
+            if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
 
             // Launcher is a hold, checked before the popups so it works
@@ -1520,6 +1525,111 @@ static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
 static HWND   g_kb = NULL;
 static int    g_kb_row = 1, g_kb_col = 0;
 static bool   g_kb_shift = false;
+
+// --- Search mode ------------------------------------------------------------
+// Holding the keyboard button opens it with a search field instead of typing
+// into whatever has focus. This exists because the on-screen keyboard cannot
+// be drawn over the Start menu - the shell reserves that z-order band for
+// uiAccess processes - so rather than fight for the Start search box, the
+// keyboard carries its own.
+#define KB_SEARCH_FIELD 46
+#define KB_RES_H        30
+#define KB_RES_MAX      5
+#define KB_SEARCH_H     (KB_SEARCH_FIELD + KB_RES_MAX * KB_RES_H + 10)
+#define KB_INDEX_MAX    600
+
+struct AppEntry { std::wstring name, path; };
+static AppEntry g_index[KB_INDEX_MAX];
+static int      g_index_count = 0;
+static bool     g_index_built = false;
+
+static bool     g_kb_search = false;      // keyboard is in search mode
+static wchar_t  g_kb_query[64] = L"";
+static int      g_kb_res[KB_RES_MAX];     // indices into g_index
+static int      g_kb_res_count = 0;
+static int      g_kb_res_sel = 0;
+static bool     g_kb_in_res = false;      // focus is in the results, not the keys
+
+static int kb_y_off() { return g_kb_search ? KB_SEARCH_H : 0; }
+
+// Everything the Start menu lists comes from these two folders, so walking
+// them gives the same set of applications without touching the search index.
+static void index_dir(const std::wstring& dir, int depth) {
+    if (g_index_count >= KB_INDEX_MAX || depth > 4) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        std::wstring full = dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            index_dir(full, depth + 1);
+        } else {
+            const wchar_t* ext = wcsrchr(fd.cFileName, L'.');
+            if (ext && _wcsicmp(ext, L".lnk") == 0 && g_index_count < KB_INDEX_MAX) {
+                std::wstring nm(fd.cFileName);
+                nm.resize(nm.size() - 4);          // drop .lnk
+                g_index[g_index_count].name = nm;
+                g_index[g_index_count].path = full;
+                g_index_count++;
+            }
+        }
+    } while (g_index_count < KB_INDEX_MAX && FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void build_index() {
+    if (g_index_built) return;
+    g_index_built = true;
+    g_index_count = 0;
+    const int folders[2] = {CSIDL_COMMON_PROGRAMS, CSIDL_PROGRAMS};
+    for (int i = 0; i < 2; i++) {
+        wchar_t path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, folders[i], NULL, 0, path)))
+            index_dir(path, 0);
+    }
+}
+
+static std::wstring lower_of(const std::wstring& s) {
+    std::wstring o(s);
+    for (size_t i = 0; i < o.size(); i++) o[i] = (wchar_t)towlower(o[i]);
+    return o;
+}
+
+// Prefix matches first, then anything containing the query - the same ordering
+// intuition as Start, without pretending to be a real ranker.
+static void kb_search_update() {
+    g_kb_res_count = 0;
+    g_kb_res_sel = 0;
+    if (!g_kb_query[0]) return;
+    build_index();
+    std::wstring q = lower_of(g_kb_query);
+    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX; pass++) {
+        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX; i++) {
+            std::wstring n = lower_of(g_index[i].name);
+            size_t at = n.find(q);
+            if (at == std::wstring::npos) continue;
+            if ((pass == 0) != (at == 0)) continue;
+            bool dup = false;
+            for (int j = 0; j < g_kb_res_count; j++)
+                if (g_kb_res[j] == i) dup = true;
+            if (!dup) g_kb_res[g_kb_res_count++] = i;
+        }
+    }
+}
+
+// Defined with the launcher, which shares it: launching something already
+// running should switch to it rather than start a second copy.
+static bool activate_running(const std::wstring& path);
+
+static void kb_search_launch() {
+    if (g_kb_res_sel < 0 || g_kb_res_sel >= g_kb_res_count) return;
+    std::wstring path = g_index[g_kb_res[g_kb_res_sel]].path;
+    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);   // dismiss, then run
+    if (!activate_running(path))
+        ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
 // The only GDI object left: the window-class background brush, which just
 // prevents a white flash between window creation and the first D2D paint.
 static HBRUSH g_kb_bg = NULL;
@@ -1579,6 +1689,7 @@ static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
 static ID2D1SolidColorBrush*  g_br_kb_onacc = NULL;   // label on an accent fill
 static ID2D1SolidColorBrush*  g_br_kb_border = NULL;  // hairline control stroke
+static ID2D1SolidColorBrush*  g_br_kb_dim = NULL;     // placeholder / secondary
 
 static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
@@ -1689,8 +1800,9 @@ static bool d2d_create_main(HWND hwnd) {
 static void d2d_release_kb() {
     ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
                                    &g_br_kb_text, &g_br_kb_flash,
-                                   &g_br_kb_onacc, &g_br_kb_border};
-    for (int i = 0; i < 7; i++)
+                                   &g_br_kb_onacc, &g_br_kb_border,
+                                   &g_br_kb_dim};
+    for (int i = 0; i < 8; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
 }
@@ -1706,6 +1818,7 @@ static bool d2d_create_kb(HWND hwnd) {
     g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_flash);
     g_rt_kb->CreateSolidColorBrush(
         D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_kb_border);
+    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_kb_dim);
     return true;
 }
 
@@ -1724,7 +1837,7 @@ static RECT kb_key_rect(int row, int idx) {
     for (int i = 0; i < KB_COUNT[row]; i++) roww += kb_key_width(KB_ROWS[row][i]);
     int x = (KB_W - roww) / 2;
     for (int i = 0; i < idx; i++) x += kb_key_width(KB_ROWS[row][i]) + KB_GAP;
-    int y = KB_M + row * (KB_KU + KB_GAP);
+    int y = KB_M + kb_y_off() + row * (KB_KU + KB_GAP);
     RECT r = {x, y, x + kb_key_width(KB_ROWS[row][idx]), y + KB_KU};
     return r;
 }
@@ -1741,19 +1854,70 @@ static void kb_send_vk(WORD vk, bool shift) {
 }
 
 static void kb_select() {
+    if (g_kb_search && g_kb_in_res) { kb_search_launch(); return; }
     const KbKey& k = KB_ROWS[g_kb_row][g_kb_col];
     if (k.vk == VK_SHIFT) {
         g_kb_shift = !g_kb_shift;   // one-shot: applies to the next key
+        if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+        return;
+    }
+    if (g_kb_search) {
+        // Keys build the query instead of being sent to another window.
+        size_t n = wcslen(g_kb_query);
+        if (k.vk == VK_RETURN) {
+            kb_search_launch();
+            return;
+        }
+        if (k.vk == VK_SPACE) {
+            if (n < 62) { g_kb_query[n] = L' '; g_kb_query[n + 1] = 0; }
+        } else if (n < 62) {
+            wchar_t c = k.label[0];
+            if (!g_kb_shift && c >= L'A' && c <= L'Z') c = (wchar_t)towlower(c);
+            g_kb_query[n] = c;
+            g_kb_query[n + 1] = 0;
+        }
+        g_kb_shift = false;
+        kb_search_update();
     } else {
         kb_send_vk(k.vk, g_kb_shift);
         g_kb_shift = false;
-        g_kb_pulse_t0 = GetTickCount64();          // flash the pressed key
-        if (g_kb) SetTimer(g_kb, KB_TIMER, 15, NULL);
     }
+    g_kb_pulse_t0 = GetTickCount64();          // flash the pressed key
+    if (g_kb) SetTimer(g_kb, KB_TIMER, 15, NULL);
     if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
 }
 
+// Circle: backspace in search mode, a real backspace otherwise.
+static void kb_backspace() {
+    if (!g_kb_search) { kb_send_vk(VK_BACK, false); return; }
+    size_t n = wcslen(g_kb_query);
+    if (n) {
+        g_kb_query[n - 1] = 0;
+        kb_search_update();
+        if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+    }
+}
+
 static void kb_nav(int dir) {
+    if (g_kb_search) {
+        if (g_kb_in_res) {
+            // Inside the results: up/down move, down past the end returns to
+            // the keys.
+            if (dir == 0 && g_kb_res_sel > 0) g_kb_res_sel--;
+            else if (dir == 2) {
+                if (g_kb_res_sel + 1 < g_kb_res_count) g_kb_res_sel++;
+                else { g_kb_in_res = false; g_kb_row = 0; }
+            }
+            if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            return;
+        }
+        if (dir == 0 && g_kb_row == 0 && g_kb_res_count) {
+            g_kb_in_res = true;
+            g_kb_res_sel = g_kb_res_count - 1;
+            if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            return;
+        }
+    }
     if (dir == 0) g_kb_row = (g_kb_row + KB_NROWS - 1) % KB_NROWS;        // up
     else if (dir == 2) g_kb_row = (g_kb_row + 1) % KB_NROWS;              // down
     else if (dir == 1) g_kb_col = (g_kb_col + 1) % KB_COUNT[g_kb_row];    // right
@@ -1825,6 +1989,51 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_rt_kb->DrawRoundedRectangle(
                     D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
                     g_br_kb_border, 1.0f);
+            }
+
+            // Search field and results, when the keyboard was opened by
+            // holding rather than tapping.
+            if (g_kb_search) {
+                D2D1_RECT_F fr = D2D1::RectF((float)KB_M, (float)KB_M,
+                                             (float)(KB_W - KB_M),
+                                             (float)(KB_M + KB_SEARCH_FIELD - 10));
+                draw_control(g_rt_kb, fr, KB_RADIUS, g_br_kb_key, g_br_kb_border);
+                if (g_tf_key) {
+                    D2D1_RECT_F tr = D2D1::RectF(fr.left + 14, fr.top,
+                                                 fr.right - 14, fr.bottom);
+                    g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    const wchar_t* q = g_kb_query[0] ? g_kb_query : L"Search";
+                    g_rt_kb->DrawText(q, (UINT32)wcslen(q), g_tf_key, tr,
+                                      g_kb_query[0] ? g_br_kb_text : g_br_kb_dim);
+                    g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                }
+                for (int r = 0; r < g_kb_res_count; r++) {
+                    float y = (float)(KB_M + KB_SEARCH_FIELD + r * KB_RES_H);
+                    D2D1_RECT_F rr = D2D1::RectF((float)KB_M, y,
+                                                 (float)(KB_W - KB_M),
+                                                 y + KB_RES_H - 4);
+                    bool rsel = (g_kb_in_res && r == g_kb_res_sel);
+                    if (rsel)
+                        draw_control(g_rt_kb, rr, KB_RADIUS, g_br_kb_sel, NULL);
+                    if (g_tf_body) {
+                        const std::wstring& nm = g_index[g_kb_res[r]].name;
+                        D2D1_RECT_F tr = D2D1::RectF(rr.left + 14, rr.top,
+                                                     rr.right - 14, rr.bottom);
+                        g_rt_kb->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                          g_tf_body, tr,
+                                          rsel ? (ID2D1Brush*)g_br_kb_onacc
+                                               : g_br_kb_text);
+                    }
+                }
+                if (!g_kb_res_count && g_tf_body) {
+                    float y = (float)(KB_M + KB_SEARCH_FIELD);
+                    D2D1_RECT_F tr = D2D1::RectF((float)(KB_M + 14), y,
+                                                 (float)(KB_W - KB_M), y + KB_RES_H);
+                    const wchar_t* msg = g_kb_query[0]
+                        ? L"No matching apps" : L"Type to search your apps";
+                    g_rt_kb->DrawText(msg, (UINT32)wcslen(msg), g_tf_body, tr,
+                                      g_br_kb_dim);
+                }
             }
 
             for (int r = 0; r < KB_NROWS; r++) {
@@ -1915,19 +2124,6 @@ static void kb_ensure() {
                            g_kb_x, g_kb_y, ww, wh, g_hwnd, NULL,
                            GetModuleHandleW(NULL), NULL);
 
-    // Try to join the z-order band the shell's own input surfaces live in, so
-    // the keyboard can cover the Start menu - which is the whole point of it
-    // when the thing being typed into is Start's search box. SetWindowBand is
-    // undocumented and only honours a raised band for a uiAccess process, so
-    // this is expected to fail for an unsigned portable exe and is treated as
-    // best-effort; the timer keeps re-asserting plain topmost regardless.
-    if (g_kb) {
-        typedef BOOL(WINAPI * SetBandFn)(HWND, HWND, DWORD);
-        HMODULE u = GetModuleHandleW(L"user32.dll");
-        SetBandFn sb = u ? (SetBandFn)GetProcAddress(u, "SetWindowBand") : NULL;
-        if (sb) sb(g_kb, NULL, 2 /*ZBID_ABOVELOCK_UX*/);
-    }
-
     // Rounded window corners on Windows 11 (best-effort; harmless elsewhere).
     if (g_kb) {
         SetLayeredWindowAttributes(g_kb, 0, 255, LWA_ALPHA);
@@ -1935,6 +2131,19 @@ static void kb_ensure() {
         DwmSetWindowAttribute(g_kb, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/,
                               &pref, sizeof(pref));
     }
+}
+
+// Size and re-centre for the current mode; the search area only exists when
+// search mode is on.
+static void kb_relayout() {
+    if (!g_kb) return;
+    int ww = dip_to_px(KB_W), wh = dip_to_px(KB_H + kb_y_off());
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;
+    g_kb_y = wa.bottom - wh - dip_to_px(12);
+    SetWindowPos(g_kb, NULL, g_kb_x, g_kb_y, ww, wh,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 static void kb_toggle() {
@@ -1948,6 +2157,8 @@ static void kb_toggle() {
         SetTimer(g_kb, KB_TIMER, 15, NULL);
     } else {
         g_kb_shift = false;
+        g_kb_in_res = false;
+        kb_relayout();
         SetLayeredWindowAttributes(g_kb, 0, 0, LWA_ALPHA);
         SetWindowPos(g_kb, HWND_TOPMOST, g_kb_x, g_kb_y + dip_to_px(KB_SLIDE), 0, 0,
                      SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -3136,9 +3347,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_GAMEPAD:
         switch (wp) {
-        case GP_KB_TOGGLE:    kb_toggle(); break;
+        case GP_KB_TOGGLE:
+            if (g_kb_visible && g_kb_search) g_kb_search = false;
+            kb_toggle();
+            break;
+        case GP_KB_SEARCH:
+            // Hold: open straight into search, or switch an already-open
+            // keyboard over to it.
+            if (g_kb_visible && !g_kb_search) kb_toggle();
+            g_kb_search = true;
+            g_kb_query[0] = 0;
+            g_kb_res_count = 0;
+            g_kb_in_res = false;
+            if (!g_kb_visible) kb_toggle();
+            break;
         case GP_KB_SELECT:    kb_select(); break;
-        case GP_KB_BACKSPACE: kb_send_vk(VK_BACK, false); break;
+        case GP_KB_BACKSPACE: kb_backspace(); break;
         case GP_KB_NAV:       kb_nav((int)lp); break;
         case GP_LX_TOGGLE:    lx_toggle(); break;
         case GP_LX_NAV:       lx_nav((int)lp); break;
