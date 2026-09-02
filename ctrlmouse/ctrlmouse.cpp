@@ -145,6 +145,42 @@ static std::wstring data_dir() {
 
 static std::wstring config_path() { return data_dir() + L"config.json"; }
 
+// --- Run at login -----------------------------------------------------------
+// A Run key entry rather than a scheduled task or a service: it needs no
+// elevation, and it is where a user would look to remove it. The entry starts
+// us with --tray so login does not throw a window at them.
+#define RUN_KEY  L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_NAME L"ctrlmouse"
+
+static bool startup_enabled() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    bool found = RegQueryValueExW(k, RUN_NAME, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return found;
+}
+
+static void set_startup(bool on) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0, KEY_WRITE, NULL,
+                        &k, NULL) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        wchar_t exe[MAX_PATH];
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            std::wstring cmd = L"\"";
+            cmd += exe;
+            cmd += L"\" --tray";
+            RegSetValueExW(k, RUN_NAME, 0, REG_SZ, (const BYTE*)cmd.c_str(),
+                           (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(k, RUN_NAME);
+    }
+    RegCloseKey(k);
+}
+
 // Bring settings written by an older build across, once.
 static void migrate_old_data() {
     if (data_dir() == exe_dir()) return;
@@ -1753,9 +1789,16 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else g_kb_pulse_t0 = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        // Nothing animates while the keyboard merely sits open, so the timer
-        // stops once the open/close slide and the key flash are done.
-        if (!active) KillTimer(hwnd, KB_TIMER);
+        // Other topmost windows appearing after ours will sit above it, so
+        // while the keyboard is up keep pushing it back to the front. This
+        // cannot beat the Start menu, which the shell puts in a higher
+        // z-order band that only a uiAccess process can enter - see kb_ensure.
+        if (g_kb_visible) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!active) SetTimer(hwnd, KB_TIMER, 250, NULL);
+        }
+        if (!active && !g_kb_visible) KillTimer(hwnd, KB_TIMER);
         return 0;
     }
     case WM_ERASEBKGND:
@@ -1871,6 +1914,19 @@ static void kb_ensure() {
     g_kb = CreateWindowExW(ex, L"ControllerMouseKB", L"", style,
                            g_kb_x, g_kb_y, ww, wh, g_hwnd, NULL,
                            GetModuleHandleW(NULL), NULL);
+
+    // Try to join the z-order band the shell's own input surfaces live in, so
+    // the keyboard can cover the Start menu - which is the whole point of it
+    // when the thing being typed into is Start's search box. SetWindowBand is
+    // undocumented and only honours a raised band for a uiAccess process, so
+    // this is expected to fail for an unsigned portable exe and is treated as
+    // best-effort; the timer keeps re-asserting plain topmost regardless.
+    if (g_kb) {
+        typedef BOOL(WINAPI * SetBandFn)(HWND, HWND, DWORD);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        SetBandFn sb = u ? (SetBandFn)GetProcAddress(u, "SetWindowBand") : NULL;
+        if (sb) sb(g_kb, NULL, 2 /*ZBID_ABOVELOCK_UX*/);
+    }
 
     // Rounded window corners on Windows 11 (best-effort; harmless elsewhere).
     if (g_kb) {
@@ -2017,7 +2073,10 @@ static void lx_save() {
     fclose(f);
 }
 
-static int lx_tiles() { return g_lx_count + 1; }   // apps plus the "+" tile
+// Apps, then two fixed tiles: add an app, and open Windows Settings.
+static int lx_tiles() { return g_lx_count + 2; }
+static int lx_add_index()      { return g_lx_count; }
+static int lx_settings_index() { return g_lx_count + 1; }
 static int lx_rows()  { return (lx_tiles() + LX_COLS - 1) / LX_COLS; }
 static int lx_width() { return LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + 2 * LX_M; }
 static int lx_height() {
@@ -2170,6 +2229,21 @@ static bool d2d_create_lx(HWND hwnd) {
     return true;
 }
 
+static void draw_cog(ID2D1RenderTarget* rt, float cx, float cy, float r,
+                     ID2D1Brush* br) {
+    D2D1_POINT_2F c = D2D1::Point2F(cx, cy);
+    for (int i = 0; i < 8; i++) {
+        rt->SetTransform(D2D1::Matrix3x2F::Rotation(i * 45.0f, c));
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - r * 0.16f, cy - r * 1.18f,
+                                          cx + r * 0.16f, cy - r * 0.62f),
+                              1.5f, 1.5f), br);
+    }
+    rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    rt->DrawEllipse(D2D1::Ellipse(c, r * 0.72f, r * 0.72f), br, r * 0.26f);
+    rt->DrawEllipse(D2D1::Ellipse(c, r * 0.30f, r * 0.30f), br, r * 0.16f);
+}
+
 static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER: {
@@ -2196,7 +2270,12 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else active = true;
             InvalidateRect(hwnd, NULL, FALSE);
         }
-        if (!active) KillTimer(hwnd, LX_TIMER);
+        if (g_lx_visible) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!active) SetTimer(hwnd, LX_TIMER, 250, NULL);
+        }
+        if (!active && !g_lx_visible) KillTimer(hwnd, LX_TIMER);
         return 0;
     }
     case WM_ERASEBKGND:
@@ -2267,9 +2346,18 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (cp > 0.0f)
                     g_rt_lx->PushAxisAlignedClip(tf, D2D1_ANTIALIAS_MODE_ALIASED);
 
-                if (i == g_lx_count) {
+                if (i == lx_add_index()) {
                     if (g_tf_key)
                         g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
+                } else if (i == lx_settings_index()) {
+                    draw_cog(g_rt_lx, (tf.left + tf.right) / 2, tf.top + 40, 17.0f, tb);
+                    if (g_tf_body) {
+                        D2D1_RECT_F sr = D2D1::RectF(tf.left + 8, tf.top + 62,
+                                                     tf.right - 8, tf.bottom - 6);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_lx->DrawText(L"Settings", 8, g_tf_body, sr, tb);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
                 } else if (g_tf_body) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
@@ -2464,7 +2552,7 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 756
+#define WIN_H 788
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
@@ -2488,33 +2576,35 @@ static const RECT kTrackRect[NTRACKS] = {
     {20, 228, 20 + 344, 228 + 28},
     {20, 290, 20 + 344, 290 + 28},
 };
-#define NTOGGLES 2
+#define NTOGGLES 3
 static const RECT kToggleRect[NTOGGLES] = {
     {20, 332, 20 + 46, 332 + 22},
     {196, 332, 196 + 46, 332 + 22},
+    {20, 364, 20 + 46, 364 + 22},
 };
 static const RECT kToggleLabel[NTOGGLES] = {
     {74, 334, 74 + 110, 334 + 18},
     {250, 334, 250 + 114, 334 + 18},
+    {74, 366, 74 + 260, 366 + 18},
 };
 
 // Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
 // the right answer depends entirely on the app being used.
-static const RECT kFsLabelRect = {20, 376, 20 + 100, 376 + 18};
+static const RECT kFsLabelRect = {20, 408, 20 + 100, 408 + 18};
 #define NFSKEYS 3
 static const RECT kFsSeg[NFSKEYS] = {
-    {124, 372, 124 + 76, 372 + 26},
-    {206, 372, 206 + 76, 372 + 26},
-    {288, 372, 288 + 76, 372 + 26},
+    {124, 404, 124 + 76, 404 + 26},
+    {206, 404, 206 + 76, 404 + 26},
+    {288, 404, 288 + 76, 404 + 26},
 };
 static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F"};
 
 // Feature list. Each row is an icon for what the action does, its name, and a
 // button showing the control bound to it - click to rebind. The two D-pad
 // rows are shown for reference and are not rebindable.
-static const RECT kLegendHdr = {20, 416, 20 + 344, 416 + 18};
+static const RECT kLegendHdr = {20, 448, 20 + 344, 448 + 18};
 #define NROWS 9
-#define ROW_Y0   442
+#define ROW_Y0   474
 #define ROW_STEP 30
 // icon kind
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
@@ -2540,14 +2630,15 @@ static RECT row_btn_rect(int i) {
     return r;
 }
 
-static const RECT kFooterRect = {20, 726, 20 + 344, 726 + 18};
+static const RECT kFooterRect = {20, 758, 20 + 344, 758 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
 static const wchar_t* kTrackLabel[NTRACKS] = {
     L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone",
     L"Response curve"};
-static const wchar_t* kToggleText[NTOGGLES] = {L"Enabled", L"Pause in games"};
+static const wchar_t* kToggleText[NTOGGLES] = {
+    L"Enabled", L"Pause in games", L"Start with Windows (minimised)"};
 
 // HidHide state, kept to one short line. Detail only appears when something
 // needs doing about it.
@@ -2787,6 +2878,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         for (int i = 0; i < NTOGGLES; i++) {
             if (!PtInRect(&kToggleRect[i], pt)) continue;
+            if (i == 2) {
+                // Lives in the registry, not config.json, so that removing the
+                // Run entry by hand is respected.
+                set_startup(!startup_enabled());
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             EnterCriticalSection(&g_cs);
             if (i == 0) g_cfg.enabled = !g_cfg.enabled;
             else        g_cfg.game_pause = !g_cfg.game_pause;
@@ -2958,7 +3056,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             // Toggle switches: pill track + sliding white knob.
-            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause};
+            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause,
+                                        startup_enabled()};
             for (int i = 0; i < NTOGGLES; i++) {
                 const RECT& r = kToggleRect[i];
                 float h = (float)(r.bottom - r.top);
@@ -3054,7 +3153,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 lx_set_close_mode(false);
                 break;
             }
-            if (g_lx_sel == g_lx_count) {
+            if (g_lx_sel == lx_settings_index()) {
+                lx_toggle();
+                ShellExecuteW(NULL, L"open", L"ms-settings:", NULL, NULL,
+                              SW_SHOWNORMAL);
+                break;
+            }
+            if (g_lx_sel == lx_add_index()) {
                 // "+" tile: pick an executable. The launcher never takes
                 // focus, so it is dismissed first and the dialog is put up
                 // from the settings window, which can.

@@ -47,6 +47,8 @@ the way video players expect — so it applies to the focused window.
   toggled off, and the controller toggle button overrides it in-game.
 - **Customizable toggle bind** — bind any controller button to enable/disable
   the mapping from the couch.
+- **Run at login** — an optional toggle registers a `Run` entry that starts
+  ctrlmouse minimised to the tray.
 - **System tray** — closing the window sends it to the tray; the mapping keeps
   running. Right-click the tray icon to restore or quit.
 - **Settings window** — sensitivity, scroll speed, and deadzone sliders with
