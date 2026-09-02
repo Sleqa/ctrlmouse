@@ -8,28 +8,56 @@ XInput pads.
 
 ## Controls
 
+Every action below is rebindable from the settings window — click the button
+beside it and press a controller button. The D-pad media bindings are fixed.
+
 | Controller | Action |
 |---|---|
 | Left stick | Move the mouse cursor |
-| Right stick (up/down) | Scroll wheel |
+| Right stick (up/down) | Scroll wheel (stick up scrolls down) |
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
+| Square / X | Play / pause — **hold** for fullscreen, or for the radial picker |
+| D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
+| D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
+| Triangle *(hold)* | Open the keyboard with an app search bar |
+| Options *(hold)* | Open the app launcher |
+| D-pad *(launcher open)* | Move between apps |
+| Cross *(launcher open)* | Launch the highlighted app |
+| Circle *(launcher open)* | Close the launcher |
+| D-pad up *(launcher, app running)* | Ask whether to close that app |
+| Cross *(close prompt)* | Close the app |
+| D-pad down / Circle *(close prompt)* | Back out |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |
 | Circle *(keyboard open)* | Backspace |
 | Touchpad click *(customizable)* | Toggle the mapping on / off |
 
+Volume and play/pause use the system media keys, so they reach whichever app
+owns playback even in the background. Seeking sends left/right arrow keys —
+the way video players expect — so it applies to the focused window.
+
 ## Features
 
 - **On-screen keyboard** — dark themed, animated, driven entirely by the
   controller. It never steals focus, so keys go to the app you're working in.
+- **App search** — hold the keyboard button and it opens with a search bar
+  instead. Typing filters your installed applications; D-pad up from the top
+  key row moves into the results, Cross launches. It searches the same Start
+  Menu shortcuts Windows does.
 - **Game auto-pause** — detects fullscreen games (exclusive and borderless)
   and pauses the mapping so your sticks don't fight the game. Checked at most
   every 2 seconds with a couple of API calls; effectively zero cost. Can be
   toggled off, and the controller toggle button overrides it in-game.
 - **Customizable toggle bind** — bind any controller button to enable/disable
   the mapping from the couch.
+- **Run at login** — an optional toggle registers a `Run` entry that starts
+  ctrlmouse minimised to the tray.
+- **App launcher** — hold Options for a grid of apps with their real icons.
+  Launching one that is already open switches to it instead of starting a
+  second copy, and D-pad up on a running app offers to close it. A Settings
+  tile opens Windows Settings.
 - **System tray** — closing the window sends it to the tray; the mapping keeps
   running. Right-click the tray icon to restore or quit.
 - **Settings window** — sensitivity, scroll speed, and deadzone sliders with
@@ -69,7 +97,9 @@ a version resource. Win32 + DirectInput + GDI only — no third-party libraries.
 
 ## Configuration
 
-Settings are saved automatically to `config.json` beside the exe:
+Settings are saved automatically to `config.json` in
+`%APPDATA%\ctrlmouse`, alongside `apps.txt` (the launcher list, one path per
+line). Settings written by older builds are moved there on first run.
 
 | Key | Meaning | Default |
 |---|---|---|
@@ -77,8 +107,10 @@ Settings are saved automatically to `config.json` beside the exe:
 | `scroll_sensitivity` | Scroll speed at full deflection | `1.0` |
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
-| `toggle_button` | Controller button index for the toggle bind | `13` (touchpad) |
+| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` | Controller button index per action; rebindable from the settings window | `1, 2, 3, 0, 0, 9, 13` |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
+| `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
+| `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial picker | `0` |
 
 ## License
 
