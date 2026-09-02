@@ -2759,11 +2759,13 @@ static void lx_nav(int dir) {
 // Shown only while the fullscreen button is held: the left stick swings the
 // selection round and letting go fires it. Transient by design, unlike the
 // keyboard and launcher which toggle.
-#define RAD_W    280
-#define RAD_H    280
-#define RAD_R    88.0f    // distance from centre to each option
-#define RAD_BW   104      // option bubble size
-#define RAD_BH   42
+#define RAD_W   300
+#define RAD_H   300
+#define RAD_RI   64.0f   // inner radius - the hollow centre
+#define RAD_RO  132.0f   // outer radius
+#define RAD_POP   7.0f   // how much the selected wedge grows
+#define RAD_GAP   0.052f // radians of space between wedges
+
 static HWND g_rad = NULL;
 static int  g_rad_sel = 0;
 static ID2D1HwndRenderTarget* g_rt_rad = NULL;
@@ -2773,18 +2775,43 @@ static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_onacc = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_hub = NULL;
 
-static D2D1_RECT_F rad_bubble(int i) {
-    float cx = RAD_W / 2.0f + cosf(kRadAngle[i]) * RAD_R;
-    float cy = RAD_H / 2.0f + sinf(kRadAngle[i]) * RAD_R;
-    return D2D1::RectF(cx - RAD_BW / 2.0f, cy - RAD_BH / 2.0f,
-                       cx + RAD_BW / 2.0f, cy + RAD_BH / 2.0f);
+// A donut wedge: out along one edge, round the outer arc, back in, round the
+// inner arc. Filled rather than stroked so the segments read as solid keys.
+static void fill_wedge(ID2D1RenderTarget* rt, float cx, float cy, float ri,
+                       float ro, float a0, float a1, ID2D1Brush* br) {
+    if (!g_d2d_factory) return;
+    ID2D1PathGeometry* g = NULL;
+    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
+    ID2D1GeometrySink* sink = NULL;
+    if (SUCCEEDED(g->Open(&sink)) && sink) {
+        D2D1_ARC_SIZE big = (a1 - a0) > 3.14159265f ? D2D1_ARC_SIZE_LARGE
+                                                    : D2D1_ARC_SIZE_SMALL;
+        D2D1_POINT_2F p0 = D2D1::Point2F(cx + cosf(a0) * ri, cy + sinf(a0) * ri);
+        D2D1_POINT_2F p1 = D2D1::Point2F(cx + cosf(a0) * ro, cy + sinf(a0) * ro);
+        D2D1_POINT_2F p2 = D2D1::Point2F(cx + cosf(a1) * ro, cy + sinf(a1) * ro);
+        D2D1_POINT_2F p3 = D2D1::Point2F(cx + cosf(a1) * ri, cy + sinf(a1) * ri);
+        sink->BeginFigure(p0, D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddLine(p1);
+        sink->AddArc(D2D1::ArcSegment(p2, D2D1::SizeF(ro, ro), 0.0f,
+                                      D2D1_SWEEP_DIRECTION_CLOCKWISE, big));
+        sink->AddLine(p3);
+        sink->AddArc(D2D1::ArcSegment(p0, D2D1::SizeF(ri, ri), 0.0f,
+                                      D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, big));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink->Close();
+        sink->Release();
+        rt->FillGeometry(g, br);
+    }
+    g->Release();
 }
 
 static void d2d_release_rad() {
     ID2D1SolidColorBrush** bs[] = {&g_br_rad_face, &g_br_rad_sel, &g_br_rad_text,
-                                   &g_br_rad_dim, &g_br_rad_border, &g_br_rad_onacc};
-    for (int i = 0; i < 6; i++)
+                                   &g_br_rad_dim, &g_br_rad_border,
+                                   &g_br_rad_onacc, &g_br_rad_hub};
+    for (int i = 0; i < 7; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
 }
@@ -2792,6 +2819,7 @@ static void d2d_release_rad() {
 static bool d2d_create_rad(HWND hwnd) {
     g_rt_rad = d2d_create_rt(hwnd, true);
     if (!g_rt_rad) return false;
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_rad_hub);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_rad_face);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
@@ -2817,32 +2845,52 @@ static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rt_rad->BeginDraw();
             g_rt_rad->Clear(d2d_clr(KB_CLR_BG));
             D2D1_SIZE_F sz = g_rt_rad->GetSize();
-            g_rt_rad->DrawRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
-                                              sz.height - 0.5f),
-                                  KB_CARD_RADIUS, KB_CARD_RADIUS),
-                g_br_rad_border, 1.0f);
+            float cx = sz.width / 2, cy = sz.height / 2;
+
+            // Wedges. The selected one grows outward slightly, which reads as
+            // a press without needing motion.
+            const float half = 3.14159265f / NRADIAL - RAD_GAP;
+            for (int i = 0; i < NRADIAL; i++) {
+                bool sel = (i == g_rad_sel);
+                float ro = RAD_RO + (sel ? RAD_POP : 0.0f);
+                fill_wedge(g_rt_rad, cx, cy, RAD_RI, ro,
+                           kRadAngle[i] - half, kRadAngle[i] + half,
+                           sel ? (ID2D1Brush*)g_br_rad_sel : g_br_rad_face);
+            }
+
+            // Hub, sitting over the inner edge of the wedges.
+            g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
+                                                RAD_RI - 4, RAD_RI - 4),
+                                  g_br_rad_hub);
+            g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
+                                                RAD_RI - 4, RAD_RI - 4),
+                                  g_br_rad_border, 1.0f);
+
+            // Labels sit on the mid-line of each wedge.
             if (g_tf_body) {
-                D2D1_RECT_F t = D2D1::RectF(0, sz.height / 2 - 10, sz.width,
-                                            sz.height / 2 + 10);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t, g_br_rad_dim);
+                float rmid = (RAD_RI + RAD_RO) / 2;
+                for (int i = 0; i < NRADIAL; i++) {
+                    float lx = cx + cosf(kRadAngle[i]) * rmid;
+                    float ly = cy + sinf(kRadAngle[i]) * rmid;
+                    D2D1_RECT_F lr = D2D1::RectF(lx - 52, ly - 12, lx + 52, ly + 12);
+                    g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
+                                       g_tf_body, lr,
+                                       i == g_rad_sel ? (ID2D1Brush*)g_br_rad_onacc
+                                                      : g_br_rad_text);
+                }
+                // Hub text: what this wheel is, and what is currently picked.
+                D2D1_RECT_F t1 = D2D1::RectF(cx - 56, cy - 22, cx + 56, cy - 2);
+                g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t1, g_br_rad_dim);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
-            for (int i = 0; i < NRADIAL; i++) {
-                D2D1_RECT_F b = rad_bubble(i);
-                bool sel = (i == g_rad_sel);
-                draw_control(g_rt_rad, b, KB_RADIUS,
-                             sel ? (ID2D1Brush*)g_br_rad_sel : g_br_rad_face,
-                             sel ? NULL : (ID2D1Brush*)g_br_rad_border);
-                if (g_tf_body) {
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
-                                       g_tf_body, b,
-                                       sel ? (ID2D1Brush*)g_br_rad_onacc
-                                           : g_br_rad_text);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
+            if (g_tf_header) {
+                g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                D2D1_RECT_F t2 = D2D1::RectF(cx - 56, cy - 2, cx + 56, cy + 22);
+                g_rt_rad->DrawText(kRadName[g_rad_sel],
+                                   (UINT32)wcslen(kRadName[g_rad_sel]),
+                                   g_tf_header, t2, g_br_rad_text);
+                g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
             HRESULT hr = g_rt_rad->EndDraw();
             if (hr == D2DERR_RECREATE_TARGET) d2d_release_rad();
