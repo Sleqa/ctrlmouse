@@ -287,10 +287,13 @@ static void mouse_move(LONG dx, LONG dy) {
     SendInput(1, &in, sizeof(in));
 }
 
-static void mouse_scroll(int steps) {
+// Raw wheel delta, not whole notches. WHEEL_DELTA (120) is one notch, and
+// applications have accepted fractions of it since Vista, so sending small
+// deltas every poll scrolls smoothly instead of jumping a line at a time.
+static void mouse_scroll(int delta) {
     INPUT in = {};
     in.type = INPUT_MOUSE;
-    in.mi.mouseData = (DWORD)(steps * WHEEL_DELTA);
+    in.mi.mouseData = (DWORD)delta;
     in.mi.dwFlags = MOUSEEVENTF_WHEEL;
     SendInput(1, &in, sizeof(in));
 }
@@ -1073,6 +1076,7 @@ static bool ensure_device() {
 static DWORD WINAPI worker_thread(LPVOID) {
     double scroll_accum = 0.0;
     double move_ax = 0.0, move_ay = 0.0;   // sub-pixel cursor remainder
+    double scroll_vel = 0.0;               // smoothed stick input for the wheel
     bool a_down = false, b_down = false;
 
     int dpad_prev = -1;
@@ -1167,6 +1171,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         if (!got) {   // HID pad went away mid-read
             g_connected = false;
             scroll_accum = 0.0;
+            scroll_vel = 0.0;
             move_ax = move_ay = 0.0;
             edge_click_release_all(a_down, b_down);
             for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
@@ -1315,15 +1320,27 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 move_ax = move_ay = 0.0;
             }
 
-            double nrz = norm(st.ry, cfg.deadzone);  // right stick Y
-            if (nrz != 0.0) {
-                scroll_accum += nrz * cfg.scroll_sensitivity;  // stick up -> scroll down
-                int steps = (int)scroll_accum;
-                if (steps) {
-                    mouse_scroll(steps);
-                    scroll_accum -= steps;
+            // Scrolling, smoothed three ways. The wheel used to move only in
+            // whole notches, which at 120Hz meant long gaps followed by a jump.
+            //  * a low-pass filter on the stick, so the wheel eases in and out
+            //    of motion instead of snapping to it and twitching on noise;
+            //  * the same response curve as the cursor, so a small push scrolls
+            //    slowly and fine control survives a high sensitivity;
+            //  * fractional wheel deltas, so movement is spread across every
+            //    poll rather than saved up into discrete steps.
+            double target = norm(st.ry, cfg.deadzone);   // stick up -> scroll down
+            scroll_vel += (target - scroll_vel) * 0.22;
+            if (fabs(scroll_vel) > 0.0008) {
+                double mag = pow(fabs(scroll_vel), cfg.mouse_curve);
+                double dir = scroll_vel < 0 ? -1.0 : 1.0;
+                scroll_accum += dir * mag * cfg.scroll_sensitivity;
+                int delta = (int)(scroll_accum * WHEEL_DELTA);
+                if (delta) {
+                    mouse_scroll(delta);
+                    scroll_accum -= (double)delta / WHEEL_DELTA;
                 }
             } else {
+                scroll_vel = 0.0;
                 scroll_accum = 0.0;
             }
 
@@ -1462,6 +1479,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             }
         } else {
             scroll_accum = 0.0;
+            scroll_vel = 0.0;
             move_ax = move_ay = 0.0;
             dpad_prev = -1;
             // Track the pad while paused too, so re-enabling with something
@@ -3998,7 +4016,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     BOOL dark = TRUE;   // dark title bar to match (Win10 1809+ / Win11)
     DwmSetWindowAttribute(g_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/,
                           &dark, sizeof(dark));
-    ShowWindow(g_hwnd, SW_SHOW);
+    // Started by the login entry, which passes --tray: go straight to the tray
+    // rather than putting a window in front of someone who just signed in.
+    if (wcsstr(GetCommandLineW(), L"--tray"))
+        hide_to_tray(g_hwnd);
+    else
+        ShowWindow(g_hwnd, SW_SHOW);
 
     // Optional device-hiding support. Whitelist ourselves up front: hiding is
     // only ever enabled if that worked, so we can't hide the pad from
