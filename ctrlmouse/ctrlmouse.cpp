@@ -2776,15 +2776,22 @@ static void lx_nav(int dir) {
     int n = lx_tiles();
     if (n <= 0) return;
     if (g_lx_close_mode) {
-        // Anything except another "up" backs out of the prompt.
-        if (dir != 0) lx_set_close_mode(false);
+        lx_set_close_mode(false);
+        // Up again carries on upward rather than just dismissing, so the
+        // header icons stay reachable from a tile whose app is running.
+        if (dir == 0) {
+            if (g_lx_sel < LX_COLS) g_lx_sel = lx_hdr_first();
+            else                    g_lx_sel -= LX_COLS;
+            if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+        }
         return;
     }
     if (lx_in_header(g_lx_sel)) {
         int h = g_lx_sel - n;
         if (dir == 1 && h + 1 < LX_HDR_N)      g_lx_sel = n + h + 1;
         else if (dir == 3 && h > 0)            g_lx_sel = n + h - 1;
-        else if (dir == 2)                     g_lx_sel = 0;   // back to the grid
+        else if (dir == 3)                     g_lx_sel = n - 1;  // back to the tiles
+        else if (dir == 2)                     g_lx_sel = 0;      // back to the grid
         if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
         return;
     }
@@ -2799,7 +2806,10 @@ static void lx_nav(int dir) {
         if (g_lx_sel < LX_COLS) g_lx_sel = lx_hdr_first();
         else                    g_lx_sel -= LX_COLS;
     } else if (dir == 1) {
-        g_lx_sel = (g_lx_sel + 1) % n;
+        // Past the last tile, right continues into the header rather than
+        // wrapping onto the next row.
+        if (g_lx_sel + 1 >= n) g_lx_sel = lx_hdr_second();
+        else                   g_lx_sel++;
     } else if (dir == 3) {
         g_lx_sel = (g_lx_sel + n - 1) % n;
     } else if (dir == 2) {
@@ -2813,8 +2823,8 @@ static void lx_nav(int dir) {
 // Shown only while the fullscreen button is held: the left stick swings the
 // selection round and letting go fires it. Transient by design, unlike the
 // keyboard and launcher which toggle.
-#define RAD_W   310
-#define RAD_H   310
+#define RAD_W   288
+#define RAD_H   288
 #define RAD_HUB  84.0f   // the large dark centre
 #define RAD_RI   90.0f   // inner edge of the ring
 #define RAD_RO  132.0f   // outer edge of the ring
@@ -2899,8 +2909,8 @@ static void d2d_release_rad() {
 static bool d2d_create_rad(HWND hwnd) {
     g_rt_rad = d2d_create_rt(hwnd, true);
     if (!g_rt_rad) return false;
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(26, 26, 26)), &g_br_rad_hub);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(38, 38, 38)), &g_br_rad_face);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(32, 32, 32)), &g_br_rad_hub);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(58, 58, 58)), &g_br_rad_face);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
@@ -2927,7 +2937,8 @@ static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_rt_rad) d2d_create_rad(hwnd);
         if (g_rt_rad) {
             g_rt_rad->BeginDraw();
-            g_rt_rad->Clear(d2d_clr(KB_CLR_BG));
+            // Fills the whole disc, so there is no lighter square behind it.
+            g_rt_rad->Clear(d2d_clr(RGB(20, 20, 20)));
             D2D1_SIZE_F sz = g_rt_rad->GetSize();
             float cx = sz.width / 2, cy = sz.height / 2;
             const float half = 3.14159265f / NRADIAL - RAD_GAP;
@@ -3018,8 +3029,12 @@ static void rad_show(bool on) {
                 GetModuleHandleW(NULL), NULL);
             if (g_rad) {
                 SetLayeredWindowAttributes(g_rad, 0, 245, LWA_ALPHA);
-                DWORD pref = 2;  // DWMWCP_ROUND
-                DwmSetWindowAttribute(g_rad, 33, &pref, sizeof(pref));
+                // Clip the window to a circle. The popup is layered with a
+                // single constant alpha and so has no per-pixel alpha to
+                // shape it with; a region is the only way to stop the square
+                // card showing behind the wheel.
+                int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
+                SetWindowRgn(g_rad, CreateEllipticRgn(0, 0, w + 1, h + 1), TRUE);
             }
         }
         if (!g_rad) return;
