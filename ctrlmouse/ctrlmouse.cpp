@@ -2325,10 +2325,24 @@ static void lx_save() {
     fclose(f);
 }
 
-// Apps, then two fixed tiles: add an app, and open Windows Settings.
-static int lx_tiles() { return g_lx_count + 2; }
-static int lx_add_index()      { return g_lx_count; }
-static int lx_settings_index() { return g_lx_count + 1; }
+// The grid holds the apps plus the "+" tile. Show desktop and Windows
+// Settings are utilities rather than launcher entries, so they sit as small
+// icons on the header line instead of taking grid slots.
+static int lx_tiles() { return g_lx_count + 1; }
+static int lx_add_index()  { return g_lx_count; }
+#define LX_HDR_N 2
+static int lx_hdr_first()  { return lx_tiles(); }          // show desktop
+static int lx_hdr_second() { return lx_tiles() + 1; }      // Windows Settings
+static int lx_total()      { return lx_tiles() + LX_HDR_N; }
+static bool lx_in_header(int sel) { return sel >= lx_tiles(); }
+
+#define LX_HDR_SZ 30
+static RECT lx_hdr_rect(int i) {
+    int right = LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + LX_M;
+    int x = right - (LX_HDR_N - i) * (LX_HDR_SZ + 8) + 8;
+    RECT r = {x, 10, x + LX_HDR_SZ, 10 + LX_HDR_SZ};
+    return r;
+}
 static int lx_rows()  { return (lx_tiles() + LX_COLS - 1) / LX_COLS; }
 static int lx_width() { return LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + 2 * LX_M; }
 static int lx_height() {
@@ -2456,6 +2470,27 @@ static bool activate_running(const std::wstring& path) {
     return true;
 }
 
+static void show_desktop() {
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_LWIN;
+    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'D';
+    in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = 'D';
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_LWIN;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+// A monitor: screen plus a stand.
+static void draw_desktop_icon(ID2D1RenderTarget* rt, float cx, float cy,
+                              ID2D1Brush* br) {
+    rt->DrawRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(cx - 9, cy - 7, cx + 9, cy + 4), 2, 2),
+        br, 1.4f);
+    rt->FillRectangle(D2D1::RectF(cx - 1.2f, cy + 4, cx + 1.2f, cy + 7), br);
+    rt->FillRectangle(D2D1::RectF(cx - 6, cy + 7, cx + 6, cy + 8.4f), br);
+}
+
 static void d2d_release_lx() {
     ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel,
                                    &g_br_lx_face, &g_br_lx_border,
@@ -2554,6 +2589,18 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_rt_lx->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
             }
 
+            for (int i = 0; i < LX_HDR_N; i++) {
+                RECT hr = lx_hdr_rect(i);
+                bool hsel = (g_lx_sel == lx_tiles() + i);
+                if (hsel)
+                    draw_control(g_rt_lx, to_f(hr), 6.0f, g_br_lx_sel, NULL);
+                ID2D1Brush* hb = hsel ? (ID2D1Brush*)g_br_lx_onacc : g_br_lx_dim;
+                float hx = (float)((hr.left + hr.right) / 2);
+                float hy = (float)((hr.top + hr.bottom) / 2);
+                if (i == 0) draw_desktop_icon(g_rt_lx, hx, hy, hb);
+                else        draw_cog(g_rt_lx, hx, hy, 10.0f, hb);
+            }
+
             for (int i = 0; i < lx_tiles(); i++) {
                 RECT tr = lx_tile_rect(i);
                 D2D1_RECT_F tf = to_f(tr);
@@ -2601,15 +2648,6 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (i == lx_add_index()) {
                     if (g_tf_key)
                         g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
-                } else if (i == lx_settings_index()) {
-                    draw_cog(g_rt_lx, (tf.left + tf.right) / 2, tf.top + 40, 17.0f, tb);
-                    if (g_tf_body) {
-                        D2D1_RECT_F sr = D2D1::RectF(tf.left + 8, tf.top + 62,
-                                                     tf.right - 8, tf.bottom - 6);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_lx->DrawText(L"Settings", 8, g_tf_body, sr, tb);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
                 } else if (g_tf_body) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
@@ -2710,7 +2748,7 @@ static void lx_toggle() {
         lx_load();
         g_lx_close_mode = false;
         g_lx_close_anim = 0;
-        if (g_lx_sel >= lx_tiles()) g_lx_sel = lx_tiles() - 1;
+        if (g_lx_sel >= lx_total()) g_lx_sel = 0;
         lx_relayout();
         SetLayeredWindowAttributes(g_lx, 0, 0, LWA_ALPHA);
         SetWindowPos(g_lx, HWND_TOPMOST, g_lx_x, g_lx_y + dip_to_px(KB_SLIDE),
@@ -2742,16 +2780,32 @@ static void lx_nav(int dir) {
         if (dir != 0) lx_set_close_mode(false);
         return;
     }
+    if (lx_in_header(g_lx_sel)) {
+        int h = g_lx_sel - n;
+        if (dir == 1 && h + 1 < LX_HDR_N)      g_lx_sel = n + h + 1;
+        else if (dir == 3 && h > 0)            g_lx_sel = n + h - 1;
+        else if (dir == 2)                     g_lx_sel = 0;   // back to the grid
+        if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+        return;
+    }
     // Up on a running app asks whether to close it, instead of moving a row.
     if (dir == 0 && g_lx_sel < g_lx_count &&
         find_app_window(g_lx_apps[g_lx_sel])) {
         lx_set_close_mode(true);
         return;
     }
-    if (dir == 1)      g_lx_sel = (g_lx_sel + 1) % n;
-    else if (dir == 3) g_lx_sel = (g_lx_sel + n - 1) % n;
-    else if (dir == 2) g_lx_sel = (g_lx_sel + LX_COLS) % n;
-    else if (dir == 0) g_lx_sel = (g_lx_sel - LX_COLS + n * 2) % n;
+    if (dir == 0) {
+        // From the top row, up reaches the header icons.
+        if (g_lx_sel < LX_COLS) g_lx_sel = lx_hdr_first();
+        else                    g_lx_sel -= LX_COLS;
+    } else if (dir == 1) {
+        g_lx_sel = (g_lx_sel + 1) % n;
+    } else if (dir == 3) {
+        g_lx_sel = (g_lx_sel + n - 1) % n;
+    } else if (dir == 2) {
+        g_lx_sel = (g_lx_sel + LX_COLS < n) ? g_lx_sel + LX_COLS
+                                            : g_lx_sel % LX_COLS;
+    }
     if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
 }
 
@@ -2759,12 +2813,13 @@ static void lx_nav(int dir) {
 // Shown only while the fullscreen button is held: the left stick swings the
 // selection round and letting go fires it. Transient by design, unlike the
 // keyboard and launcher which toggle.
-#define RAD_W   300
-#define RAD_H   300
-#define RAD_RI   64.0f   // inner radius - the hollow centre
-#define RAD_RO  132.0f   // outer radius
-#define RAD_POP   7.0f   // how much the selected wedge grows
-#define RAD_GAP   0.052f // radians of space between wedges
+#define RAD_W   310
+#define RAD_H   310
+#define RAD_HUB  84.0f   // the large dark centre
+#define RAD_RI   90.0f   // inner edge of the ring
+#define RAD_RO  132.0f   // outer edge of the ring
+#define RAD_RIM 140.0f   // thin outline enclosing everything
+#define RAD_GAP   0.012f // hairline of space between wedges
 
 static HWND g_rad = NULL;
 static int  g_rad_sel = 0;
@@ -2807,7 +2862,32 @@ static void fill_wedge(ID2D1RenderTarget* rt, float cx, float cy, float ri,
     g->Release();
 }
 
+// Stroked arc, for the indicator riding the outer edge of the selection.
+static ID2D1StrokeStyle* g_rad_round = NULL;
+
+static void stroke_arc(ID2D1RenderTarget* rt, float cx, float cy, float r,
+                       float a0, float a1, ID2D1Brush* br, float width) {
+    if (!g_d2d_factory) return;
+    ID2D1PathGeometry* g = NULL;
+    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
+    ID2D1GeometrySink* sink = NULL;
+    if (SUCCEEDED(g->Open(&sink)) && sink) {
+        sink->BeginFigure(D2D1::Point2F(cx + cosf(a0) * r, cy + sinf(a0) * r),
+                          D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddArc(D2D1::ArcSegment(
+            D2D1::Point2F(cx + cosf(a1) * r, cy + sinf(a1) * r),
+            D2D1::SizeF(r, r), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            (a1 - a0) > 3.14159265f ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        sink->Release();
+        rt->DrawGeometry(g, br, width, g_rad_round);
+    }
+    g->Release();
+}
+
 static void d2d_release_rad() {
+    if (g_rad_round) { g_rad_round->Release(); g_rad_round = NULL; }
     ID2D1SolidColorBrush** bs[] = {&g_br_rad_face, &g_br_rad_sel, &g_br_rad_text,
                                    &g_br_rad_dim, &g_br_rad_border,
                                    &g_br_rad_onacc, &g_br_rad_hub};
@@ -2819,14 +2899,18 @@ static void d2d_release_rad() {
 static bool d2d_create_rad(HWND hwnd) {
     g_rt_rad = d2d_create_rt(hwnd, true);
     if (!g_rt_rad) return false;
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_rad_hub);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_rad_face);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(26, 26, 26)), &g_br_rad_hub);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(38, 38, 38)), &g_br_rad_face);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_rad_onacc);
     g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
                                     &g_br_rad_border);
+    if (!g_rad_round && g_d2d_factory)
+        g_d2d_factory->CreateStrokeStyle(
+            D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND),
+            NULL, 0, &g_rad_round);
     return true;
 }
 
@@ -2846,50 +2930,63 @@ static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rt_rad->Clear(d2d_clr(KB_CLR_BG));
             D2D1_SIZE_F sz = g_rt_rad->GetSize();
             float cx = sz.width / 2, cy = sz.height / 2;
-
-            // Wedges. The selected one grows outward slightly, which reads as
-            // a press without needing motion.
             const float half = 3.14159265f / NRADIAL - RAD_GAP;
-            for (int i = 0; i < NRADIAL; i++) {
-                bool sel = (i == g_rad_sel);
-                float ro = RAD_RO + (sel ? RAD_POP : 0.0f);
-                fill_wedge(g_rt_rad, cx, cy, RAD_RI, ro,
+
+            // Ring of wedges. Only the selected one lifts off the background,
+            // so the highlight carries the eye rather than the whole wheel.
+            for (int i = 0; i < NRADIAL; i++)
+                fill_wedge(g_rt_rad, cx, cy, RAD_RI, RAD_RO,
                            kRadAngle[i] - half, kRadAngle[i] + half,
-                           sel ? (ID2D1Brush*)g_br_rad_sel : g_br_rad_face);
+                           i == g_rad_sel ? (ID2D1Brush*)g_br_rad_face
+                                          : g_br_rad_hub);
+
+            // Hairline spokes on the wedge boundaries.
+            for (int i = 0; i < NRADIAL; i++) {
+                float a = kRadAngle[i] + 3.14159265f / NRADIAL;
+                g_rt_rad->DrawLine(
+                    D2D1::Point2F(cx + cosf(a) * RAD_RI, cy + sinf(a) * RAD_RI),
+                    D2D1::Point2F(cx + cosf(a) * RAD_RO, cy + sinf(a) * RAD_RO),
+                    g_br_rad_border, 1.0f);
             }
 
-            // Hub, sitting over the inner edge of the wedges.
-            g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                                                RAD_RI - 4, RAD_RI - 4),
-                                  g_br_rad_hub);
+            // Accent arc riding the outer edge of the selection.
+            stroke_arc(g_rt_rad, cx, cy, RAD_RO + 4.0f,
+                       kRadAngle[g_rad_sel] - half, kRadAngle[g_rad_sel] + half,
+                       g_br_rad_sel, 4.0f);
+
+            // Enclosing rim, then the hub covering the inner edge of the ring.
             g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                                                RAD_RI - 4, RAD_RI - 4),
+                                                RAD_RIM, RAD_RIM),
+                                  g_br_rad_border, 1.2f);
+            g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
+                                                RAD_HUB, RAD_HUB), g_br_rad_hub);
+            g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
+                                                RAD_HUB, RAD_HUB),
                                   g_br_rad_border, 1.0f);
 
-            // Labels sit on the mid-line of each wedge.
             if (g_tf_body) {
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 float rmid = (RAD_RI + RAD_RO) / 2;
                 for (int i = 0; i < NRADIAL; i++) {
                     float lx = cx + cosf(kRadAngle[i]) * rmid;
                     float ly = cy + sinf(kRadAngle[i]) * rmid;
-                    D2D1_RECT_F lr = D2D1::RectF(lx - 52, ly - 12, lx + 52, ly + 12);
+                    D2D1_RECT_F lr = D2D1::RectF(lx - 46, ly - 11, lx + 46, ly + 11);
                     g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
                                        g_tf_body, lr,
-                                       i == g_rad_sel ? (ID2D1Brush*)g_br_rad_onacc
-                                                      : g_br_rad_text);
+                                       i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
+                                                      : g_br_rad_dim);
                 }
-                // Hub text: what this wheel is, and what is currently picked.
-                D2D1_RECT_F t1 = D2D1::RectF(cx - 56, cy - 22, cx + 56, cy - 2);
-                g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t1, g_br_rad_dim);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
+            // The hub names the current pick, as in the reference.
             if (g_tf_header) {
                 g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                D2D1_RECT_F t2 = D2D1::RectF(cx - 56, cy - 2, cx + 56, cy + 22);
+                g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                D2D1_RECT_F t = D2D1::RectF(cx - 62, cy - 22, cx + 62, cy + 24);
                 g_rt_rad->DrawText(kRadName[g_rad_sel],
                                    (UINT32)wcslen(kRadName[g_rad_sel]),
-                                   g_tf_header, t2, g_br_rad_text);
+                                   g_tf_header, t, g_br_rad_text);
+                g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                 g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
             HRESULT hr = g_rt_rad->EndDraw();
@@ -3616,10 +3713,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 lx_set_close_mode(false);
                 break;
             }
-            if (g_lx_sel == lx_settings_index()) {
+            if (g_lx_sel == lx_hdr_second()) {
                 lx_toggle();
                 ShellExecuteW(NULL, L"open", L"ms-settings:", NULL, NULL,
                               SW_SHOWNORMAL);
+                break;
+            }
+            if (g_lx_sel == lx_hdr_first()) {
+                lx_toggle();
+                show_desktop();
                 break;
             }
             if (g_lx_sel == lx_add_index()) {

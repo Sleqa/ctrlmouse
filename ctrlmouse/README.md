@@ -26,6 +26,7 @@ beside it and press a controller button. The D-pad media bindings are fixed.
 | D-pad *(launcher open)* | Move between apps |
 | Cross *(launcher open)* | Launch the highlighted app |
 | Circle *(launcher open)* | Close the launcher |
+| D-pad up *(launcher, top row)* | Reach the show-desktop and Settings icons |
 | D-pad up *(launcher, app running)* | Ask whether to close that app |
 | Cross *(close prompt)* | Close the app |
 | D-pad down / Circle *(close prompt)* | Back out |
