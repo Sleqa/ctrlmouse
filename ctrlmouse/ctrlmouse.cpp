@@ -2833,7 +2833,10 @@ static void lx_nav(int dir) {
 
 static HWND g_rad = NULL;
 static int  g_rad_sel = 0;
-static ID2D1HwndRenderTarget* g_rt_rad = NULL;
+static ID2D1DCRenderTarget* g_rt_rad = NULL;
+static HDC     g_rad_dc = NULL;      // memory DC holding the DIB below
+static HBITMAP g_rad_dib = NULL;
+static int     g_rad_w = 0, g_rad_h = 0;
 static ID2D1SolidColorBrush*  g_br_rad_face = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
@@ -2898,6 +2901,8 @@ static void stroke_arc(ID2D1RenderTarget* rt, float cx, float cy, float r,
 
 static void d2d_release_rad() {
     if (g_rad_round) { g_rad_round->Release(); g_rad_round = NULL; }
+    if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
+    if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
     ID2D1SolidColorBrush** bs[] = {&g_br_rad_face, &g_br_rad_sel, &g_br_rad_text,
                                    &g_br_rad_dim, &g_br_rad_border,
                                    &g_br_rad_onacc, &g_br_rad_hub};
@@ -2906,151 +2911,168 @@ static void d2d_release_rad() {
     if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
 }
 
-static bool d2d_create_rad(HWND hwnd) {
-    g_rt_rad = d2d_create_rt(hwnd, true);
-    if (!g_rt_rad) return false;
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(32, 32, 32)), &g_br_rad_hub);
+static bool d2d_create_rad() {
+    if (g_rt_rad) return true;
+    if (!g_d2d_factory) return false;
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        (float)g_dpi, (float)g_dpi);
+    if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &g_rt_rad))) {
+        g_rt_rad = NULL;
+        return false;
+    }
+    g_rt_rad->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(58, 58, 58)), &g_br_rad_face);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_rad_onacc);
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(32, 32, 32)), &g_br_rad_hub);
     g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
                                     &g_br_rad_border);
-    if (!g_rad_round && g_d2d_factory)
+    if (!g_rad_round)
         g_d2d_factory->CreateStrokeStyle(
             D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND),
             NULL, 0, &g_rad_round);
     return true;
 }
 
-static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_SIZE:
-        if (g_rt_rad) g_rt_rad->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
-        return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        BeginPaint(hwnd, &ps);
-        if (!g_rt_rad) d2d_create_rad(hwnd);
-        if (g_rt_rad) {
-            g_rt_rad->BeginDraw();
-            // Fills the whole disc, so there is no lighter square behind it.
-            g_rt_rad->Clear(d2d_clr(RGB(20, 20, 20)));
-            D2D1_SIZE_F sz = g_rt_rad->GetSize();
-            float cx = sz.width / 2, cy = sz.height / 2;
-            const float half = 3.14159265f / NRADIAL - RAD_GAP;
+// Draw the wheel into the DIB and hand it to UpdateLayeredWindow.
+//
+// This shapes the window with per-pixel alpha rather than a window region.
+// A region on a layered window drags DWM onto a slow composition path for the
+// whole desktop - it cost most of the frame rate on the machine, not just in
+// this app - and it also gives a hard aliased edge. Per-pixel alpha is both
+// faster and smoother. It is available here, unlike on the keyboard, because
+// this popup never animates a whole-window fade.
+static void rad_render() {
+    if (!g_rad || !d2d_create_rad()) return;
+    int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
+    if (!g_rad_dib || g_rad_w != w || g_rad_h != h) {
+        if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
+        if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;          // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HDC screen = GetDC(NULL);
+        g_rad_dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        g_rad_dc = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+        if (!g_rad_dib || !g_rad_dc) return;
+        SelectObject(g_rad_dc, g_rad_dib);
+        g_rad_w = w;
+        g_rad_h = h;
+    }
 
-            // Ring of wedges. Only the selected one lifts off the background,
-            // so the highlight carries the eye rather than the whole wheel.
-            for (int i = 0; i < NRADIAL; i++)
-                fill_wedge(g_rt_rad, cx, cy, RAD_RI, RAD_RO,
-                           kRadAngle[i] - half, kRadAngle[i] + half,
-                           i == g_rad_sel ? (ID2D1Brush*)g_br_rad_face
-                                          : g_br_rad_hub);
+    RECT bind = {0, 0, w, h};
+    if (FAILED(g_rt_rad->BindDC(g_rad_dc, &bind))) return;
+    g_rt_rad->BeginDraw();
+    g_rt_rad->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the disc
+    float cx = RAD_W / 2.0f, cy = RAD_H / 2.0f;
+    const float half = 3.14159265f / NRADIAL - RAD_GAP;
 
-            // Hairline spokes on the wedge boundaries.
-            for (int i = 0; i < NRADIAL; i++) {
-                float a = kRadAngle[i] + 3.14159265f / NRADIAL;
-                g_rt_rad->DrawLine(
-                    D2D1::Point2F(cx + cosf(a) * RAD_RI, cy + sinf(a) * RAD_RI),
-                    D2D1::Point2F(cx + cosf(a) * RAD_RO, cy + sinf(a) * RAD_RO),
-                    g_br_rad_border, 1.0f);
-            }
+    // Disc, then the ring of wedges over it.
+    g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_RIM, RAD_RIM),
+                          g_br_rad_hub);
+    for (int i = 0; i < NRADIAL; i++)
+        if (i == g_rad_sel)
+            fill_wedge(g_rt_rad, cx, cy, RAD_RI, RAD_RO,
+                       kRadAngle[i] - half, kRadAngle[i] + half, g_br_rad_face);
 
-            // Accent arc riding the outer edge of the selection.
-            stroke_arc(g_rt_rad, cx, cy, RAD_RO + 4.0f,
-                       kRadAngle[g_rad_sel] - half, kRadAngle[g_rad_sel] + half,
-                       g_br_rad_sel, 4.0f);
+    for (int i = 0; i < NRADIAL; i++) {
+        float a = kRadAngle[i] + 3.14159265f / NRADIAL;
+        g_rt_rad->DrawLine(
+            D2D1::Point2F(cx + cosf(a) * RAD_RI, cy + sinf(a) * RAD_RI),
+            D2D1::Point2F(cx + cosf(a) * RAD_RO, cy + sinf(a) * RAD_RO),
+            g_br_rad_border, 1.0f);
+    }
+    stroke_arc(g_rt_rad, cx, cy, RAD_RO + 4.0f,
+               kRadAngle[g_rad_sel] - half, kRadAngle[g_rad_sel] + half,
+               g_br_rad_sel, 4.0f);
+    g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_RIM - 1,
+                                        RAD_RIM - 1), g_br_rad_border, 1.2f);
+    g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_HUB, RAD_HUB),
+                          g_br_rad_hub);
+    g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_HUB, RAD_HUB),
+                          g_br_rad_border, 1.0f);
 
-            // Enclosing rim, then the hub covering the inner edge of the ring.
-            g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                                                RAD_RIM, RAD_RIM),
-                                  g_br_rad_border, 1.2f);
-            g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                                                RAD_HUB, RAD_HUB), g_br_rad_hub);
-            g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
-                                                RAD_HUB, RAD_HUB),
-                                  g_br_rad_border, 1.0f);
-
-            if (g_tf_body) {
-                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                float rmid = (RAD_RI + RAD_RO) / 2;
-                for (int i = 0; i < NRADIAL; i++) {
-                    float lx = cx + cosf(kRadAngle[i]) * rmid;
-                    float ly = cy + sinf(kRadAngle[i]) * rmid;
-                    D2D1_RECT_F lr = D2D1::RectF(lx - 46, ly - 11, lx + 46, ly + 11);
-                    g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
-                                       g_tf_body, lr,
-                                       i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
-                                                      : g_br_rad_dim);
-                }
-                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            }
-            // The hub names the current pick, as in the reference.
-            if (g_tf_header) {
-                g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-                D2D1_RECT_F t = D2D1::RectF(cx - 62, cy - 22, cx + 62, cy + 24);
-                g_rt_rad->DrawText(kRadName[g_rad_sel],
-                                   (UINT32)wcslen(kRadName[g_rad_sel]),
-                                   g_tf_header, t, g_br_rad_text);
-                g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-                g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            }
-            HRESULT hr = g_rt_rad->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) d2d_release_rad();
+    if (g_tf_body) {
+        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        float rmid = (RAD_RI + RAD_RO) / 2;
+        for (int i = 0; i < NRADIAL; i++) {
+            float lx = cx + cosf(kRadAngle[i]) * rmid;
+            float ly = cy + sinf(kRadAngle[i]) * rmid;
+            D2D1_RECT_F lr = D2D1::RectF(lx - 46, ly - 11, lx + 46, ly + 11);
+            g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
+                               g_tf_body, lr,
+                               i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
+                                              : g_br_rad_dim);
         }
-        EndPaint(hwnd, &ps);
-        return 0;
+        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    case WM_DESTROY:
-        d2d_release_rad();
-        return 0;
+    if (g_tf_header) {
+        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        D2D1_RECT_F t = D2D1::RectF(cx - 62, cy - 22, cx + 62, cy + 24);
+        g_rt_rad->DrawText(kRadName[g_rad_sel],
+                           (UINT32)wcslen(kRadName[g_rad_sel]),
+                           g_tf_header, t, g_br_rad_text);
+        g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
+    if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
+
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
+                 wa.top + (wa.bottom - wa.top - h) / 2};
+    SIZE  size = {w, h};
+    POINT src = {0, 0};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    HDC screen = GetDC(NULL);
+    UpdateLayeredWindow(g_rad, screen, &pos, &size, g_rad_dc, &src, 0, &bf,
+                        ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+}
+
+static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Content is pushed with UpdateLayeredWindow, so this window never paints
+    // itself; it only needs to release its resources on the way out.
+    if (msg == WM_DESTROY) { d2d_release_rad(); return 0; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static void rad_show(bool on) {
-    if (on) {
-        if (!g_rad) {
-            WNDCLASSW wc = {};
-            wc.lpfnWndProc = rad_proc;
-            wc.hInstance = GetModuleHandleW(NULL);
-            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-            wc.lpszClassName = L"ControllerMouseRadial";
-            RegisterClassW(&wc);
-            g_rad = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-                L"ControllerMouseRadial", L"", WS_POPUP, 0, 0,
-                dip_to_px(RAD_W), dip_to_px(RAD_H), g_hwnd, NULL,
-                GetModuleHandleW(NULL), NULL);
-            if (g_rad) {
-                SetLayeredWindowAttributes(g_rad, 0, 245, LWA_ALPHA);
-                // Clip the window to a circle. The popup is layered with a
-                // single constant alpha and so has no per-pixel alpha to
-                // shape it with; a region is the only way to stop the square
-                // card showing behind the wheel.
-                int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
-                SetWindowRgn(g_rad, CreateEllipticRgn(0, 0, w + 1, h + 1), TRUE);
-            }
-        }
-        if (!g_rad) return;
-        RECT wa;
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-        int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
-        SetWindowPos(g_rad, HWND_TOPMOST,
-                     wa.left + (wa.right - wa.left - w) / 2,
-                     wa.top + (wa.bottom - wa.top - h) / 2, w, h,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        g_rad_visible = true;
-        InvalidateRect(g_rad, NULL, FALSE);
-    } else if (g_rad) {
-        ShowWindow(g_rad, SW_HIDE);
+    if (!on) {
+        if (g_rad) ShowWindow(g_rad, SW_HIDE);
         g_rad_visible = false;
+        return;
     }
+    if (!g_rad) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = rad_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"ControllerMouseRadial";
+        RegisterClassW(&wc);
+        g_rad = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            L"ControllerMouseRadial", L"", WS_POPUP, 0, 0,
+            dip_to_px(RAD_W), dip_to_px(RAD_H), g_hwnd, NULL,
+            GetModuleHandleW(NULL), NULL);
+    }
+    if (!g_rad) return;
+    rad_render();                     // positions and sizes the window too
+    ShowWindow(g_rad, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_rad, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    g_rad_visible = true;
 }
 
 // --- System tray -----------------------------------------------------------
@@ -3695,7 +3717,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case GP_RAD_SEL:
             if (g_rad_sel != (int)lp) {
                 g_rad_sel = (int)lp;
-                if (g_rad) InvalidateRect(g_rad, NULL, FALSE);
+                if (g_rad_visible) rad_render();
             }
             break;
         case GP_RAD_PICK:
