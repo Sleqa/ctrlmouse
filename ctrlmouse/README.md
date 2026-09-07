@@ -18,7 +18,7 @@ beside it and press a controller button. The D-pad media bindings are fixed.
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
 | Square / X | Play / pause — **hold** for fullscreen, or for the radial picker |
-| R1 / R2 | Forward / back, as the mouse side buttons |
+| R1 / L1 | Forward / back, as the mouse side buttons |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
@@ -109,7 +109,7 @@ line). Settings written by older builds are moved there on first run.
 | `scroll_sensitivity` | Scroll speed at full deflection | `1.0` |
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
-| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` | Controller button index per action; rebindable from the settings window | `1, 2, 3, 0, 0, 9, 13, 5, 7` |
+| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` | Controller button index per action; rebindable from the settings window | `1, 2, 3, 0, 0, 9, 13, 5, 4` |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial picker | `0` |

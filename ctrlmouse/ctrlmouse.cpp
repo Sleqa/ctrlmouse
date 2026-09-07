@@ -25,6 +25,7 @@
 #include <dwrite.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <devpropdef.h>
 #include <wincodec.h>
 #include <commoncontrols.h>
 #include <shlobj.h>
@@ -83,9 +84,9 @@ struct Config {
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
 // Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad,
-// R1 (forward), R2 (back).
+// R1 (forward), L1 (back).
 static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
-                                {1, 2, 3, 0, 0, 9, 13, 5, 7}};
+                                {1, 2, 3, 0, 0, 9, 13, 5, 4}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -747,6 +748,7 @@ static unsigned g_hid_gen = 0;
 // Battery, as reported by the pad itself. -1 until a report carries it.
 static volatile int  g_pad_batt = -1;
 static volatile bool g_pad_charging = false;
+static volatile bool g_batt_from_report = false;  // report beats the property
 // False until a genuine report has been parsed on the current handle. Until
 // then hid_poll can only hand back the zeroed placeholder from the open, which
 // must not be mistaken for "every button released".
@@ -835,6 +837,41 @@ static void set_pad_name(const wchar_t* raw) {
     if (name) wcscpy(g_pad_name, name);
     else if (raw && *raw) { wcsncpy(g_pad_name, raw, 47); g_pad_name[47] = 0; }
     else wcscpy(g_pad_name, L"Third Party");
+}
+
+// Battery, the other way round.
+//
+// Only the long USB and Bluetooth-extended reports carry a battery byte. A
+// DualSense paired over Bluetooth sends the short report until something puts
+// it into extended mode - and doing that ourselves is exactly what leaves the
+// pad unreadable to every other app, which is the bug this project already
+// spent a long time chasing. So instead we ask Windows, which surfaces the
+// figure it shows in Settings as a device property on the Bluetooth node
+// above our HID device.
+static const DEVPROPKEY kPkeyBattery = {
+    {0x104ea319, 0x6ee2, 0x4701, {0xbd, 0x47, 0x8d, 0xdb, 0xf4, 0x25, 0xbb, 0xe5}},
+    2};
+
+static int battery_from_devnode() {
+    if (!g_pad_inst_count) return -1;
+    DEVINST inst;
+    if (CM_Locate_DevNodeW(&inst, (DEVINSTID_W)g_pad_inst[0].c_str(),
+                           CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+        return -1;
+    // The property sits on the Bluetooth device, a few nodes above the HID
+    // interface we opened, so walk up until it turns up.
+    for (int depth = 0; depth < 6; depth++) {
+        DEVPROPTYPE type = 0;
+        BYTE val = 0;
+        ULONG size = sizeof(val);
+        if (CM_Get_DevNode_PropertyW(inst, &kPkeyBattery, &type, &val, &size, 0)
+                == CR_SUCCESS && type == DEVPROP_TYPE_BYTE && val <= 100)
+            return val;
+        DEVINST parent;
+        if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS) break;
+        inst = parent;
+    }
+    return -1;
 }
 
 static bool path_is_dualsense(const wchar_t* path) {
@@ -961,6 +998,7 @@ static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
         if (pct > 100) pct = 100;
         g_pad_batt = pct;
         g_pad_charging = (charge == 0x1 || charge == 0x2);
+        g_batt_from_report = true;
     }
     st.lx = hid_axis(buf[off + 0]);
     st.ly = hid_axis(buf[off + 1]);
@@ -1126,6 +1164,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
     bool radial_up = false;                // radial picker is on screen
+    ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Media controls (D-pad + Square) while the on-screen keyboard is closed.
     int       media_dir = -1;              // D-pad direction being held
@@ -1285,6 +1324,14 @@ static DWORD WINAPI worker_thread(LPVOID) {
             }
         }
         btn_mask_prev = mask;
+
+        // Battery: only worth asking Windows when the pad itself is not
+        // telling us, and it moves slowly enough that once a minute is plenty.
+        if (!g_batt_from_report && bnow - batt_last >= 60000) {
+            batt_last = bnow;
+            int b = battery_from_devnode();
+            if (b >= 0) { g_pad_batt = b; g_pad_charging = false; }
+        }
 
         // Game check: at most two cheap API calls every 2 seconds.
         if (cfg.game_pause) {
