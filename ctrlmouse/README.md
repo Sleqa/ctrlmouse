@@ -44,13 +44,11 @@ the way video players expect — so it applies to the focused window.
 
 - **On-screen keyboard** — dark themed, animated, driven entirely by the
   controller. It never steals focus, so keys go to the app you're working in.
-- **Search on hold** — holding the keyboard button opens a search. With
-  PowerToys installed it summons **PowerToys Command Palette** (or PowerToys
-  Run) and the keyboard types into it, so you get the real launcher with its
-  own ranking, history and extensions; the shoulder buttons walk its results.
-  Without PowerToys it falls back to a built-in search covering installed
-  apps, open windows, a calculator, `>` to run a command, and a web search.
-  Which one is used is a setting.
+- **Search on hold** — holding the keyboard button opens a search. Set it to
+  *Third party* and it presses a hotkey you choose, summoning a launcher you
+  already use (PowerToys Command Palette, PowerToys Run, or anything else with
+  a hotkey); the keyboard types into it and the shoulder buttons walk its
+  results. Set it to *Built-in* for a simple list of your installed apps.
 - **Game auto-pause** — detects fullscreen games (exclusive and borderless)
   and pauses the mapping so your sticks don't fight the game. Checked at most
   every 2 seconds with a couple of API calls; effectively zero cost. Can be
@@ -116,7 +114,8 @@ line). Settings written by older builds are moved there on first run.
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial picker | `0` |
-| `search_mode` | Search opened on hold: 0 = built-in, 1 = PowerToys Command Palette, 2 = PowerToys Run | `1` if PowerToys is installed |
+| `search_mode` | Search opened on hold: 0 = built-in list, 1 = press a hotkey for your own launcher | `1` if PowerToys is installed |
+| `search_mods` / `search_vk` | The hotkey sent in third-party mode; set it from the settings window | `Alt+Space` |
 
 ## License
 

@@ -79,14 +79,17 @@ struct Config {
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
     int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial pick
     double mouse_curve;         // 1 = linear; higher = finer near centre
-    int    search_mode;         // 0 built-in, 1 Command Palette, 2 PowerToys Run
+    int    search_mode;         // 0 built-in, 1 third-party launcher
+    unsigned search_mods;       // MOD_* bits for the third-party hotkey
+    unsigned search_vk;         // and its key
     int    bind[F_COUNT];       // controller button per action
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
 // Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad,
 // R1 (forward), L1 (back).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0, 0,
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
+                                0, MOD_ALT, VK_SPACE,
                                 {1, 2, 3, 0, 0, 9, 13, 5, 4}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
@@ -212,11 +215,13 @@ static void save_config(const Config& c) {
             "  \"game_pause\": %s,\n"
             "  \"fullscreen_key\": %d,\n"
             "  \"mouse_curve\": %.2f,\n"
-            "  \"search_mode\": %d",
+            "  \"search_mode\": %d,\n"
+            "  \"search_mods\": %u,\n"
+            "  \"search_vk\": %u",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false",
             c.game_pause ? "true" : "false", c.fullscreen_key,
-            c.mouse_curve, c.search_mode);
+            c.mouse_curve, c.search_mode, c.search_mods, c.search_vk);
     // Flat keys rather than a nested object: the reader looks each name up
     // directly, so nesting would buy nothing and cost a real parser.
     for (int i = 0; i < F_COUNT; i++)
@@ -293,10 +298,13 @@ static Config load_config() {
     if (c.mouse_curve < 1.0) c.mouse_curve = 1.0;
     if (c.mouse_curve > 3.0) c.mouse_curve = 3.0;
     double sm;
-    if (parse_double(s, "search_mode", sm) && sm >= 0 && sm <= 2)
+    if (parse_double(s, "search_mode", sm) && sm >= 0 && sm <= 1)
         c.search_mode = (int)sm;
     else if (powertoys_installed())
-        c.search_mode = 1;   // prefer the real thing where it exists
+        c.search_mode = 1;   // a launcher is already there, so use it
+    double v;
+    if (parse_double(s, "search_mods", v)) c.search_mods = (unsigned)v;
+    if (parse_double(s, "search_vk", v) && v > 0) c.search_vk = (unsigned)v;
     return c;
 }
 
@@ -376,22 +384,53 @@ static void mouse_xbutton(int which) {
 // history and extensions rather than an imitation of it. It relies on the
 // hotkey being the default; if it has been changed, the built-in search is
 // still there in the settings.
-static void open_powertoys_search(int mode) {
-    INPUT in[6] = {};
+static void send_hotkey(unsigned mods, unsigned vk) {
+    if (!vk) return;
+    WORD mk[4];
+    int mc = 0;
+    if (mods & MOD_CONTROL) mk[mc++] = VK_CONTROL;
+    if (mods & MOD_ALT)     mk[mc++] = VK_MENU;
+    if (mods & MOD_SHIFT)   mk[mc++] = VK_SHIFT;
+    if (mods & MOD_WIN)     mk[mc++] = VK_LWIN;
+    INPUT in[10] = {};
     int n = 0;
-    bool win = (mode == 1);
-    if (win) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN; n++; }
-    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_MENU; n++;
-    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SPACE; n++;
-    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SPACE;
+    for (int i = 0; i < mc; i++) {
+        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mk[i]; n++;
+    }
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = (WORD)vk; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = (WORD)vk;
     in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
-    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_MENU;
-    in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
-    if (win) {
-        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN;
+    for (int i = mc - 1; i >= 0; i--) {
+        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mk[i];
         in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
     }
     SendInput(n, in, sizeof(INPUT));
+}
+
+// Render a hotkey the way a person would write it.
+static void hotkey_name(unsigned mods, unsigned vk, wchar_t* out, size_t n) {
+    std::wstring t;
+    if (mods & MOD_CONTROL) t += L"Ctrl+";
+    if (mods & MOD_ALT)     t += L"Alt+";
+    if (mods & MOD_SHIFT)   t += L"Shift+";
+    if (mods & MOD_WIN)     t += L"Win+";
+    wchar_t key[32] = L"";
+    switch (vk) {
+    case VK_SPACE:  wcscpy(key, L"Space"); break;
+    case VK_RETURN: wcscpy(key, L"Enter"); break;
+    case VK_TAB:    wcscpy(key, L"Tab"); break;
+    case VK_ESCAPE: wcscpy(key, L"Esc"); break;
+    default:
+        if (vk >= VK_F1 && vk <= VK_F24) swprintf(key, 32, L"F%u", vk - VK_F1 + 1);
+        else {
+            UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0x7FFF;
+            if (ch > 32) swprintf(key, 32, L"%c", (wchar_t)ch);
+            else         swprintf(key, 32, L"0x%02X", vk);
+        }
+    }
+    t += key;
+    wcsncpy(out, t.c_str(), n - 1);
+    out[n - 1] = 0;
 }
 
 static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
@@ -1473,8 +1512,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
                 bnow - hold_t0[F_KEYBOARD] >= 500) {
                 PostMessageW(g_hwnd, WM_GAMEPAD,
-                             cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH,
-                             cfg.search_mode);
+                             cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH, 0);
                 hold_fired[F_KEYBOARD] = true;
             }
             if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
@@ -1750,17 +1788,7 @@ static bool     g_index_built = false;
 
 static bool     g_kb_search = false;      // keyboard is in search mode
 static wchar_t  g_kb_query[64] = L"";
-// Results are heterogeneous, in the spirit of a command palette: an app, an
-// already-open window, a calculation, a command to run, a web search.
-enum { SR_APP, SR_WINDOW, SR_CALC, SR_RUN, SR_WEB };
-struct SearchResult {
-    int          kind;
-    std::wstring title;   // the row text
-    std::wstring hint;    // small right-aligned kind label
-    std::wstring data;    // path, command, or computed value
-    HWND         hwnd;    // for SR_WINDOW
-};
-static SearchResult g_kb_res[KB_RES_MAX];
+static int      g_kb_res[KB_RES_MAX];     // indices into g_index
 static int      g_kb_res_count = 0;
 static int      g_kb_res_sel = 0;
 static bool     g_kb_in_res = false;      // focus is in the results, not the keys
@@ -1817,229 +1845,34 @@ static std::wstring lower_of(const std::wstring& s) {
 // running should switch to it rather than start a second copy.
 static bool activate_running(const std::wstring& path);
 
-// --- Calculator -------------------------------------------------------------
-// A small recursive-descent evaluator, so typing "1920/2.35" answers without
-// leaving the keyboard. Arithmetic only, deliberately.
-struct Calc { const wchar_t* p; bool ok; };
-
-static double calc_expr(Calc& c);
-
-static void calc_skip(Calc& c) { while (*c.p == L' ') c.p++; }
-
-static double calc_atom(Calc& c) {
-    calc_skip(c);
-    if (*c.p == L'(') {
-        c.p++;
-        double v = calc_expr(c);
-        calc_skip(c);
-        if (*c.p == L')') c.p++; else c.ok = false;
-        return v;
-    }
-    if (*c.p == L'-') { c.p++; return -calc_atom(c); }
-    if (*c.p == L'+') { c.p++; return calc_atom(c); }
-    wchar_t* end = NULL;
-    double v = wcstod(c.p, &end);
-    if (!end || end == c.p) { c.ok = false; return 0.0; }
-    c.p = end;
-    return v;
-}
-
-static double calc_term(Calc& c) {
-    double v = calc_atom(c);
-    for (;;) {
-        calc_skip(c);
-        wchar_t op = *c.p;
-        if (op != L'*' && op != L'/' && op != L'x' && op != L'%') return v;
-        c.p++;
-        double r = calc_atom(c);
-        if (op == L'/') { if (r == 0.0) { c.ok = false; return 0.0; } v /= r; }
-        else if (op == L'%') { if (r == 0.0) { c.ok = false; return 0.0; }
-                               v = fmod(v, r); }
-        else v *= r;
-    }
-}
-
-static double calc_expr(Calc& c) {
-    double v = calc_term(c);
-    for (;;) {
-        calc_skip(c);
-        wchar_t op = *c.p;
-        if (op != L'+' && op != L'-') return v;
-        c.p++;
-        double r = calc_term(c);
-        v = (op == L'+') ? v + r : v - r;
-    }
-}
-
-// Only treat the query as a sum when it actually looks like one, so ordinary
-// words cannot produce a spurious result row.
-static bool calc_eval(const wchar_t* q, double& out) {
-    bool digit = false, op = false;
-    for (const wchar_t* t = q; *t; t++) {
-        if (iswdigit(*t)) digit = true;
-        else if (wcschr(L"+-*/x%(", *t)) op = true;
-        else if (*t != L' ' && *t != L'.' && *t != L')') return false;
-    }
-    if (!digit || !op) return false;
-    Calc c = {q, true};
-    double v = calc_expr(c);
-    calc_skip(c);
-    if (!c.ok || *c.p) return false;
-    out = v;
-    return true;
-}
-
-// --- Open windows -----------------------------------------------------------
-struct WinHit { HWND h; std::wstring title; };
-static WinHit g_winhits[64];
-static int    g_winhit_count = 0;
-
-static BOOL CALLBACK collect_window_cb(HWND h, LPARAM) {
-    if (g_winhit_count >= 64) return FALSE;
-    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
-    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
-    int len = GetWindowTextLengthW(h);
-    if (len <= 0 || len > 200) return TRUE;
-    wchar_t buf[256];
-    if (!GetWindowTextW(h, buf, 256)) return TRUE;
-    g_winhits[g_winhit_count].h = h;
-    g_winhits[g_winhit_count].title = buf;
-    g_winhit_count++;
-    return TRUE;
-}
-
-static void add_result(int kind, const std::wstring& title,
-                       const std::wstring& hint, const std::wstring& data,
-                       HWND h) {
-    if (g_kb_res_count >= KB_RES_MAX) return;
-    SearchResult& r = g_kb_res[g_kb_res_count++];
-    r.kind = kind;
-    r.title = title;
-    r.hint = hint;
-    r.data = data;
-    r.hwnd = h;
-}
-
+// Prefix matches first, then anything containing the query - the same ordering
+// intuition as Start, without pretending to be a real ranker.
 static void kb_search_update() {
     g_kb_res_count = 0;
     g_kb_res_sel = 0;
     if (!g_kb_query[0]) return;
-    std::wstring q = lower_of(g_kb_query);
-
-    // A leading ">" runs a command, the way a command palette does.
-    if (g_kb_query[0] == L'>') {
-        std::wstring cmd = g_kb_query + 1;
-        if (!cmd.empty()) add_result(SR_RUN, cmd, L"run", cmd, NULL);
-        return;
-    }
-
-    // A calculation answers first, since it is unambiguous.
-    double val;
-    if (calc_eval(g_kb_query, val)) {
-        wchar_t buf[64];
-        if (val == (double)(long long)val)
-            swprintf(buf, 64, L"%lld", (long long)val);
-        else
-            swprintf(buf, 64, L"%.10g", val);
-        add_result(SR_CALC, buf, L"copy", buf, NULL);
-    }
-
-    // Installed applications, prefix matches ahead of substring ones. One slot
-    // is always held back for the web fallback.
     build_index();
-    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX - 1; pass++) {
-        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX - 1; i++) {
+    std::wstring q = lower_of(g_kb_query);
+    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX; pass++) {
+        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX; i++) {
             std::wstring n = lower_of(g_index[i].name);
             size_t at = n.find(q);
             if (at == std::wstring::npos) continue;
             if ((pass == 0) != (at == 0)) continue;
             bool dup = false;
             for (int j = 0; j < g_kb_res_count; j++)
-                if (g_kb_res[j].kind == SR_APP &&
-                    g_kb_res[j].data == g_index[i].path) dup = true;
-            if (!dup)
-                add_result(SR_APP, g_index[i].name, L"app", g_index[i].path, NULL);
+                if (g_kb_res[j] == i) dup = true;
+            if (!dup) g_kb_res[g_kb_res_count++] = i;
         }
     }
-
-    // Windows that are already open, so search doubles as a switcher.
-    g_winhit_count = 0;
-    EnumWindows(collect_window_cb, 0);
-    for (int i = 0; i < g_winhit_count && g_kb_res_count < KB_RES_MAX - 1; i++) {
-        if (lower_of(g_winhits[i].title).find(q) == std::wstring::npos) continue;
-        add_result(SR_WINDOW, g_winhits[i].title, L"window", L"", g_winhits[i].h);
-    }
-
-    // Web search sits at the bottom as the always-available fallback.
-    add_result(SR_WEB, g_kb_query, L"web", g_kb_query, NULL);
-}
-
-static void copy_to_clipboard(const std::wstring& text) {
-    if (!OpenClipboard(g_hwnd)) return;
-    EmptyClipboard();
-    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (mem) {
-        void* dst = GlobalLock(mem);
-        if (dst) {
-            memcpy(dst, text.c_str(), bytes);
-            GlobalUnlock(mem);
-            SetClipboardData(CF_UNICODETEXT, mem);
-        }
-    }
-    CloseClipboard();
-}
-
-static std::wstring url_escape(const std::wstring& in) {
-    std::wstring o;
-    for (size_t i = 0; i < in.size(); i++) {
-        wchar_t c = in[i];
-        if (iswalnum(c) || c == L'-' || c == L'_' || c == L'.' || c == L'~') o += c;
-        else if (c == L' ') o += L'+';
-        else {
-            wchar_t b[8];
-            swprintf(b, 8, L"%%%02X", (unsigned)(c & 0xFF));
-            o += b;
-        }
-    }
-    return o;
 }
 
 static void kb_search_launch() {
     if (g_kb_res_sel < 0 || g_kb_res_sel >= g_kb_res_count) return;
-    SearchResult r = g_kb_res[g_kb_res_sel];   // copied: the popup closes below
-    // A calculation leaves the keyboard up, since another sum usually follows.
-    if (r.kind != SR_CALC)
-        PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
-    switch (r.kind) {
-    case SR_APP:
-        if (!activate_running(r.data))
-            ShellExecuteW(NULL, L"open", r.data.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        break;
-    case SR_WINDOW:
-        if (r.hwnd) {
-            if (IsIconic(r.hwnd)) ShowWindow(r.hwnd, SW_RESTORE);
-            if (!SetForegroundWindow(r.hwnd)) {
-                typedef void(WINAPI * SwitchFn)(HWND, BOOL);
-                HMODULE u = GetModuleHandleW(L"user32.dll");
-                SwitchFn f = u ? (SwitchFn)GetProcAddress(u, "SwitchToThisWindow")
-                               : NULL;
-                if (f) f(r.hwnd, TRUE);
-            }
-        }
-        break;
-    case SR_CALC:
-        copy_to_clipboard(r.data);
-        break;
-    case SR_RUN:
-        ShellExecuteW(NULL, L"open", r.data.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        break;
-    case SR_WEB: {
-        std::wstring url = L"https://www.google.com/search?q=" + url_escape(r.data);
-        ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        break;
-    }
-    }
+    std::wstring path = g_index[g_kb_res[g_kb_res_sel]].path;
+    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);   // dismiss, then run
+    if (!activate_running(path))
+        ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
 
 // The only GDI object left: the window-class background brush, which just
@@ -2446,22 +2279,13 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (rsel)
                         draw_control(g_rt_kb, rr, KB_RADIUS, g_br_kb_sel, NULL);
                     if (g_tf_body) {
-                        const SearchResult& res = g_kb_res[r];
-                        ID2D1Brush* rb = rsel ? (ID2D1Brush*)g_br_kb_onacc
-                                              : g_br_kb_text;
+                        const std::wstring& nm = g_index[g_kb_res[r]].name;
                         D2D1_RECT_F tr = D2D1::RectF(rr.left + 14, rr.top,
-                                                     rr.right - 76, rr.bottom);
-                        g_rt_kb->DrawText(res.title.c_str(),
-                                          (UINT32)res.title.size(),
-                                          g_tf_body, tr, rb);
-                        // What acting on this row will do, right-aligned.
-                        D2D1_RECT_F hr2 = D2D1::RectF(rr.right - 72, rr.top,
-                                                      rr.right - 12, rr.bottom);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        g_rt_kb->DrawText(res.hint.c_str(),
-                                          (UINT32)res.hint.size(), g_tf_body,
-                                          hr2, rsel ? rb : (ID2D1Brush*)g_br_kb_dim);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                                                     rr.right - 14, rr.bottom);
+                        g_rt_kb->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                          g_tf_body, tr,
+                                          rsel ? (ID2D1Brush*)g_br_kb_onacc
+                                               : g_br_kb_text);
                     }
                 }
                 if (!g_kb_res_count && g_tf_body) {
@@ -3549,77 +3373,117 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // child control any more - every label, slider, toggle and button is drawn by
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
-#define WIN_W 384
-#define WIN_H 884
+// Settings window layout, in DIPs.
+//
+// Wider than it needs to be for the controls alone, because every setting
+// carries a line of plain English underneath saying what it does - the list of
+// names on its own was not enough to work out what anything did. The controls
+// list is collapsible, since it is much the longest section and is only needed
+// while rebinding.
+#define WIN_W 600
+#define PAD   24                  // left and right margin
+#define CONTENT (WIN_W - PAD * 2)
 
-static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
-static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
-static const RECT kHidBtnRect = {284, 42, 284 + 80, 42 + 24};
+static const RECT kStatusRect = {PAD, 16, PAD + 420, 16 + 26};
+static const RECT kHideRect   = {PAD, 48, PAD + 380, 48 + 20};
+static const RECT kHidBtnRect = {WIN_W - PAD - 92, 44, WIN_W - PAD, 44 + 26};
 
-static const RECT kLabelRect[NTRACKS] = {
-    {20, 82, 20 + 200, 82 + 18},
-    {20, 144, 20 + 200, 144 + 18},
-    {20, 206, 20 + 200, 206 + 18},
-    {20, 268, 20 + 200, 268 + 18},
-};
-static const RECT kValRect[NTRACKS] = {
-    {284, 82, 284 + 80, 82 + 18},
-    {284, 144, 284 + 80, 144 + 18},
-    {284, 206, 284 + 80, 206 + 18},
-    {284, 268, 284 + 80, 268 + 18},
-};
-static const RECT kTrackRect[NTRACKS] = {
-    {20, 104, 20 + 344, 104 + 28},
-    {20, 166, 20 + 344, 166 + 28},
-    {20, 228, 20 + 344, 228 + 28},
-    {20, 290, 20 + 344, 290 + 28},
-};
+// --- Pointer section --------------------------------------------------------
+#define SEC1_Y   88               // "POINTER" heading
+#define SLIDE_Y0 116              // first slider row
+#define SLIDE_STEP 52
+static const wchar_t* kTrackLabel[NTRACKS] = {
+    L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
+static const wchar_t* kTrackDesc[NTRACKS] = {
+    L"How far the cursor travels when the stick is pushed all the way.",
+    L"How fast the right stick scrolls. Pushing up scrolls down.",
+    L"Stick movement near the centre that is ignored, so a resting stick sits still.",
+    L"Higher means small stick movements stay slow, so you can aim precisely "
+    L"without lowering the speed above."};
+
+static RECT slide_label(int i) {
+    RECT r = {PAD, SLIDE_Y0 + i * SLIDE_STEP, PAD + 150,
+              SLIDE_Y0 + i * SLIDE_STEP + 18};
+    return r;
+}
+static RECT slide_value(int i) {
+    RECT r = {WIN_W - PAD - 64, SLIDE_Y0 + i * SLIDE_STEP, WIN_W - PAD,
+              SLIDE_Y0 + i * SLIDE_STEP + 18};
+    return r;
+}
+static RECT slide_track(int i) {
+    RECT r = {PAD + 162, SLIDE_Y0 + i * SLIDE_STEP - 4, WIN_W - PAD - 76,
+              SLIDE_Y0 + i * SLIDE_STEP + 24};
+    return r;
+}
+static RECT slide_desc(int i) {
+    RECT r = {PAD, SLIDE_Y0 + i * SLIDE_STEP + 20, PAD + CONTENT,
+              SLIDE_Y0 + i * SLIDE_STEP + 38};
+    return r;
+}
+
+// --- Behaviour section ------------------------------------------------------
+#define SEC2_Y  (SLIDE_Y0 + NTRACKS * SLIDE_STEP + 8)
+#define TOG_Y0  (SEC2_Y + 28)
+#define TOG_STEP 48
 #define NTOGGLES 3
-static const RECT kToggleRect[NTOGGLES] = {
-    {20, 332, 20 + 46, 332 + 22},
-    {196, 332, 196 + 46, 332 + 22},
-    {20, 364, 20 + 46, 364 + 22},
-};
-static const RECT kToggleLabel[NTOGGLES] = {
-    {74, 334, 74 + 110, 334 + 18},
-    {250, 334, 250 + 114, 334 + 18},
-    {74, 366, 74 + 260, 366 + 18},
-};
+static const wchar_t* kToggleText[NTOGGLES] = {
+    L"Mapping enabled", L"Pause while a game is running",
+    L"Start with Windows"};
+static const wchar_t* kToggleDesc[NTOGGLES] = {
+    L"Turn the controller-to-mouse mapping on or off.",
+    L"Stops the sticks fighting a fullscreen game. The toggle button overrides "
+    L"it while a game is open.",
+    L"Launches minimised to the notification area when you sign in."};
 
-// Hold-Square-for-fullscreen: which shortcut to send. Segmented picker, since
-// the right answer depends entirely on the app being used.
-static const RECT kFsLabelRect = {20, 408, 20 + 80, 408 + 18};
+static RECT toggle_rect(int i) {
+    RECT r = {PAD, TOG_Y0 + i * TOG_STEP, PAD + 46, TOG_Y0 + i * TOG_STEP + 22};
+    return r;
+}
+static RECT toggle_label(int i) {
+    RECT r = {PAD + 58, TOG_Y0 + i * TOG_STEP + 2, PAD + 400,
+              TOG_Y0 + i * TOG_STEP + 20};
+    return r;
+}
+static RECT toggle_desc(int i) {
+    RECT r = {PAD + 58, TOG_Y0 + i * TOG_STEP + 22, PAD + CONTENT,
+              TOG_Y0 + i * TOG_STEP + 40};
+    return r;
+}
+
+// Search: built-in list, or hand off to a launcher you already use.
+#define SEARCH_Y (TOG_Y0 + NTOGGLES * TOG_STEP + 4)
+#define NSEARCH 2
+static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
+static RECT search_seg(int i) {
+    RECT r = {PAD + 162 + i * 96, SEARCH_Y, PAD + 162 + i * 96 + 90,
+              SEARCH_Y + 26};
+    return r;
+}
+static RECT search_key_rect() {
+    RECT r = {PAD + 162 + NSEARCH * 96 + 12, SEARCH_Y,
+              PAD + 162 + NSEARCH * 96 + 12 + 120, SEARCH_Y + 26};
+    return r;
+}
+
+// Fullscreen shortcut, since the right one depends on the app.
+#define FS_Y (SEARCH_Y + 48)
 #define NFSKEYS 4
-static const RECT kFsSeg[NFSKEYS] = {
-    {106, 404, 106 + 60, 404 + 26},
-    {172, 404, 172 + 60, 404 + 26},
-    {238, 404, 238 + 60, 404 + 26},
-    {304, 404, 304 + 60, 404 + 26},
-};
-static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Ent", L"F", L"Radial"};
+static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F", L"Radial"};
+static RECT fs_seg(int i) {
+    RECT r = {PAD + 162 + i * 78, FS_Y, PAD + 162 + i * 78 + 72, FS_Y + 26};
+    return r;
+}
 
-// Which search the keyboard-hold opens.
-static const RECT kSearchLabelRect = {20, 444, 20 + 80, 444 + 18};
-#define NSEARCH 3
-static const RECT kSearchSeg[NSEARCH] = {
-    {106, 440, 106 + 82, 440 + 26},
-    {194, 440, 194 + 82, 440 + 26},
-    {282, 440, 282 + 82, 440 + 26},
-};
-static const wchar_t* kSearchName[NSEARCH] = {
-    L"Built-in", L"Cmd Palette", L"PT Run"};
-
-// Feature list. Each row is an icon for what the action does, its name, and a
-// button showing the control bound to it - click to rebind. The two D-pad
-// rows are shown for reference and are not rebindable.
-static const RECT kLegendHdr = {20, 484, 20 + 344, 484 + 18};
+// --- Controls section -------------------------------------------------------
+// Collapsible: eleven rows is most of the window, and it is only wanted while
+// rebinding something.
+#define SEC3_Y   (FS_Y + 48)
+#define ROW_Y0   (SEC3_Y + 30)
+#define ROW_STEP 34
 #define NROWS 11
-#define ROW_Y0   510
-#define ROW_STEP 30
-// icon kind
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
        IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
-// feature index, or -1 for a fixed row
 static const int kRowFeature[NROWS] = {
     F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
     F_LAUNCHER, F_BACK, F_FORWARD, F_TOGGLE, -1, -1};
@@ -3628,38 +3492,63 @@ static const int kRowIcon[NROWS] = {
     IC_LAUNCHER, IC_BACK, IC_FORWARD, IC_POWER, IC_VOLUME, IC_SCRUB};
 static const wchar_t* kRowName[NROWS] = {
     L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
-    L"Fullscreen (hold)", L"App launcher (hold)", L"Back", L"Forward",
-    L"Toggle CtrlMouse", L"Volume up / down", L"Seek / scrub"};
-// Fixed rows draw a D-pad glyph in place of a bind button: 0 = none,
-// 1 = vertical axis, 2 = horizontal axis.
+    L"Fullscreen", L"App launcher", L"Back", L"Forward",
+    L"Turn mapping on / off", L"Volume", L"Seek"};
+static const wchar_t* kRowDesc[NROWS] = {
+    L"Hold to drag.",
+    L"Opens context menus.",
+    L"Tap to type on screen. Hold to search instead.",
+    L"Sent to whatever is playing, even in the background.",
+    L"Hold. Sends the shortcut chosen above.",
+    L"Hold. A grid of apps you pick, with a search and Windows Settings.",
+    L"Goes back, like the side button on a mouse.",
+    L"Goes forward.",
+    L"Works even while the mapping is off, so you can switch it back on.",
+    L"D-pad up and down. Hold to keep changing.",
+    L"D-pad left and right. Hold to scrub through video.",
+};
 static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2};
+
+static bool g_controls_open = false;
 
 static RECT row_btn_rect(int i) {
     int y = ROW_Y0 + i * ROW_STEP;
-    RECT r = {248, y, 248 + 116, y + 26};
+    RECT r = {WIN_W - PAD - 120, y, WIN_W - PAD, y + 26};
+    return r;
+}
+static RECT sec3_header() {
+    RECT r = {PAD, SEC3_Y, PAD + CONTENT, SEC3_Y + 20};
     return r;
 }
 
-static const RECT kFooterRect = {20, 854, 20 + 344, 854 + 18};
-static const wchar_t* kFooterText =
-    L"Close sends to tray; right-click the tray icon to quit.";
-
-static const wchar_t* kTrackLabel[NTRACKS] = {
-    L"Mouse sensitivity", L"Scroll sensitivity", L"Deadzone",
-    L"Response curve"};
-static const wchar_t* kToggleText[NTOGGLES] = {
-    L"Enabled", L"Pause in games", L"Start with Windows (minimised)"};
-
-// HidHide state, kept to one short line. Detail only appears when something
-// needs doing about it.
-static const wchar_t* hide_status_text() {
-    if (g_hh == INVALID_HANDLE_VALUE) return L"HidHide: Not installed";
-    if (!g_hh_whitelisted)            return L"HidHide: Installed (needs admin)";
-    if (!g_pad_inst_count)            return L"HidHide: Installed (no pad found)";
-    return g_hh_hiding ? L"HidHide: Installed - pad hidden"
-                       : L"HidHide: Installed";
+static int win_height() {
+    int h = SEC3_Y + 30;
+    if (g_controls_open) h += NROWS * ROW_STEP + 8;
+    return h + 20;
 }
 
+static const wchar_t* kFooterText =
+    L"Closing this window leaves ctrlmouse running in the notification area.";
+static RECT footer_rect() {
+    RECT r = {PAD, win_height() - 34, PAD + CONTENT, win_height() - 16};
+    return r;
+}
+
+// One line on whether the pad is being kept to ourselves, and what to do if
+// it is not. HidHide is the only way to stop other apps seeing the controller.
+static const wchar_t* hide_status_text() {
+    if (g_hh == INVALID_HANDLE_VALUE)
+        return L"Other apps can also see this controller. Install HidHide to stop that.";
+    if (!g_hh_whitelisted)
+        return L"HidHide is installed but needs admin once - restart ctrlmouse as administrator.";
+    if (!g_pad_inst_count)
+        return L"HidHide is ready, but no controller was found to hide.";
+    return g_hh_hiding
+        ? L"This controller is hidden from other apps while the mapping is on."
+        : L"HidHide is ready. The controller is hidden while the mapping is on.";
+}
+
+static bool g_hotkey_capture = false;   // next key press becomes the hotkey
 static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
 
 // --- Feature icons ----------------------------------------------------------
@@ -3846,7 +3735,7 @@ static int track_current_pos(int idx) {
 }
 
 static int track_pos_from_x(int idx, int x) {
-    const RECT& r = kTrackRect[idx];
+    RECT r = slide_track(idx);
     double frac = (double)(x - r.left) / (double)(r.right - r.left);
     if (frac < 0.0) frac = 0.0;
     if (frac > 1.0) frac = 1.0;
@@ -3867,7 +3756,7 @@ static void apply_track_pos(int idx, int pos) {
 
 static int hit_test_track(POINT pt) {
     for (int i = 0; i < NTRACKS; i++)
-        if (PtInRect(&kTrackRect[i], pt)) return i;
+        { RECT t = slide_track(i); if (PtInRect(&t, pt)) return i; }
     return -1;
 }
 
@@ -3887,8 +3776,33 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_ERASEBKGND:
         return 1;   // WM_PAINT clears the whole client area itself
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        // Recording a launcher hotkey. Alt combinations arrive as SYSKEYDOWN,
+        // hence both messages; bare modifiers are ignored so the combination
+        // can be built up before the real key lands.
+        if (!g_hotkey_capture) break;
+        UINT vk = (UINT)wp;
+        if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
+            vk == VK_LWIN || vk == VK_RWIN)
+            return 0;
+        unsigned mods = 0;
+        if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+        if (GetKeyState(VK_MENU) < 0)    mods |= MOD_ALT;
+        if (GetKeyState(VK_SHIFT) < 0)   mods |= MOD_SHIFT;
+        if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
+        EnterCriticalSection(&g_cs);
+        if (vk != VK_ESCAPE) { g_cfg.search_mods = mods; g_cfg.search_vk = vk; }
+        Config nc = g_cfg;
+        LeaveCriticalSection(&g_cs);
+        save_config(nc);
+        g_hotkey_capture = false;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         POINT pt = lparam_to_dip(lp);
+        Config c = get_cfg();
         int idx = hit_test_track(pt);
         if (idx >= 0) {
             g_drag_track = idx;
@@ -3897,7 +3811,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         for (int i = 0; i < NTOGGLES; i++) {
-            if (!PtInRect(&kToggleRect[i], pt)) continue;
+            { RECT t = toggle_rect(i); if (!PtInRect(&t, pt)) continue; }
             if (i == 2) {
                 // Lives in the registry, not config.json, so that removing the
                 // Run entry by hand is respected.
@@ -3914,7 +3828,31 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        for (int i = 0; i < NROWS; i++) {
+        // Collapsing the controls list changes the window height.
+        {
+            RECT sh = sec3_header();
+            sh.bottom += 6;
+            if (PtInRect(&sh, pt)) {
+                g_controls_open = !g_controls_open;
+                RECT wr = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
+                AdjustWindowRect(&wr, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE);
+                SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left,
+                             wr.bottom - wr.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        {
+            RECT hk = search_key_rect();
+            if (c.search_mode == 1 && PtInRect(&hk, pt)) {
+                g_hotkey_capture = true;
+                SetFocus(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        for (int i = 0; g_controls_open && i < NROWS; i++) {
             int f = kRowFeature[i];
             if (f < 0) continue;
             RECT br = row_btn_rect(i);
@@ -3925,7 +3863,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         for (int i = 0; i < NSEARCH; i++) {
-            if (!PtInRect(&kSearchSeg[i], pt)) continue;
+            { RECT t = search_seg(i); if (!PtInRect(&t, pt)) continue; }
             EnterCriticalSection(&g_cs);
             g_cfg.search_mode = i;
             Config c = g_cfg;
@@ -3935,7 +3873,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         for (int i = 0; i < NFSKEYS; i++) {
-            if (!PtInRect(&kFsSeg[i], pt)) continue;
+            { RECT t = fs_seg(i); if (!PtInRect(&t, pt)) continue; }
             EnterCriticalSection(&g_cs);
             g_cfg.fullscreen_key = i;
             Config c = g_cfg;
@@ -3993,31 +3931,57 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     to_f(kHideRect), g_br_main_dim);
                 for (int i = 0; i < NTRACKS; i++)
                     g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
-                                        g_tf_label, to_f(kLabelRect[i]), g_br_main_dim);
+                                        g_tf_label, to_f(slide_label(i)), g_br_main_dim);
                 for (int i = 0; i < NTOGGLES; i++)
                     g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
-                                        g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
-                g_rt_main->DrawText(L"Fullscreen", 10, g_tf_label,
-                                    to_f(kFsLabelRect), g_br_main_dim);
-                g_rt_main->DrawText(L"Search", 6, g_tf_label,
-                                    to_f(kSearchLabelRect), g_br_main_dim);
-                g_rt_main->DrawText(L"Controls", 8, g_tf_label,
-                                    to_f(kLegendHdr), g_br_main_text);
+                                        g_tf_label, to_f(toggle_label(i)), g_br_main_text);
+                // Each setting says what it does, in a line under it.
+                for (int i = 0; i < NTRACKS; i++)
+                    g_rt_main->DrawText(kTrackDesc[i], (UINT32)wcslen(kTrackDesc[i]),
+                                        g_tf_label, to_f(slide_desc(i)), g_br_main_dim);
+                for (int i = 0; i < NTOGGLES; i++)
+                    g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
+                                        g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
+
+                RECT sl = {PAD, SEARCH_Y + 3, PAD + 150, SEARCH_Y + 21};
+                g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
+                                    g_br_main_text);
+                RECT fl = {PAD, FS_Y + 3, PAD + 150, FS_Y + 21};
+                g_rt_main->DrawText(L"Fullscreen key", 14, g_tf_label, to_f(fl),
+                                    g_br_main_text);
+
+                // Section headings.
+                RECT s1 = {PAD, SEC1_Y, PAD + CONTENT, SEC1_Y + 20};
+                g_rt_main->DrawText(L"POINTER", 7, g_tf_label, to_f(s1),
+                                    g_br_main_dim);
+                RECT s2 = {PAD, SEC2_Y, PAD + CONTENT, SEC2_Y + 20};
+                g_rt_main->DrawText(L"BEHAVIOUR", 9, g_tf_label, to_f(s2),
+                                    g_br_main_dim);
+                RECT s3 = sec3_header();
+                g_rt_main->DrawText(g_controls_open
+                                        ? L"CONTROLS      (click to hide)"
+                                        : L"CONTROLS      (click to show)",
+                                    29, g_tf_label, to_f(s3), g_br_main_dim);
+
+                RECT fr = footer_rect();
                 g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
-                                    g_tf_label, to_f(kFooterRect), g_br_main_dim);
+                                    g_tf_label, to_f(fr), g_br_main_dim);
             }
 
-            // Feature rows: icon, name, and the control bound to it.
-            for (int i = 0; i < NROWS; i++) {
+            // Feature rows: icon, name, what it does, and its binding.
+            for (int i = 0; g_controls_open && i < NROWS; i++) {
                 float cy = (float)(ROW_Y0 + i * ROW_STEP) + 13.0f;
                 int f = kRowFeature[i];
-                draw_feature_icon(g_rt_main, 34.0f, cy, kRowIcon[i],
+                draw_feature_icon(g_rt_main, 36.0f, cy, kRowIcon[i],
                                   g_br_main_sel, g_br_main_dim);
                 if (g_tf_label) {
-                    RECT nr = {58, ROW_Y0 + i * ROW_STEP + 4,
-                               58 + 184, ROW_Y0 + i * ROW_STEP + 22};
+                    int y = ROW_Y0 + i * ROW_STEP;
+                    RECT nr = {58, y + 1, 58 + 180, y + 19};
                     g_rt_main->DrawText(kRowName[i], (UINT32)wcslen(kRowName[i]),
                                         g_tf_label, to_f(nr), g_br_main_text);
+                    RECT dr = {58, y + 16, WIN_W - PAD - 132, y + 32};
+                    g_rt_main->DrawText(kRowDesc[i], (UINT32)wcslen(kRowDesc[i]),
+                                        g_tf_label, to_f(dr), g_br_main_dim);
                 }
                 RECT br = row_btn_rect(i);
                 bool capturing = (g_capture && g_capture_feature == f && f >= 0);
@@ -4045,7 +4009,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Trackbars: rounded channel            // Trackbars: rounded channel + accent fill + round thumb.
             for (int i = 0; i < NTRACKS; i++) {
-                const RECT& r = kTrackRect[i];
+                RECT r = slide_track(i);
                 float left = (float)r.left, right = (float)r.right;
                 float cy = (float)((r.top + r.bottom) / 2);
                 g_rt_main->FillRoundedRectangle(
@@ -4083,7 +4047,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
                 for (int i = 0; i < NTRACKS; i++)
                     g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
-                                        g_tf_body, to_f(kValRect[i]), g_br_main_text);
+                                        g_tf_body, to_f(slide_value(i)), g_br_main_text);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
 
@@ -4091,7 +4055,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause,
                                         startup_enabled()};
             for (int i = 0; i < NTOGGLES; i++) {
-                const RECT& r = kToggleRect[i];
+                RECT r = toggle_rect(i);
                 float h = (float)(r.bottom - r.top);
                 g_rt_main->FillRoundedRectangle(
                     D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
@@ -4112,14 +4076,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // others are outlined.
             for (int i = 0; i < NFSKEYS; i++) {
                 D2D1_ROUNDED_RECT rr =
-                    D2D1::RoundedRect(to_f(kFsSeg[i]), 8.0f, 8.0f);
+                    D2D1::RoundedRect(to_f(fs_seg(i)), 8.0f, 8.0f);
                 bool on = (c.fullscreen_key == i);
                 if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
                 else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
                 if (g_tf_body) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_rt_main->DrawText(kFsName[i], (UINT32)wcslen(kFsName[i]),
-                                        g_tf_body, to_f(kFsSeg[i]),
+                                        g_tf_body, to_f(fs_seg(i)),
                                         on ? (ID2D1Brush*)g_br_main_onacc
                                            : g_br_main_dim);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -4129,7 +4093,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Which search the keyboard-hold opens.
             for (int i = 0; i < NSEARCH; i++) {
                 D2D1_ROUNDED_RECT rr =
-                    D2D1::RoundedRect(to_f(kSearchSeg[i]), 8.0f, 8.0f);
+                    D2D1::RoundedRect(to_f(search_seg(i)), 8.0f, 8.0f);
                 bool on = (c.search_mode == i);
                 if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
                 else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
@@ -4137,9 +4101,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_rt_main->DrawText(kSearchName[i],
                                         (UINT32)wcslen(kSearchName[i]),
-                                        g_tf_body, to_f(kSearchSeg[i]),
+                                        g_tf_body, to_f(search_seg(i)),
                                         on ? (ID2D1Brush*)g_br_main_onacc
                                            : g_br_main_dim);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+
+            // The hotkey that summons the third-party launcher.
+            if (c.search_mode == 1) {
+                RECT hk = search_key_rect();
+                draw_control(g_rt_main, to_f(hk), 6.0f,
+                             g_hotkey_capture ? g_br_main_armed : g_br_main_key,
+                             NULL);
+                if (g_tf_body) {
+                    wchar_t kn[48];
+                    if (g_hotkey_capture) wcscpy(kn, L"Press keys...");
+                    else hotkey_name(c.search_mods, c.search_vk, kn, 48);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_body,
+                                        to_f(hk), g_br_main_text);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             }
@@ -4203,7 +4184,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Raise PowerToys, then put the keyboard up to type into it. The
             // keyboard never takes focus, so what it types lands in whatever
             // PowerToys just focused.
-            open_powertoys_search((int)lp);
+            {
+                Config sc = get_cfg();
+                send_hotkey(sc.search_mods, sc.search_vk);
+            }
             g_kb_search = false;
             if (!g_kb_visible) kb_toggle();
             g_kb_external = true;
@@ -4484,7 +4468,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         }
     }
 
-    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(WIN_H)};
+    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
     DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     g_hwnd = CreateWindowW(
