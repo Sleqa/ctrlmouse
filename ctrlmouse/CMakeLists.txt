@@ -16,6 +16,9 @@ target_link_libraries(ctrlmouse PRIVATE
     dinput8
     dxguid
     dwmapi
+    d3d11
+    dxgi
+    dcomp
     d2d1
     dwrite
     hid

@@ -23,6 +23,9 @@
 #include <dwmapi.h>
 #include <d2d1_1.h>
 #include <dwrite.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dcomp.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <devpropdef.h>
@@ -46,6 +49,9 @@ extern "C" {
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -1896,8 +1902,11 @@ static IDWriteTextFormat* g_tf_body = NULL;    // 13, values
 static IDWriteTextFormat* g_tf_label = NULL;   // 13, dim labels
 static IDWriteTextFormat* g_tf_header = NULL;  // 15 semibold, status line
 static IDWriteTextFormat* g_tf_key = NULL;     // 18 semibold, keyboard keys
+static IDWriteTextFormat* g_tf_title = NULL;   // 24 semibold, page title
+static IDWriteTextFormat* g_tf_fly = NULL;     // 14 medium, flyout
 
-static ID2D1HwndRenderTarget* g_rt_main = NULL;
+static ID2D1RenderTarget*     g_rt_main = NULL;  // Mica DC, or the Hwnd RT
+static ID2D1HwndRenderTarget* g_rt_main_hwnd = NULL;
 static ID2D1SolidColorBrush*  g_br_main_key = NULL;
 static ID2D1SolidColorBrush*  g_br_main_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_main_armed = NULL;
@@ -1948,12 +1957,36 @@ static void d2d_init_process() {
     g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", &g_tf_key);
-    IDWriteTextFormat* left[] = {g_tf_body, g_tf_label, g_tf_header};
-    for (int i = 0; i < 3; i++) {
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 24.0f, L"en-us", &g_tf_title);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_tf_fly);
+    // Long descriptions truncate cleanly rather than running under the control
+    // on the right of the card.
+    IDWriteTextFormat* trim[] = {g_tf_body, g_tf_label};
+    for (int i = 0; i < 2; i++) {
+        if (!trim[i]) continue;
+        DWRITE_TRIMMING t = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        IDWriteInlineObject* sign = NULL;
+        if (SUCCEEDED(g_dwrite_factory->CreateEllipsisTrimmingSign(trim[i],
+                                                                   &sign))) {
+            trim[i]->SetTrimming(&t, sign);
+            sign->Release();
+        }
+    }
+    IDWriteTextFormat* left[] = {g_tf_body, g_tf_label, g_tf_header,
+                                 g_tf_title};
+    for (int i = 0; i < 4; i++) {
         if (!left[i]) continue;
         left[i]->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         left[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         left[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    if (g_tf_fly) {
+        g_tf_fly->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_tf_fly->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
     if (g_tf_key) {
         g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2012,8 +2045,152 @@ static void d2d_release_main() {
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
 
+// --- Mica backdrop ----------------------------------------------------------
+// The settings window would rather be a Mica window than a flat dark panel.
+// That needs the window pixels to be genuinely translucent, which an
+// ID2D1HwndRenderTarget cannot do - it always presents opaque. So this window
+// renders through a composition swap chain hosted on a DirectComposition
+// visual, the way WinUI does it: we clear to transparent, DWM draws the Mica
+// material behind us, and the cards sit on top as translucent layers.
+//
+// Every step degrades to the plain opaque render target if it fails, which is
+// what happens on Windows 10, so nothing here is load-bearing.
+static ID3D11Device*        g_d3d = NULL;
+static ID2D1Device*         g_d2d_dev = NULL;
+static ID2D1DeviceContext*  g_dc_main = NULL;
+static IDXGISwapChain1*     g_swap = NULL;
+static IDCompositionDevice* g_dcomp = NULL;
+static IDCompositionTarget* g_dcomp_target = NULL;
+static IDCompositionVisual* g_dcomp_visual = NULL;
+static bool g_mica = false;
+
+static void mica_release() {
+    if (g_dc_main) g_dc_main->SetTarget(NULL);
+    if (g_dcomp_visual) { g_dcomp_visual->Release(); g_dcomp_visual = NULL; }
+    if (g_dcomp_target) { g_dcomp_target->Release(); g_dcomp_target = NULL; }
+    if (g_dcomp) { g_dcomp->Release(); g_dcomp = NULL; }
+    if (g_swap) { g_swap->Release(); g_swap = NULL; }
+    if (g_dc_main) { g_dc_main->Release(); g_dc_main = NULL; }
+    if (g_d2d_dev) { g_d2d_dev->Release(); g_d2d_dev = NULL; }
+    if (g_d3d) { g_d3d->Release(); g_d3d = NULL; }
+    g_mica = false;
+}
+
+// Point the device context at the swap chain current back buffer.
+static bool mica_bind_target() {
+    IDXGISurface* surf = NULL;
+    if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&surf)))) return false;
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                          D2D1_ALPHA_MODE_PREMULTIPLIED),
+        (float)g_dpi, (float)g_dpi);
+    ID2D1Bitmap1* bmp = NULL;
+    HRESULT hr = g_dc_main->CreateBitmapFromDxgiSurface(surf, &bp, &bmp);
+    surf->Release();
+    if (FAILED(hr)) return false;
+    g_dc_main->SetTarget(bmp);
+    bmp->Release();
+    g_dc_main->SetDpi((float)g_dpi, (float)g_dpi);
+    return true;
+}
+
+static bool mica_create(HWND hwnd) {
+    if (!g_d2d_factory) return false;
+    // DirectComposition only ships on Windows 8 and later, and the backdrop
+    // attribute only does anything on Windows 11, so both are late-bound.
+    HMODULE dc_dll = LoadLibraryW(L"dcomp.dll");
+    if (!dc_dll) return false;
+    typedef HRESULT(WINAPI * CreateDevFn)(IDXGIDevice*, REFIID, void**);
+    CreateDevFn create_dev =
+        (CreateDevFn)GetProcAddress(dc_dll, "DCompositionCreateDevice");
+    if (!create_dev) return false;
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL got;
+    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags,
+                                 NULL, 0, D3D11_SDK_VERSION, &g_d3d, &got,
+                                 NULL)))
+        return false;
+    IDXGIDevice* dxgi_dev = NULL;
+    if (FAILED(g_d3d->QueryInterface(IID_PPV_ARGS(&dxgi_dev)))) {
+        mica_release();
+        return false;
+    }
+
+    bool ok = false;
+    IDXGIAdapter* adapter = NULL;
+    IDXGIFactory2* dxgi_factory = NULL;
+    do {
+        if (FAILED(g_d2d_factory->CreateDevice(dxgi_dev, &g_d2d_dev))) break;
+        if (FAILED(g_d2d_dev->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_dc_main))) break;
+
+        if (FAILED(dxgi_dev->GetAdapter(&adapter))) break;
+        if (FAILED(adapter->GetParent(IID_PPV_ARGS(&dxgi_factory)))) break;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        DXGI_SWAP_CHAIN_DESC1 sd = {};
+        sd.Width  = (rc.right - rc.left) > 0 ? rc.right - rc.left : 1;
+        sd.Height = (rc.bottom - rc.top) > 0 ? rc.bottom - rc.top : 1;
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;   // the whole point
+        if (FAILED(dxgi_factory->CreateSwapChainForComposition(
+                dxgi_dev, &sd, NULL, &g_swap))) break;
+
+        if (FAILED(create_dev(dxgi_dev, IID_PPV_ARGS(&g_dcomp)))) break;
+        if (FAILED(g_dcomp->CreateTargetForHwnd(hwnd, TRUE, &g_dcomp_target)))
+            break;
+        if (FAILED(g_dcomp->CreateVisual(&g_dcomp_visual))) break;
+        if (FAILED(g_dcomp_visual->SetContent(g_swap))) break;
+        if (FAILED(g_dcomp_target->SetRoot(g_dcomp_visual))) break;
+        if (FAILED(g_dcomp->Commit())) break;
+        if (!mica_bind_target()) break;
+        ok = true;
+    } while (0);
+
+    if (dxgi_factory) dxgi_factory->Release();
+    if (adapter) adapter->Release();
+    dxgi_dev->Release();
+    if (!ok) { mica_release(); return false; }
+
+    // DWMSBT_MAINWINDOW. Pre-22H2 builds reject the attribute and would leave
+    // us with a see-through window, so check rather than assume.
+    int backdrop = 2;
+    if (FAILED(DwmSetWindowAttribute(hwnd, 38 /*SYSTEMBACKDROP_TYPE*/,
+                                     &backdrop, sizeof(backdrop)))) {
+        mica_release();
+        return false;
+    }
+    g_dc_main->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    // ClearType has no background to blend against on a transparent target,
+    // so this page gets grayscale antialiasing.
+    g_dc_main->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    g_mica = true;
+    return true;
+}
+
+static void mica_resize(UINT px_w, UINT px_h) {
+    if (!g_mica || !g_swap) return;
+    g_dc_main->SetTarget(NULL);
+    if (FAILED(g_swap->ResizeBuffers(0, px_w ? px_w : 1, px_h ? px_h : 1,
+                                     DXGI_FORMAT_UNKNOWN, 0)))
+        return;
+    mica_bind_target();
+}
+
 static bool d2d_create_main(HWND hwnd) {
-    g_rt_main = d2d_create_rt(hwnd, false);
+    if (mica_create(hwnd)) {
+        g_rt_main = g_dc_main;
+    } else {
+        g_rt_main_hwnd = d2d_create_rt(hwnd, false);
+        g_rt_main = g_rt_main_hwnd;
+    }
     if (!g_rt_main) return false;
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_main_key);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_sel);
@@ -2025,8 +2202,14 @@ static bool d2d_create_main(HWND hwnd) {
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_glow);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
-    // CardBackgroundFillColorDefault sits just above the page behind it.
-    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_main_card);
+    // CardBackgroundFillColorDefault sits just above the page behind it -
+    // as a translucent layer over Mica, as a solid colour without it.
+    if (g_mica)
+        g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
+                                         &g_br_main_card);
+    else
+        g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)),
+                                         &g_br_main_card);
     g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
                                      &g_br_main_border);
     return true;
@@ -2731,14 +2914,16 @@ static bool d2d_create_lx(HWND hwnd) {
 static void draw_cog(ID2D1RenderTarget* rt, float cx, float cy, float r,
                      ID2D1Brush* br) {
     D2D1_POINT_2F c = D2D1::Point2F(cx, cy);
+    D2D1_MATRIX_3X2_F base;
+    rt->GetTransform(&base);
     for (int i = 0; i < 8; i++) {
-        rt->SetTransform(D2D1::Matrix3x2F::Rotation(i * 45.0f, c));
+        rt->SetTransform(D2D1::Matrix3x2F::Rotation(i * 45.0f, c) * base);
         rt->FillRoundedRectangle(
             D2D1::RoundedRect(D2D1::RectF(cx - r * 0.16f, cy - r * 1.18f,
                                           cx + r * 0.16f, cy - r * 0.62f),
                               1.5f, 1.5f), br);
     }
-    rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    rt->SetTransform(base);
     rt->DrawEllipse(D2D1::Ellipse(c, r * 0.72f, r * 0.72f), br, r * 0.26f);
     rt->DrawEllipse(D2D1::Ellipse(c, r * 0.30f, r * 0.30f), br, r * 0.16f);
 }
@@ -3064,16 +3249,19 @@ static void lx_nav(int dir) {
 // bottom of the screen - rather than a menu that takes over the middle. It is
 // only up while the button is held: the left stick slides the underline
 // between the options and letting go sends the one under it.
-#define FLY_W    390
+#define FLY_W    310
 #define FLY_H     96
-#define FLY_PAD   16
+#define FLY_PAD   12
 #define FLY_ITEMW ((FLY_W - FLY_PAD * 2) / NRADIAL)
 #define FLY_ANIM  140      // underline glide, ms
+#define FLY_IN    250      // slide-and-fade in, ms
+#define FLY_RISE  36       // how far it travels on the way in, DIPs
 
 static HWND g_rad = NULL;
 static int  g_rad_sel = 0;
 static int  g_rad_prev_sel = 0;
 static ULONGLONG g_rad_move_t0 = 0;
+static ULONGLONG g_rad_in_t0 = 0;
 static ID2D1DCRenderTarget* g_rt_rad = NULL;
 static HDC     g_rad_dc = NULL;      // memory DC holding the DIB below
 static HBITMAP g_rad_dib = NULL;
@@ -3088,6 +3276,13 @@ static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
 
 static float fly_item_cx(int i) {
     return FLY_PAD + FLY_ITEMW * (i + 0.5f);
+}
+
+static float ease_out(ULONGLONG t0, int ms) {
+    if (!t0) return 1.0f;
+    double e = (double)(GetTickCount64() - t0) / ms;
+    if (e >= 1.0) return 1.0f;
+    return (float)(1.0 - pow(1.0 - e, 3));
 }
 
 static void d2d_release_rad() {
@@ -3159,28 +3354,25 @@ static void rad_render() {
     g_rt_rad->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
                                    g_br_rad_border, 1.0f);
 
-    if (g_tf_body) {
+    if (g_tf_fly) {
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         D2D1_RECT_F t = D2D1::RectF(0, 12, FLY_W, 32);
-        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t, g_br_rad_dim);
+        g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_fly, t, g_br_rad_dim);
         for (int i = 0; i < NRADIAL; i++) {
             D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + (float)FLY_ITEMW * i, 40,
-                                         FLY_PAD + (float)FLY_ITEMW * (i + 1), 66);
+                                         FLY_PAD + (float)FLY_ITEMW * (i + 1),
+                                         66);
             g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
-                               g_tf_body, ir,
+                               g_tf_fly, ir,
                                i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
                                               : g_br_rad_dim);
         }
-        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
     // The underline glides to the new option rather than jumping, which is the
     // part that makes it feel like a system flyout.
-    float t = 1.0f;
-    if (g_rad_move_t0) {
-        double e = (double)(GetTickCount64() - g_rad_move_t0) / FLY_ANIM;
-        t = (e >= 1.0) ? 1.0f : (float)(1.0 - pow(1.0 - e, 3));
-    }
+    float t = ease_out(g_rad_move_t0, FLY_ANIM);
     float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
     float cx = from + (to - from) * t;
     float halfw = FLY_ITEMW * 0.30f;
@@ -3191,13 +3383,15 @@ static void rad_render() {
 
     if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
 
+    float in = ease_out(g_rad_in_t0, FLY_IN);
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
-                 wa.bottom - h - dip_to_px(72)};
+                 wa.bottom - h - dip_to_px(72) +
+                     (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
     SIZE  size = {w, h};
     POINT src = {0, 0};
-    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)(255 * in), AC_SRC_ALPHA};
     HDC screen = GetDC(NULL);
     UpdateLayeredWindow(g_rad, screen, &pos, &size, g_rad_dc, &src, 0, &bf,
                         ULW_ALPHA);
@@ -3208,11 +3402,12 @@ static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_TIMER) {
         // Only runs while the underline is moving.
         rad_render();
-        if (!g_rad_move_t0 || GetTickCount64() - g_rad_move_t0 >= FLY_ANIM) {
-            g_rad_move_t0 = 0;
-            g_rad_prev_sel = g_rad_sel;
-            KillTimer(hwnd, FLY_TIMER);
-        }
+        ULONGLONG now = GetTickCount64();
+        bool moving = g_rad_move_t0 && now - g_rad_move_t0 < FLY_ANIM;
+        bool entering = g_rad_in_t0 && now - g_rad_in_t0 < FLY_IN;
+        if (!moving) { g_rad_move_t0 = 0; g_rad_prev_sel = g_rad_sel; }
+        if (!entering) g_rad_in_t0 = 0;
+        if (!moving && !entering) KillTimer(hwnd, FLY_TIMER);
         return 0;
     }
     if (msg == WM_DESTROY) { d2d_release_rad(); return 0; }
@@ -3241,8 +3436,10 @@ static void rad_show(bool on) {
     if (!g_rad) return;
     g_rad_prev_sel = g_rad_sel;
     g_rad_move_t0 = 0;
+    g_rad_in_t0 = GetTickCount64();
     rad_render();                     // positions and sizes the window too
     ShowWindow(g_rad, SW_SHOWNOACTIVATE);
+    SetTimer(g_rad, FLY_TIMER, 15, NULL);
     SetWindowPos(g_rad, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     g_rad_visible = true;
@@ -3315,9 +3512,27 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // names on its own was not enough to work out what anything did. The controls
 // list is collapsible, since it is much the longest section and is only needed
 // while rebinding.
-#define WIN_W 600
-#define PAD   24                  // left and right margin
-#define CONTENT (WIN_W - PAD * 2)
+// The window is resizable. Content stretches with it up to a comfortable
+// reading width and then centres, the way the app this borrows from does -
+// a settings list stretched across a very wide window is hard to scan.
+#define WIN_W     620             // starting width only
+#define WIN_MIN_W 480
+#define WIN_MIN_H 420
+#define PAD       24
+#define MAXW      900             // widest the content ever gets
+
+static int g_cw = WIN_W;          // client size, DIPs
+static int g_ch = 700;
+static int g_scroll = 0;          // vertical scroll offset, DIPs
+
+static int content_w() {
+    int w = g_cw - PAD * 2;
+    if (w > MAXW) w = MAXW;
+    if (w < 240) w = 240;
+    return w;
+}
+static int content_x() { return (g_cw - content_w()) / 2; }
+#define CONTENT content_w()
 // WinUI SettingsCard proportions: a rounded panel per setting, icon on the
 // left, title over description, the control on the right.
 #define CARD_R    4.0f
@@ -3326,13 +3541,15 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 #define CARD_ICON 44              // icon column inside a card
 #define CARD_CTRL 200             // control column on the right
 
-static const RECT kStatusRect = {PAD, 16, PAD + 420, 16 + 26};
-static const RECT kHideRect   = {PAD, 48, PAD + 380, 48 + 20};
-static const RECT kHidBtnRect = {WIN_W - PAD - 92, 44, WIN_W - PAD, 44 + 26};
+static RECT status_rect() { RECT r = {content_x(), 52, content_x() + content_w() - 110, 78}; return r; }
+ static RECT title_rect() { RECT r = {content_x(), 14, content_x() + content_w(), 46}; return r; }
+static RECT hide_rect() { RECT r = {content_x(), 78, content_x() + content_w() - 110, 98}; return r; }
+static RECT hid_btn_rect() { int rx = content_x() + content_w();
+                             RECT r = {rx - 96, 62, rx, 88}; return r; }
 
 // --- Pointer section --------------------------------------------------------
-#define SEC1_Y   88               // "POINTER" heading
-#define SLIDE_Y0 116              // first slider row
+#define SEC1_Y   112               // "POINTER" heading
+#define SLIDE_Y0 138              // first slider row
 #define SLIDE_STEP (CARD_H + CARD_GAP)
 static const wchar_t* kTrackLabel[NTRACKS] = {
     L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
@@ -3344,28 +3561,32 @@ static const wchar_t* kTrackDesc[NTRACKS] = {
     L"without lowering the speed above."};
 
 static RECT card_rect(int y) {
-    RECT r = {PAD, y, PAD + CONTENT, y + CARD_H};
+    RECT r = {content_x(), y, content_x() + content_w(), y + CARD_H};
     return r;
 }
 static RECT slide_card(int i)  { return card_rect(SLIDE_Y0 + i * SLIDE_STEP); }
 static RECT slide_label(int i) {
     int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {PAD + CARD_ICON, y + 11, WIN_W - PAD - CARD_CTRL - 12, y + 29};
+    RECT r = {content_x() + CARD_ICON, y + 11,
+              content_x() + content_w() - CARD_CTRL - 12, y + 29};
     return r;
 }
 static RECT slide_desc(int i) {
     int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {PAD + CARD_ICON, y + 30, WIN_W - PAD - CARD_CTRL - 12, y + 48};
+    RECT r = {content_x() + CARD_ICON, y + 30,
+              content_x() + content_w() - CARD_CTRL - 12, y + 48};
     return r;
 }
 static RECT slide_track(int i) {
     int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {WIN_W - PAD - CARD_CTRL, y + 18, WIN_W - PAD - 58, y + 44};
+    int rx = content_x() + content_w();
+    RECT r = {rx - CARD_CTRL, y + 18, rx - 58, y + 44};
     return r;
 }
 static RECT slide_value(int i) {
     int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {WIN_W - PAD - 50, y + 22, WIN_W - PAD - 14, y + 40};
+    int rx = content_x() + content_w();
+    RECT r = {rx - 50, y + 22, rx - 14, y + 40};
     return r;
 }
 
@@ -3386,17 +3607,20 @@ static const wchar_t* kToggleDesc[NTOGGLES] = {
 static RECT toggle_card(int i) { return card_rect(TOG_Y0 + i * TOG_STEP); }
 static RECT toggle_rect(int i) {
     int y = TOG_Y0 + i * TOG_STEP;
-    RECT r = {WIN_W - PAD - 62, y + 20, WIN_W - PAD - 16, y + 42};
+    int rx = content_x() + content_w();
+    RECT r = {rx - 62, y + 20, rx - 16, y + 42};
     return r;
 }
 static RECT toggle_label(int i) {
     int y = TOG_Y0 + i * TOG_STEP;
-    RECT r = {PAD + CARD_ICON, y + 11, WIN_W - PAD - 80, y + 29};
+    RECT r = {content_x() + CARD_ICON, y + 11,
+              content_x() + content_w() - 80, y + 29};
     return r;
 }
 static RECT toggle_desc(int i) {
     int y = TOG_Y0 + i * TOG_STEP;
-    RECT r = {PAD + CARD_ICON, y + 30, WIN_W - PAD - 80, y + 48};
+    RECT r = {content_x() + CARD_ICON, y + 30,
+              content_x() + content_w() - 80, y + 48};
     return r;
 }
 
@@ -3406,12 +3630,14 @@ static RECT toggle_desc(int i) {
 static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
 static RECT search_card() { return card_rect(SEARCH_Y); }
 static RECT search_seg(int i) {
-    RECT r = {WIN_W - PAD - 240 + i * 62, SEARCH_Y + 18,
-              WIN_W - PAD - 240 + i * 62 + 58, SEARCH_Y + 44};
+    int rx = content_x() + content_w();
+    RECT r = {rx - 240 + i * 62, SEARCH_Y + 18, rx - 240 + i * 62 + 58,
+              SEARCH_Y + 44};
     return r;
 }
 static RECT search_key_rect() {
-    RECT r = {WIN_W - PAD - 112, SEARCH_Y + 18, WIN_W - PAD - 8, SEARCH_Y + 44};
+    int rx = content_x() + content_w();
+    RECT r = {rx - 112, SEARCH_Y + 18, rx - 8, SEARCH_Y + 44};
     return r;
 }
 
@@ -3451,17 +3677,19 @@ static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2};
 
 static bool g_controls_open = false;
 
-static RECT row_card(int i)  { RECT r = {PAD, ROW_Y0 + i * ROW_STEP,
-                                         PAD + CONTENT,
-                                         ROW_Y0 + i * ROW_STEP + 34};
-                               return r; }
+static RECT row_card(int i) {
+    RECT r = {content_x(), ROW_Y0 + i * ROW_STEP,
+              content_x() + content_w(), ROW_Y0 + i * ROW_STEP + 34};
+    return r;
+}
 static RECT row_btn_rect(int i) {
     int y = ROW_Y0 + i * ROW_STEP;
-    RECT r = {WIN_W - PAD - 126, y + 4, WIN_W - PAD - 10, y + 30};
+    int rx = content_x() + content_w();
+    RECT r = {rx - 126, y + 4, rx - 10, y + 30};
     return r;
 }
 static RECT sec3_header() {
-    RECT r = {PAD, SEC3_Y, PAD + CONTENT, SEC3_Y + 20};
+    RECT r = {content_x(), SEC3_Y, content_x() + content_w(), SEC3_Y + 20};
     return r;
 }
 
@@ -3474,7 +3702,9 @@ static int win_height() {
 static const wchar_t* kFooterText =
     L"Closing this window leaves ctrlmouse running in the notification area.";
 static RECT footer_rect() {
-    RECT r = {PAD, win_height() - 34, PAD + CONTENT, win_height() - 16};
+    int y = win_height();
+    if (g_scroll + g_ch > y) y = g_scroll + g_ch;
+    RECT r = {content_x(), y - 30, content_x() + content_w(), y - 12};
     return r;
 }
 
@@ -3638,9 +3868,19 @@ static void draw_dpad_icon(ID2D1RenderTarget* rt, float cx, float cy, bool verti
 }
 
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
+// Layout coordinates are in unscrolled document space, so a click has to be
+// pushed back down by however far the list has been scrolled.
 static POINT lparam_to_dip(LPARAM lp) {
-    POINT pt = {px_to_dip((int)(short)LOWORD(lp)), px_to_dip((int)(short)HIWORD(lp))};
+    POINT pt = {px_to_dip((int)(short)LOWORD(lp)),
+                px_to_dip((int)(short)HIWORD(lp)) + g_scroll};
     return pt;
+}
+
+static void clamp_scroll() {
+    int max = win_height() - g_ch;
+    if (max < 0) max = 0;
+    if (g_scroll > max) g_scroll = max;
+    if (g_scroll < 0) g_scroll = 0;
 }
 
 static void update_value(int idx) {
@@ -3716,8 +3956,29 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (g_rt_main) g_rt_main->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        if (g_mica) mica_resize(LOWORD(lp), HIWORD(lp));
+        else if (g_rt_main_hwnd)
+            g_rt_main_hwnd->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        g_cw = px_to_dip(LOWORD(lp));
+        g_ch = px_to_dip(HIWORD(lp));
+        clamp_scroll();
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+    case WM_GETMINMAXINFO: {
+        // Narrower than this and the descriptions have nowhere to go.
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        RECT r = {0, 0, dip_to_px(WIN_MIN_W), dip_to_px(WIN_MIN_H)};
+        AdjustWindowRect(&r, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE);
+        mmi->ptMinTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * 50 / WHEEL_DELTA;
+        clamp_scroll();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;   // WM_PAINT clears the whole client area itself
     case WM_KEYDOWN:
@@ -3778,11 +4039,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             sh.bottom += 6;
             if (PtInRect(&sh, pt)) {
                 g_controls_open = !g_controls_open;
-                RECT wr = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
-                AdjustWindowRect(&wr, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE);
-                SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left,
-                             wr.bottom - wr.top,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
@@ -3816,7 +4073,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&kHidBtnRect, pt)) {
+        RECT hb = hid_btn_rect();
+        if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&hb, pt)) {
             // Open the download page only; installing a driver is the user's
             // decision to make in their own browser.
             ShellExecuteW(NULL, L"open", HH_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
@@ -3844,8 +4102,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_rt_main) d2d_create_main(hwnd);
         if (g_rt_main) {
             g_rt_main->BeginDraw();
-            g_rt_main->Clear(d2d_clr(KB_CLR_BG));
+            g_rt_main->Clear(g_mica ? D2D1::ColorF(0, 0.0f)
+                                    : d2d_clr(KB_CLR_BG));
+            g_rt_main->SetTransform(
+                D2D1::Matrix3x2F::Translation(0.0f, -(float)g_scroll));
             Config c = get_cfg();
+
+            if (g_tf_title && g_br_main_text)
+                g_rt_main->DrawText(L"ctrlmouse", 9, g_tf_title,
+                                    to_f(title_rect()), g_br_main_text);
 
             // Status label (4-state color, same logic as before).
             COLORREF sc = RGB(240, 110, 110);
@@ -3855,7 +4120,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
             if (g_tf_header && g_br_main_status)
                 g_rt_main->DrawText(g_status_txt, (UINT32)wcslen(g_status_txt),
-                                    g_tf_header, to_f(kStatusRect), g_br_main_status);
+                                    g_tf_header, to_f(status_rect()), g_br_main_status);
 
             // Cards first, so every label and control lands on one.
             for (int i = 0; i < NTRACKS; i++)
@@ -3898,7 +4163,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_tf_label) {
                 const wchar_t* hs = hide_status_text();
                 g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
-                                    to_f(kHideRect), g_br_main_dim);
+                                    to_f(hide_rect()), g_br_main_dim);
                 for (int i = 0; i < NTRACKS; i++)
                     g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
                                         g_tf_label, to_f(slide_label(i)), g_br_main_dim);
@@ -3914,11 +4179,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
 
                 RECT sl = {PAD + CARD_ICON, SEARCH_Y + 11,
-                           WIN_W - PAD - 250, SEARCH_Y + 29};
+                           content_x() + content_w() - 250, SEARCH_Y + 29};
                 g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
                                     g_br_main_text);
                 RECT sd = {PAD + CARD_ICON, SEARCH_Y + 30,
-                           WIN_W - PAD - 250, SEARCH_Y + 48};
+                           content_x() + content_w() - 250, SEARCH_Y + 48};
                 const wchar_t* sdt = (c.search_mode == 1)
                     ? L"Presses your hotkey to open the launcher you already use."
                     : L"Shows a simple list of your installed apps.";
@@ -3955,7 +4220,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                y + 20};
                     g_rt_main->DrawText(kRowName[i], (UINT32)wcslen(kRowName[i]),
                                         g_tf_label, to_f(nr), g_br_main_text);
-                    RECT dr = {PAD + CARD_ICON, y + 17, WIN_W - PAD - 136,
+                    RECT dr = {content_x() + CARD_ICON, y + 17,
+                               content_x() + content_w() - 136,
                                y + 33};
                     g_rt_main->DrawText(kRowDesc[i], (UINT32)wcslen(kRowDesc[i]),
                                         g_tf_label, to_f(dr), g_br_main_dim);
@@ -4087,7 +4353,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Install button, only while HidHide is missing.
             if (g_hh == INVALID_HANDLE_VALUE) {
-                const RECT& r = kHidBtnRect;
+                RECT r = hid_btn_rect();
                 g_rt_main->FillRoundedRectangle(
                     D2D1::RoundedRect(to_f(r), 10.0f, 10.0f), g_br_main_key);
                 if (g_tf_body) {
@@ -4097,7 +4363,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
 
+            g_rt_main->SetTransform(D2D1::Matrix3x2F::Identity());
             HRESULT hr = g_rt_main->EndDraw();
+            if (g_mica && g_swap && SUCCEEDED(hr)) g_swap->Present(1, 0);
             if (hr == D2DERR_RECREATE_TARGET) d2d_release_main();
         }
         EndPaint(hwnd, &ps);
@@ -4437,7 +4705,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 
     RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
-    DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
+    DWORD style = WS_OVERLAPPEDWINDOW;   // resizable: content reflows
     AdjustWindowRect(&r, style, FALSE);
     g_hwnd = CreateWindowW(
         CLASS_NAME, L"ControllerMouse", style,
