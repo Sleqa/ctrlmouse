@@ -1254,6 +1254,8 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
     bool radial_up = false;                // radial picker is on screen
+    int  rad_idx = 1;                      // flyout selection, tracked locally
+    int  rad_deflect = -1;                 // -1 centred, 0 left, 2 right
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Media controls (D-pad + Square) while the on-screen keyboard is closed.
@@ -1608,23 +1610,28 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
                     hold_fired[F_FULLSCREEN] = true;
                     radial_up = true;
+                    rad_idx = 1;            // always opens on the middle option
+                    rad_deflect = -1;
                 }
                 if (radial_up && is_down(F_FULLSCREEN)) {
-                    // The stick springs back to dead centre - the middle
-                    // option's own zone - the instant it's let go, which is
-                    // indistinguishable from deliberately picking the middle
-                    // option if the middle zone is read like the other two.
-                    // So it isn't: only a clear push left or right ever
-                    // changes the selection, and a centred stick just leaves
-                    // whichever side was last chosen alone. The only way onto
-                    // the middle option is to never have pushed the stick at
-                    // all this hold, which is also why it's what the flyout
-                    // opens already selecting.
+                    // Read as a step, not a live position: the stick springs
+                    // back to dead centre - the same place a genuine push
+                    // toward the middle option would leave it - the instant
+                    // it's let go, so position alone can't tell "released"
+                    // from "chose the middle option" apart. A fresh push past
+                    // the threshold steps the selection one way or the other
+                    // instead, and the middle option is simply one step off
+                    // either side, so it's still reachable - releasing the
+                    // stick just isn't itself a step.
                     double sx = st.lx / 1000.0;
-                    if (sx < -0.33)
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, 0);
-                    else if (sx > 0.33)
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, 2);
+                    int dir = (sx < -0.33) ? 0 : (sx > 0.33) ? 2 : -1;
+                    if (dir != rad_deflect) {
+                        if (dir == 0 && rad_idx > 0) rad_idx--;
+                        if (dir == 2 && rad_idx < NRADIAL - 1) rad_idx++;
+                        rad_deflect = dir;
+                        if (dir != -1)
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, rad_idx);
+                    }
                 }
                 if (radial_up && went_up(F_FULLSCREEN)) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
@@ -4462,8 +4469,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_kb_external = true;
             break;
         case GP_RAD_SHOW:
-            g_rad_sel = get_cfg().fullscreen_key;
-            if (g_rad_sel < 0 || g_rad_sel >= NRADIAL) g_rad_sel = 0;
+            g_rad_sel = 1;   // always opens on the middle option
             rad_show(true);
             break;
         case GP_RAD_SEL:
