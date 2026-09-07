@@ -79,13 +79,14 @@ struct Config {
     bool   game_pause;          // auto-pause the mapping while a game is fullscreen
     int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial pick
     double mouse_curve;         // 1 = linear; higher = finer near centre
+    int    search_mode;         // 0 built-in, 1 Command Palette, 2 PowerToys Run
     int    bind[F_COUNT];       // controller button per action
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
 // Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad,
 // R1 (forward), L1 (back).
-static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0, 0,
                                 {1, 2, 3, 0, 0, 9, 13, 5, 4}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
@@ -210,11 +211,12 @@ static void save_config(const Config& c) {
             "  \"enabled\": %s,\n"
             "  \"game_pause\": %s,\n"
             "  \"fullscreen_key\": %d,\n"
-            "  \"mouse_curve\": %.2f",
+            "  \"mouse_curve\": %.2f,\n"
+            "  \"search_mode\": %d",
             c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
             c.enabled ? "true" : "false",
             c.game_pause ? "true" : "false", c.fullscreen_key,
-            c.mouse_curve);
+            c.mouse_curve, c.search_mode);
     // Flat keys rather than a nested object: the reader looks each name up
     // directly, so nesting would buy nothing and cost a real parser.
     for (int i = 0; i < F_COUNT; i++)
@@ -222,6 +224,19 @@ static void save_config(const Config& c) {
     fprintf(f, "\n}\n");
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+// PowerToys installs per-user or per-machine depending on the installer, so
+// check both. Only used to pick a sensible default the first time.
+static bool powertoys_installed() {
+    const wchar_t* env[3] = {L"LOCALAPPDATA", L"ProgramFiles", L"ProgramW6432"};
+    for (int i = 0; i < 3; i++) {
+        wchar_t base[MAX_PATH];
+        if (!GetEnvironmentVariableW(env[i], base, MAX_PATH)) continue;
+        std::wstring p = std::wstring(base) + L"\\PowerToys\\PowerToys.exe";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    }
+    return false;
 }
 
 static bool parse_double(const std::string& s, const char* key, double& out) {
@@ -277,6 +292,11 @@ static Config load_config() {
     parse_double(s, "mouse_curve", c.mouse_curve);
     if (c.mouse_curve < 1.0) c.mouse_curve = 1.0;
     if (c.mouse_curve > 3.0) c.mouse_curve = 3.0;
+    double sm;
+    if (parse_double(s, "search_mode", sm) && sm >= 0 && sm <= 2)
+        c.search_mode = (int)sm;
+    else if (powertoys_installed())
+        c.search_mode = 1;   // prefer the real thing where it exists
     return c;
 }
 
@@ -350,6 +370,30 @@ static void mouse_xbutton(int which) {
     SendInput(2, in, sizeof(INPUT));
 }
 
+// Summon PowerToys' own launcher by its default hotkey - Win+Alt+Space for
+// Command Palette, Alt+Space for the older PowerToys Run. Nothing here talks
+// to PowerToys directly, so this is the real thing with its own ranking,
+// history and extensions rather than an imitation of it. It relies on the
+// hotkey being the default; if it has been changed, the built-in search is
+// still there in the settings.
+static void open_powertoys_search(int mode) {
+    INPUT in[6] = {};
+    int n = 0;
+    bool win = (mode == 1);
+    if (win) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN; n++; }
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_MENU; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SPACE; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SPACE;
+    in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_MENU;
+    in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    if (win) {
+        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_LWIN;
+        in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    }
+    SendInput(n, in, sizeof(INPUT));
+}
+
 static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
     if (pressed && !prev) {
         mouse_button(down);
@@ -373,11 +417,14 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE, GP_CAPTURED,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
-       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER };
+       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
 static volatile bool g_rad_visible = false;  // radial fullscreen picker
+// Keyboard open purely to type into someone else's search box, so its result
+// list is navigated rather than ours. Read by the worker, hence up here.
+static volatile bool g_kb_external = false;
 // Radial option layout: top, lower-right, lower-left. Declared here because
 // the worker maps stick direction onto these angles.
 #define NRADIAL 3
@@ -1425,7 +1472,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
             if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
                 bnow - hold_t0[F_KEYBOARD] >= 500) {
-                PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SEARCH, 0);
+                PostMessageW(g_hwnd, WM_GAMEPAD,
+                             cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH,
+                             cfg.search_mode);
                 hold_fired[F_KEYBOARD] = true;
             }
             if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
@@ -1433,8 +1482,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
             // Browser-style navigation on the shoulder buttons, sent as the
             // mouse side buttons so it works wherever those already do.
-            if (went_down(F_BACK))    mouse_xbutton(XBUTTON1);
-            if (went_down(F_FORWARD)) mouse_xbutton(XBUTTON2);
+            if (!g_kb_external) {
+                if (went_down(F_BACK))    mouse_xbutton(XBUTTON1);
+                if (went_down(F_FORWARD)) mouse_xbutton(XBUTTON2);
+            }
 
             // Launcher is a hold, checked before the popups so it works
             // whichever of them happens to be up.
@@ -1467,6 +1518,12 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // Keep media state in step while the keyboard owns the D-pad,
                 // so closing it with a direction held doesn't fire.
                 media_dir = st.hat;
+                // PowerToys owns the result list, and our D-pad is busy with
+                // the keys, so the shoulder buttons walk it.
+                if (g_kb_external) {
+                    if (went_down(F_BACK))    tap_key(VK_UP);
+                    if (went_down(F_FORWARD)) tap_key(VK_DOWN);
+                }
                 // While typing, the play/pause button is a shortcut to Enter -
                 // it moves the selection there rather than pressing it, so a
                 // second press is still a deliberate act.
@@ -3493,7 +3550,7 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 848
+#define WIN_H 884
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
@@ -3541,12 +3598,23 @@ static const RECT kFsSeg[NFSKEYS] = {
 };
 static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Ent", L"F", L"Radial"};
 
+// Which search the keyboard-hold opens.
+static const RECT kSearchLabelRect = {20, 444, 20 + 80, 444 + 18};
+#define NSEARCH 3
+static const RECT kSearchSeg[NSEARCH] = {
+    {106, 440, 106 + 82, 440 + 26},
+    {194, 440, 194 + 82, 440 + 26},
+    {282, 440, 282 + 82, 440 + 26},
+};
+static const wchar_t* kSearchName[NSEARCH] = {
+    L"Built-in", L"Cmd Palette", L"PT Run"};
+
 // Feature list. Each row is an icon for what the action does, its name, and a
 // button showing the control bound to it - click to rebind. The two D-pad
 // rows are shown for reference and are not rebindable.
-static const RECT kLegendHdr = {20, 448, 20 + 344, 448 + 18};
+static const RECT kLegendHdr = {20, 484, 20 + 344, 484 + 18};
 #define NROWS 11
-#define ROW_Y0   474
+#define ROW_Y0   510
 #define ROW_STEP 30
 // icon kind
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
@@ -3572,7 +3640,7 @@ static RECT row_btn_rect(int i) {
     return r;
 }
 
-static const RECT kFooterRect = {20, 818, 20 + 344, 818 + 18};
+static const RECT kFooterRect = {20, 854, 20 + 344, 854 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
@@ -3856,6 +3924,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        for (int i = 0; i < NSEARCH; i++) {
+            if (!PtInRect(&kSearchSeg[i], pt)) continue;
+            EnterCriticalSection(&g_cs);
+            g_cfg.search_mode = i;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         for (int i = 0; i < NFSKEYS; i++) {
             if (!PtInRect(&kFsSeg[i], pt)) continue;
             EnterCriticalSection(&g_cs);
@@ -3921,6 +3999,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(kToggleLabel[i]), g_br_main_dim);
                 g_rt_main->DrawText(L"Fullscreen", 10, g_tf_label,
                                     to_f(kFsLabelRect), g_br_main_dim);
+                g_rt_main->DrawText(L"Search", 6, g_tf_label,
+                                    to_f(kSearchLabelRect), g_br_main_dim);
                 g_rt_main->DrawText(L"Controls", 8, g_tf_label,
                                     to_f(kLegendHdr), g_br_main_text);
                 g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
@@ -4046,6 +4126,24 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
 
+            // Which search the keyboard-hold opens.
+            for (int i = 0; i < NSEARCH; i++) {
+                D2D1_ROUNDED_RECT rr =
+                    D2D1::RoundedRect(to_f(kSearchSeg[i]), 8.0f, 8.0f);
+                bool on = (c.search_mode == i);
+                if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
+                else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(kSearchName[i],
+                                        (UINT32)wcslen(kSearchName[i]),
+                                        g_tf_body, to_f(kSearchSeg[i]),
+                                        on ? (ID2D1Brush*)g_br_main_onacc
+                                           : g_br_main_dim);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+
             // Install button, only while HidHide is missing.
             if (g_hh == INVALID_HANDLE_VALUE) {
                 const RECT& r = kHidBtnRect;
@@ -4089,7 +4187,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GAMEPAD:
         switch (wp) {
         case GP_KB_TOGGLE:
-            if (g_kb_visible && g_kb_search) g_kb_search = false;
+            if (g_kb_visible) { g_kb_search = false; g_kb_external = false; }
             kb_toggle();
             break;
         case GP_KB_ENTER:
@@ -4100,6 +4198,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_kb_in_res = false;
                 if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
             }
+            break;
+        case GP_PT_SEARCH:
+            // Raise PowerToys, then put the keyboard up to type into it. The
+            // keyboard never takes focus, so what it types lands in whatever
+            // PowerToys just focused.
+            open_powertoys_search((int)lp);
+            g_kb_search = false;
+            if (!g_kb_visible) kb_toggle();
+            g_kb_external = true;
             break;
         case GP_RAD_SHOW: rad_show(true); break;
         case GP_RAD_SEL:
@@ -4113,6 +4220,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             send_fullscreen(g_rad_sel);
             break;
         case GP_KB_SEARCH:
+            g_kb_external = false;
             // Hold: open straight into search, or switch an already-open
             // keyboard over to it.
             if (g_kb_visible && !g_kb_search) kb_toggle();

@@ -44,11 +44,13 @@ the way video players expect — so it applies to the focused window.
 
 - **On-screen keyboard** — dark themed, animated, driven entirely by the
   controller. It never steals focus, so keys go to the app you're working in.
-- **Command search** — hold the keyboard button and it opens with a search bar.
-  It answers with installed apps, windows that are already open, a calculator
-  result, or a web search, and `>` before the query runs a command. D-pad up
-  from the top key row moves into the results, Cross acts on the highlighted
-  one. Apps come from the same Start Menu shortcuts Windows uses.
+- **Search on hold** — holding the keyboard button opens a search. With
+  PowerToys installed it summons **PowerToys Command Palette** (or PowerToys
+  Run) and the keyboard types into it, so you get the real launcher with its
+  own ranking, history and extensions; the shoulder buttons walk its results.
+  Without PowerToys it falls back to a built-in search covering installed
+  apps, open windows, a calculator, `>` to run a command, and a web search.
+  Which one is used is a setting.
 - **Game auto-pause** — detects fullscreen games (exclusive and borderless)
   and pauses the mapping so your sticks don't fight the game. Checked at most
   every 2 seconds with a couple of API calls; effectively zero cost. Can be
@@ -114,6 +116,7 @@ line). Settings written by older builds are moved there on first run.
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Shortcut sent on hold: 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial picker | `0` |
+| `search_mode` | Search opened on hold: 0 = built-in, 1 = PowerToys Command Palette, 2 = PowerToys Run | `1` if PowerToys is installed |
 
 ## License
 
