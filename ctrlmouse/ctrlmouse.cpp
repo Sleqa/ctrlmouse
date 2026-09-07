@@ -464,10 +464,8 @@ static volatile bool g_rad_visible = false;  // radial fullscreen picker
 // Keyboard open purely to type into someone else's search box, so its result
 // list is navigated rather than ours. Read by the worker, hence up here.
 static volatile bool g_kb_external = false;
-// Radial option layout: top, lower-right, lower-left. Declared here because
-// the worker maps stick direction onto these angles.
+// The three fullscreen shortcuts the flyout offers.
 #define NRADIAL 3
-static const float kRadAngle[NRADIAL] = {-1.5707963f, 0.5235988f, 2.6179939f};
 static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
 
 // --- Game detection / toggle-bind state (shared with the worker) -----------
@@ -1590,40 +1588,25 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 b = is_down(F_RCLICK);
                 dpad_prev = -1;
 
-                // Fullscreen is a hold. With the radial picker selected the
-                // hold instead opens the wheel, the left stick swings the
-                // selection round, and releasing fires it.
-                if (cfg.fullscreen_key == 3) {
-                    if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
-                        bnow - hold_t0[F_FULLSCREEN] >= 300) {
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
-                        hold_fired[F_FULLSCREEN] = true;
-                        radial_up = true;
-                    }
-                    if (radial_up && is_down(F_FULLSCREEN)) {
-                        // Pick by stick direction, ignoring small deflections
-                        // so a resting stick does not swing the selection.
-                        double sx = st.lx / 1000.0, sy = st.ly / 1000.0;
-                        if (sqrt(sx * sx + sy * sy) > 0.45) {
-                            double ang = atan2(sy, sx);
-                            int best = 0;
-                            double bestd = 99.0;
-                            for (int i = 0; i < NRADIAL; i++) {
-                                double d = fabs(atan2(sin(ang - kRadAngle[i]),
-                                                      cos(ang - kRadAngle[i])));
-                                if (d < bestd) { bestd = d; best = i; }
-                            }
-                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, best);
-                        }
-                    }
-                    if (radial_up && went_up(F_FULLSCREEN)) {
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
-                        radial_up = false;
-                    }
-                } else if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
-                           bnow - hold_t0[F_FULLSCREEN] >= 600) {
-                    send_fullscreen(cfg.fullscreen_key);
+                // Fullscreen is a hold: the flyout appears, the left stick
+                // slides the underline along it, and letting go sends the
+                // shortcut under it.
+                if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
+                    bnow - hold_t0[F_FULLSCREEN] >= 300) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
                     hold_fired[F_FULLSCREEN] = true;
+                    radial_up = true;
+                }
+                if (radial_up && is_down(F_FULLSCREEN)) {
+                    // Three zones across the stick, so a push lands on an
+                    // option directly rather than stepping through them.
+                    double sx = st.lx / 1000.0;
+                    int want = (sx < -0.33) ? 0 : (sx > 0.33 ? 2 : 1);
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, want);
+                }
+                if (radial_up && went_up(F_FULLSCREEN)) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
+                    radial_up = false;
                 }
                 // Play/pause is a tap. If it shares a button with fullscreen -
                 // as it does by default - it can only fire on release, once a
@@ -1925,6 +1908,8 @@ static ID2D1SolidColorBrush*  g_br_main_white = NULL;
 static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
 static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
 static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
+static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
+static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
 
 static ID2D1HwndRenderTarget* g_rt_kb = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_key = NULL;
@@ -2020,8 +2005,9 @@ static void d2d_release_main() {
                                    &g_br_main_toggle_off, &g_br_main_text,
                                    &g_br_main_dim, &g_br_main_white,
                                    &g_br_main_status, &g_br_main_glow,
-                                   &g_br_main_onacc};
-    for (int i = 0; i < 10; i++)
+                                   &g_br_main_onacc, &g_br_main_card,
+                                   &g_br_main_border};
+    for (int i = 0; i < 12; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
@@ -2039,6 +2025,10 @@ static bool d2d_create_main(HWND hwnd) {
     g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_glow);
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
+    // CardBackgroundFillColorDefault sits just above the page behind it.
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_main_card);
+    g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                     &g_br_main_border);
     return true;
 }
 
@@ -3069,95 +3059,44 @@ static void lx_nav(int dir) {
     if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
 }
 
-// --- Radial fullscreen picker -----------------------------------------------
-// Shown only while the fullscreen button is held: the left stick swings the
-// selection round and letting go fires it. Transient by design, unlike the
-// keyboard and launcher which toggle.
-#define RAD_W   288
-#define RAD_H   288
-#define RAD_HUB  84.0f   // the large dark centre
-#define RAD_RI   90.0f   // inner edge of the ring
-#define RAD_RO  132.0f   // outer edge of the ring
-#define RAD_RIM 140.0f   // thin outline enclosing everything
-#define RAD_GAP   0.012f // hairline of space between wedges
+// --- Fullscreen flyout ------------------------------------------------------
+// Shaped like one of Windows' own flyouts - a small rounded card near the
+// bottom of the screen - rather than a menu that takes over the middle. It is
+// only up while the button is held: the left stick slides the underline
+// between the options and letting go sends the one under it.
+#define FLY_W    390
+#define FLY_H     96
+#define FLY_PAD   16
+#define FLY_ITEMW ((FLY_W - FLY_PAD * 2) / NRADIAL)
+#define FLY_ANIM  140      // underline glide, ms
 
 static HWND g_rad = NULL;
 static int  g_rad_sel = 0;
+static int  g_rad_prev_sel = 0;
+static ULONGLONG g_rad_move_t0 = 0;
 static ID2D1DCRenderTarget* g_rt_rad = NULL;
 static HDC     g_rad_dc = NULL;      // memory DC holding the DIB below
 static HBITMAP g_rad_dib = NULL;
 static int     g_rad_w = 0, g_rad_h = 0;
-static ID2D1SolidColorBrush*  g_br_rad_face = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_card = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
-static ID2D1SolidColorBrush*  g_br_rad_onacc = NULL;
-static ID2D1SolidColorBrush*  g_br_rad_hub = NULL;
 
-// A donut wedge: out along one edge, round the outer arc, back in, round the
-// inner arc. Filled rather than stroked so the segments read as solid keys.
-static void fill_wedge(ID2D1RenderTarget* rt, float cx, float cy, float ri,
-                       float ro, float a0, float a1, ID2D1Brush* br) {
-    if (!g_d2d_factory) return;
-    ID2D1PathGeometry* g = NULL;
-    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
-    ID2D1GeometrySink* sink = NULL;
-    if (SUCCEEDED(g->Open(&sink)) && sink) {
-        D2D1_ARC_SIZE big = (a1 - a0) > 3.14159265f ? D2D1_ARC_SIZE_LARGE
-                                                    : D2D1_ARC_SIZE_SMALL;
-        D2D1_POINT_2F p0 = D2D1::Point2F(cx + cosf(a0) * ri, cy + sinf(a0) * ri);
-        D2D1_POINT_2F p1 = D2D1::Point2F(cx + cosf(a0) * ro, cy + sinf(a0) * ro);
-        D2D1_POINT_2F p2 = D2D1::Point2F(cx + cosf(a1) * ro, cy + sinf(a1) * ro);
-        D2D1_POINT_2F p3 = D2D1::Point2F(cx + cosf(a1) * ri, cy + sinf(a1) * ri);
-        sink->BeginFigure(p0, D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddLine(p1);
-        sink->AddArc(D2D1::ArcSegment(p2, D2D1::SizeF(ro, ro), 0.0f,
-                                      D2D1_SWEEP_DIRECTION_CLOCKWISE, big));
-        sink->AddLine(p3);
-        sink->AddArc(D2D1::ArcSegment(p0, D2D1::SizeF(ri, ri), 0.0f,
-                                      D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, big));
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        sink->Release();
-        rt->FillGeometry(g, br);
-    }
-    g->Release();
-}
+#define FLY_TIMER 3
 
-// Stroked arc, for the indicator riding the outer edge of the selection.
-static ID2D1StrokeStyle* g_rad_round = NULL;
-
-static void stroke_arc(ID2D1RenderTarget* rt, float cx, float cy, float r,
-                       float a0, float a1, ID2D1Brush* br, float width) {
-    if (!g_d2d_factory) return;
-    ID2D1PathGeometry* g = NULL;
-    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
-    ID2D1GeometrySink* sink = NULL;
-    if (SUCCEEDED(g->Open(&sink)) && sink) {
-        sink->BeginFigure(D2D1::Point2F(cx + cosf(a0) * r, cy + sinf(a0) * r),
-                          D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddArc(D2D1::ArcSegment(
-            D2D1::Point2F(cx + cosf(a1) * r, cy + sinf(a1) * r),
-            D2D1::SizeF(r, r), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-            (a1 - a0) > 3.14159265f ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
-        sink->EndFigure(D2D1_FIGURE_END_OPEN);
-        sink->Close();
-        sink->Release();
-        rt->DrawGeometry(g, br, width, g_rad_round);
-    }
-    g->Release();
+static float fly_item_cx(int i) {
+    return FLY_PAD + FLY_ITEMW * (i + 0.5f);
 }
 
 static void d2d_release_rad() {
-    if (g_rad_round) { g_rad_round->Release(); g_rad_round = NULL; }
+    ID2D1SolidColorBrush** bs[] = {&g_br_rad_card, &g_br_rad_sel, &g_br_rad_text,
+                                   &g_br_rad_dim, &g_br_rad_border};
+    for (int i = 0; i < 5; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
     if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
-    ID2D1SolidColorBrush** bs[] = {&g_br_rad_face, &g_br_rad_sel, &g_br_rad_text,
-                                   &g_br_rad_dim, &g_br_rad_border,
-                                   &g_br_rad_onacc, &g_br_rad_hub};
-    for (int i = 0; i < 7; i++)
-        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
 }
 
@@ -3173,32 +3112,21 @@ static bool d2d_create_rad() {
         return false;
     }
     g_rt_rad->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(58, 58, 58)), &g_br_rad_face);
+    // A shade above the flyout base, the way Windows' own flyouts sit.
+    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_rad_card);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_rad_onacc);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(32, 32, 32)), &g_br_rad_hub);
     g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
                                     &g_br_rad_border);
-    if (!g_rad_round)
-        g_d2d_factory->CreateStrokeStyle(
-            D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND),
-            NULL, 0, &g_rad_round);
     return true;
 }
 
-// Draw the wheel into the DIB and hand it to UpdateLayeredWindow.
-//
-// This shapes the window with per-pixel alpha rather than a window region.
-// A region on a layered window drags DWM onto a slow composition path for the
-// whole desktop - it cost most of the frame rate on the machine, not just in
-// this app - and it also gives a hard aliased edge. Per-pixel alpha is both
-// faster and smoother. It is available here, unlike on the keyboard, because
-// this popup never animates a whole-window fade.
+// Draw into the DIB and present with UpdateLayeredWindow, which is what gives
+// the card genuinely antialiased rounded corners over the desktop.
 static void rad_render() {
     if (!g_rad || !d2d_create_rad()) return;
-    int w = dip_to_px(RAD_W), h = dip_to_px(RAD_H);
+    int w = dip_to_px(FLY_W), h = dip_to_px(FLY_H);
     if (!g_rad_dib || g_rad_w != w || g_rad_h != h) {
         if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
         if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
@@ -3223,65 +3151,50 @@ static void rad_render() {
     RECT bind = {0, 0, w, h};
     if (FAILED(g_rt_rad->BindDC(g_rad_dc, &bind))) return;
     g_rt_rad->BeginDraw();
-    g_rt_rad->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the disc
-    float cx = RAD_W / 2.0f, cy = RAD_H / 2.0f;
-    const float half = 3.14159265f / NRADIAL - RAD_GAP;
+    g_rt_rad->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
 
-    // Disc, then the ring of wedges over it.
-    g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_RIM, RAD_RIM),
-                          g_br_rad_hub);
-    for (int i = 0; i < NRADIAL; i++)
-        if (i == g_rad_sel)
-            fill_wedge(g_rt_rad, cx, cy, RAD_RI, RAD_RO,
-                       kRadAngle[i] - half, kRadAngle[i] + half, g_br_rad_face);
-
-    for (int i = 0; i < NRADIAL; i++) {
-        float a = kRadAngle[i] + 3.14159265f / NRADIAL;
-        g_rt_rad->DrawLine(
-            D2D1::Point2F(cx + cosf(a) * RAD_RI, cy + sinf(a) * RAD_RI),
-            D2D1::Point2F(cx + cosf(a) * RAD_RO, cy + sinf(a) * RAD_RO),
-            g_br_rad_border, 1.0f);
-    }
-    stroke_arc(g_rt_rad, cx, cy, RAD_RO + 4.0f,
-               kRadAngle[g_rad_sel] - half, kRadAngle[g_rad_sel] + half,
-               g_br_rad_sel, 4.0f);
-    g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_RIM - 1,
-                                        RAD_RIM - 1), g_br_rad_border, 1.2f);
-    g_rt_rad->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_HUB, RAD_HUB),
-                          g_br_rad_hub);
-    g_rt_rad->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), RAD_HUB, RAD_HUB),
-                          g_br_rad_border, 1.0f);
+    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f, FLY_H - 0.5f);
+    g_rt_rad->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                                   g_br_rad_card);
+    g_rt_rad->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                                   g_br_rad_border, 1.0f);
 
     if (g_tf_body) {
+        D2D1_RECT_F t = D2D1::RectF(0, 12, FLY_W, 32);
         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        float rmid = (RAD_RI + RAD_RO) / 2;
+        g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_body, t, g_br_rad_dim);
         for (int i = 0; i < NRADIAL; i++) {
-            float lx = cx + cosf(kRadAngle[i]) * rmid;
-            float ly = cy + sinf(kRadAngle[i]) * rmid;
-            D2D1_RECT_F lr = D2D1::RectF(lx - 46, ly - 11, lx + 46, ly + 11);
+            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + (float)FLY_ITEMW * i, 40,
+                                         FLY_PAD + (float)FLY_ITEMW * (i + 1), 66);
             g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
-                               g_tf_body, lr,
+                               g_tf_body, ir,
                                i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
                                               : g_br_rad_dim);
         }
         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    if (g_tf_header) {
-        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        D2D1_RECT_F t = D2D1::RectF(cx - 62, cy - 22, cx + 62, cy + 24);
-        g_rt_rad->DrawText(kRadName[g_rad_sel],
-                           (UINT32)wcslen(kRadName[g_rad_sel]),
-                           g_tf_header, t, g_br_rad_text);
-        g_tf_header->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    // The underline glides to the new option rather than jumping, which is the
+    // part that makes it feel like a system flyout.
+    float t = 1.0f;
+    if (g_rad_move_t0) {
+        double e = (double)(GetTickCount64() - g_rad_move_t0) / FLY_ANIM;
+        t = (e >= 1.0) ? 1.0f : (float)(1.0 - pow(1.0 - e, 3));
     }
+    float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
+    float cx = from + (to - from) * t;
+    float halfw = FLY_ITEMW * 0.30f;
+    g_rt_rad->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(cx - halfw, 72, cx + halfw, 75.5f),
+                          1.8f, 1.8f),
+        g_br_rad_sel);
+
     if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
 
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
-                 wa.top + (wa.bottom - wa.top - h) / 2};
+                 wa.bottom - h - dip_to_px(72)};
     SIZE  size = {w, h};
     POINT src = {0, 0};
     BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
@@ -3292,15 +3205,23 @@ static void rad_render() {
 }
 
 static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // Content is pushed with UpdateLayeredWindow, so this window never paints
-    // itself; it only needs to release its resources on the way out.
+    if (msg == WM_TIMER) {
+        // Only runs while the underline is moving.
+        rad_render();
+        if (!g_rad_move_t0 || GetTickCount64() - g_rad_move_t0 >= FLY_ANIM) {
+            g_rad_move_t0 = 0;
+            g_rad_prev_sel = g_rad_sel;
+            KillTimer(hwnd, FLY_TIMER);
+        }
+        return 0;
+    }
     if (msg == WM_DESTROY) { d2d_release_rad(); return 0; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static void rad_show(bool on) {
     if (!on) {
-        if (g_rad) ShowWindow(g_rad, SW_HIDE);
+        if (g_rad) { KillTimer(g_rad, FLY_TIMER); ShowWindow(g_rad, SW_HIDE); }
         g_rad_visible = false;
         return;
     }
@@ -3309,20 +3230,34 @@ static void rad_show(bool on) {
         wc.lpfnWndProc = rad_proc;
         wc.hInstance = GetModuleHandleW(NULL);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.lpszClassName = L"ControllerMouseRadial";
+        wc.lpszClassName = L"ControllerMouseFlyout";
         RegisterClassW(&wc);
         g_rad = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            L"ControllerMouseRadial", L"", WS_POPUP, 0, 0,
-            dip_to_px(RAD_W), dip_to_px(RAD_H), g_hwnd, NULL,
+            L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
+            dip_to_px(FLY_W), dip_to_px(FLY_H), g_hwnd, NULL,
             GetModuleHandleW(NULL), NULL);
     }
     if (!g_rad) return;
+    g_rad_prev_sel = g_rad_sel;
+    g_rad_move_t0 = 0;
     rad_render();                     // positions and sizes the window too
     ShowWindow(g_rad, SW_SHOWNOACTIVATE);
     SetWindowPos(g_rad, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     g_rad_visible = true;
+}
+
+// Start the underline gliding to a newly chosen option.
+static void rad_select(int i) {
+    if (i == g_rad_sel || i < 0 || i >= NRADIAL) return;
+    g_rad_prev_sel = g_rad_sel;
+    g_rad_sel = i;
+    g_rad_move_t0 = GetTickCount64();
+    if (g_rad_visible && g_rad) {
+        SetTimer(g_rad, FLY_TIMER, 15, NULL);
+        rad_render();
+    }
 }
 
 // --- System tray -----------------------------------------------------------
@@ -3383,6 +3318,13 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 #define WIN_W 600
 #define PAD   24                  // left and right margin
 #define CONTENT (WIN_W - PAD * 2)
+// WinUI SettingsCard proportions: a rounded panel per setting, icon on the
+// left, title over description, the control on the right.
+#define CARD_R    4.0f
+#define CARD_H    62
+#define CARD_GAP  4
+#define CARD_ICON 44              // icon column inside a card
+#define CARD_CTRL 200             // control column on the right
 
 static const RECT kStatusRect = {PAD, 16, PAD + 420, 16 + 26};
 static const RECT kHideRect   = {PAD, 48, PAD + 380, 48 + 20};
@@ -3391,7 +3333,7 @@ static const RECT kHidBtnRect = {WIN_W - PAD - 92, 44, WIN_W - PAD, 44 + 26};
 // --- Pointer section --------------------------------------------------------
 #define SEC1_Y   88               // "POINTER" heading
 #define SLIDE_Y0 116              // first slider row
-#define SLIDE_STEP 52
+#define SLIDE_STEP (CARD_H + CARD_GAP)
 static const wchar_t* kTrackLabel[NTRACKS] = {
     L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
 static const wchar_t* kTrackDesc[NTRACKS] = {
@@ -3401,31 +3343,36 @@ static const wchar_t* kTrackDesc[NTRACKS] = {
     L"Higher means small stick movements stay slow, so you can aim precisely "
     L"without lowering the speed above."};
 
+static RECT card_rect(int y) {
+    RECT r = {PAD, y, PAD + CONTENT, y + CARD_H};
+    return r;
+}
+static RECT slide_card(int i)  { return card_rect(SLIDE_Y0 + i * SLIDE_STEP); }
 static RECT slide_label(int i) {
-    RECT r = {PAD, SLIDE_Y0 + i * SLIDE_STEP, PAD + 150,
-              SLIDE_Y0 + i * SLIDE_STEP + 18};
-    return r;
-}
-static RECT slide_value(int i) {
-    RECT r = {WIN_W - PAD - 64, SLIDE_Y0 + i * SLIDE_STEP, WIN_W - PAD,
-              SLIDE_Y0 + i * SLIDE_STEP + 18};
-    return r;
-}
-static RECT slide_track(int i) {
-    RECT r = {PAD + 162, SLIDE_Y0 + i * SLIDE_STEP - 4, WIN_W - PAD - 76,
-              SLIDE_Y0 + i * SLIDE_STEP + 24};
+    int y = SLIDE_Y0 + i * SLIDE_STEP;
+    RECT r = {PAD + CARD_ICON, y + 11, WIN_W - PAD - CARD_CTRL - 12, y + 29};
     return r;
 }
 static RECT slide_desc(int i) {
-    RECT r = {PAD, SLIDE_Y0 + i * SLIDE_STEP + 20, PAD + CONTENT,
-              SLIDE_Y0 + i * SLIDE_STEP + 38};
+    int y = SLIDE_Y0 + i * SLIDE_STEP;
+    RECT r = {PAD + CARD_ICON, y + 30, WIN_W - PAD - CARD_CTRL - 12, y + 48};
+    return r;
+}
+static RECT slide_track(int i) {
+    int y = SLIDE_Y0 + i * SLIDE_STEP;
+    RECT r = {WIN_W - PAD - CARD_CTRL, y + 18, WIN_W - PAD - 58, y + 44};
+    return r;
+}
+static RECT slide_value(int i) {
+    int y = SLIDE_Y0 + i * SLIDE_STEP;
+    RECT r = {WIN_W - PAD - 50, y + 22, WIN_W - PAD - 14, y + 40};
     return r;
 }
 
 // --- Behaviour section ------------------------------------------------------
 #define SEC2_Y  (SLIDE_Y0 + NTRACKS * SLIDE_STEP + 8)
 #define TOG_Y0  (SEC2_Y + 28)
-#define TOG_STEP 48
+#define TOG_STEP (CARD_H + CARD_GAP)
 #define NTOGGLES 3
 static const wchar_t* kToggleText[NTOGGLES] = {
     L"Mapping enabled", L"Pause while a game is running",
@@ -3436,51 +3383,44 @@ static const wchar_t* kToggleDesc[NTOGGLES] = {
     L"it while a game is open.",
     L"Launches minimised to the notification area when you sign in."};
 
+static RECT toggle_card(int i) { return card_rect(TOG_Y0 + i * TOG_STEP); }
 static RECT toggle_rect(int i) {
-    RECT r = {PAD, TOG_Y0 + i * TOG_STEP, PAD + 46, TOG_Y0 + i * TOG_STEP + 22};
+    int y = TOG_Y0 + i * TOG_STEP;
+    RECT r = {WIN_W - PAD - 62, y + 20, WIN_W - PAD - 16, y + 42};
     return r;
 }
 static RECT toggle_label(int i) {
-    RECT r = {PAD + 58, TOG_Y0 + i * TOG_STEP + 2, PAD + 400,
-              TOG_Y0 + i * TOG_STEP + 20};
+    int y = TOG_Y0 + i * TOG_STEP;
+    RECT r = {PAD + CARD_ICON, y + 11, WIN_W - PAD - 80, y + 29};
     return r;
 }
 static RECT toggle_desc(int i) {
-    RECT r = {PAD + 58, TOG_Y0 + i * TOG_STEP + 22, PAD + CONTENT,
-              TOG_Y0 + i * TOG_STEP + 40};
+    int y = TOG_Y0 + i * TOG_STEP;
+    RECT r = {PAD + CARD_ICON, y + 30, WIN_W - PAD - 80, y + 48};
     return r;
 }
 
 // Search: built-in list, or hand off to a launcher you already use.
-#define SEARCH_Y (TOG_Y0 + NTOGGLES * TOG_STEP + 4)
+#define SEARCH_Y (TOG_Y0 + NTOGGLES * TOG_STEP)
 #define NSEARCH 2
 static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
+static RECT search_card() { return card_rect(SEARCH_Y); }
 static RECT search_seg(int i) {
-    RECT r = {PAD + 162 + i * 96, SEARCH_Y, PAD + 162 + i * 96 + 90,
-              SEARCH_Y + 26};
+    RECT r = {WIN_W - PAD - 240 + i * 62, SEARCH_Y + 18,
+              WIN_W - PAD - 240 + i * 62 + 58, SEARCH_Y + 44};
     return r;
 }
 static RECT search_key_rect() {
-    RECT r = {PAD + 162 + NSEARCH * 96 + 12, SEARCH_Y,
-              PAD + 162 + NSEARCH * 96 + 12 + 120, SEARCH_Y + 26};
-    return r;
-}
-
-// Fullscreen shortcut, since the right one depends on the app.
-#define FS_Y (SEARCH_Y + 48)
-#define NFSKEYS 4
-static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Enter", L"F", L"Radial"};
-static RECT fs_seg(int i) {
-    RECT r = {PAD + 162 + i * 78, FS_Y, PAD + 162 + i * 78 + 72, FS_Y + 26};
+    RECT r = {WIN_W - PAD - 112, SEARCH_Y + 18, WIN_W - PAD - 8, SEARCH_Y + 44};
     return r;
 }
 
 // --- Controls section -------------------------------------------------------
 // Collapsible: eleven rows is most of the window, and it is only wanted while
 // rebinding something.
-#define SEC3_Y   (FS_Y + 48)
+#define SEC3_Y   (SEARCH_Y + CARD_H + 20)
 #define ROW_Y0   (SEC3_Y + 30)
-#define ROW_STEP 34
+#define ROW_STEP 38
 #define NROWS 11
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
        IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
@@ -3511,9 +3451,13 @@ static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2};
 
 static bool g_controls_open = false;
 
+static RECT row_card(int i)  { RECT r = {PAD, ROW_Y0 + i * ROW_STEP,
+                                         PAD + CONTENT,
+                                         ROW_Y0 + i * ROW_STEP + 34};
+                               return r; }
 static RECT row_btn_rect(int i) {
     int y = ROW_Y0 + i * ROW_STEP;
-    RECT r = {WIN_W - PAD - 120, y, WIN_W - PAD, y + 26};
+    RECT r = {WIN_W - PAD - 126, y + 4, WIN_W - PAD - 10, y + 30};
     return r;
 }
 static RECT sec3_header() {
@@ -3523,7 +3467,7 @@ static RECT sec3_header() {
 
 static int win_height() {
     int h = SEC3_Y + 30;
-    if (g_controls_open) h += NROWS * ROW_STEP + 8;
+    if (g_controls_open) h += NROWS * ROW_STEP + 10;
     return h + 20;
 }
 
@@ -3872,16 +3816,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        for (int i = 0; i < NFSKEYS; i++) {
-            { RECT t = fs_seg(i); if (!PtInRect(&t, pt)) continue; }
-            EnterCriticalSection(&g_cs);
-            g_cfg.fullscreen_key = i;
-            Config c = g_cfg;
-            LeaveCriticalSection(&g_cs);
-            save_config(c);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
         if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&kHidBtnRect, pt)) {
             // Open the download page only; installing a driver is the user's
             // decision to make in their own browser.
@@ -3923,6 +3857,42 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_rt_main->DrawText(g_status_txt, (UINT32)wcslen(g_status_txt),
                                     g_tf_header, to_f(kStatusRect), g_br_main_status);
 
+            // Cards first, so every label and control lands on one.
+            for (int i = 0; i < NTRACKS; i++)
+                draw_control(g_rt_main, to_f(slide_card(i)), CARD_R,
+                             g_br_main_card, g_br_main_border);
+            for (int i = 0; i < NTOGGLES; i++)
+                draw_control(g_rt_main, to_f(toggle_card(i)), CARD_R,
+                             g_br_main_card, g_br_main_border);
+            draw_control(g_rt_main, to_f(search_card()), CARD_R,
+                         g_br_main_card, g_br_main_border);
+            for (int i = 0; g_controls_open && i < NROWS; i++)
+                draw_control(g_rt_main, to_f(row_card(i)), CARD_R,
+                             g_br_main_card, g_br_main_border);
+            {
+                // A small glyph on the left of each card, as WinUI does.
+                const int slideIcon[NTRACKS] = {IC_LCLICK, IC_SCRUB, IC_POWER,
+                                                IC_FORWARD};
+                for (int i = 0; i < NTRACKS; i++) {
+                    RECT c = slide_card(i);
+                    draw_feature_icon(g_rt_main, (float)(c.left + 24),
+                                      (float)((c.top + c.bottom) / 2),
+                                      slideIcon[i], g_br_main_dim, g_br_main_dim);
+                }
+                const int togIcon[NTOGGLES] = {IC_POWER, IC_FULLSCREEN,
+                                               IC_LAUNCHER};
+                for (int i = 0; i < NTOGGLES; i++) {
+                    RECT c = toggle_card(i);
+                    draw_feature_icon(g_rt_main, (float)(c.left + 24),
+                                      (float)((c.top + c.bottom) / 2),
+                                      togIcon[i], g_br_main_dim, g_br_main_dim);
+                }
+                RECT sc = search_card();
+                draw_feature_icon(g_rt_main, (float)(sc.left + 24),
+                                  (float)((sc.top + sc.bottom) / 2),
+                                  IC_KEYBOARD, g_br_main_dim, g_br_main_dim);
+            }
+
             // Section labels (were native STATIC controls; now DirectWrite so
             // they stay sharp at any DPI).
             if (g_tf_label) {
@@ -3943,12 +3913,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
                                         g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
 
-                RECT sl = {PAD, SEARCH_Y + 3, PAD + 150, SEARCH_Y + 21};
+                RECT sl = {PAD + CARD_ICON, SEARCH_Y + 11,
+                           WIN_W - PAD - 250, SEARCH_Y + 29};
                 g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
                                     g_br_main_text);
-                RECT fl = {PAD, FS_Y + 3, PAD + 150, FS_Y + 21};
-                g_rt_main->DrawText(L"Fullscreen key", 14, g_tf_label, to_f(fl),
-                                    g_br_main_text);
+                RECT sd = {PAD + CARD_ICON, SEARCH_Y + 30,
+                           WIN_W - PAD - 250, SEARCH_Y + 48};
+                const wchar_t* sdt = (c.search_mode == 1)
+                    ? L"Presses your hotkey to open the launcher you already use."
+                    : L"Shows a simple list of your installed apps.";
+                g_rt_main->DrawText(sdt, (UINT32)wcslen(sdt), g_tf_label,
+                                    to_f(sd), g_br_main_dim);
 
                 // Section headings.
                 RECT s1 = {PAD, SEC1_Y, PAD + CONTENT, SEC1_Y + 20};
@@ -3970,16 +3945,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // Feature rows: icon, name, what it does, and its binding.
             for (int i = 0; g_controls_open && i < NROWS; i++) {
-                float cy = (float)(ROW_Y0 + i * ROW_STEP) + 13.0f;
+                float cy = (float)(ROW_Y0 + i * ROW_STEP) + 17.0f;
                 int f = kRowFeature[i];
-                draw_feature_icon(g_rt_main, 36.0f, cy, kRowIcon[i],
+                draw_feature_icon(g_rt_main, (float)(PAD + 22), cy, kRowIcon[i],
                                   g_br_main_sel, g_br_main_dim);
                 if (g_tf_label) {
                     int y = ROW_Y0 + i * ROW_STEP;
-                    RECT nr = {58, y + 1, 58 + 180, y + 19};
+                    RECT nr = {PAD + CARD_ICON, y + 2, PAD + CARD_ICON + 200,
+                               y + 20};
                     g_rt_main->DrawText(kRowName[i], (UINT32)wcslen(kRowName[i]),
                                         g_tf_label, to_f(nr), g_br_main_text);
-                    RECT dr = {58, y + 16, WIN_W - PAD - 132, y + 32};
+                    RECT dr = {PAD + CARD_ICON, y + 17, WIN_W - PAD - 136,
+                               y + 33};
                     g_rt_main->DrawText(kRowDesc[i], (UINT32)wcslen(kRowDesc[i]),
                                         g_tf_label, to_f(dr), g_br_main_dim);
                 }
@@ -4072,23 +4049,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
 
-            // Fullscreen shortcut picker: selected segment is filled, the
-            // others are outlined.
-            for (int i = 0; i < NFSKEYS; i++) {
-                D2D1_ROUNDED_RECT rr =
-                    D2D1::RoundedRect(to_f(fs_seg(i)), 8.0f, 8.0f);
-                bool on = (c.fullscreen_key == i);
-                if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
-                else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
-                if (g_tf_body) {
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(kFsName[i], (UINT32)wcslen(kFsName[i]),
-                                        g_tf_body, to_f(fs_seg(i)),
-                                        on ? (ID2D1Brush*)g_br_main_onacc
-                                           : g_br_main_dim);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
-            }
 
             // Which search the keyboard-hold opens.
             for (int i = 0; i < NSEARCH; i++) {
@@ -4192,17 +4152,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_kb_visible) kb_toggle();
             g_kb_external = true;
             break;
-        case GP_RAD_SHOW: rad_show(true); break;
-        case GP_RAD_SEL:
-            if (g_rad_sel != (int)lp) {
-                g_rad_sel = (int)lp;
-                if (g_rad_visible) rad_render();
-            }
+        case GP_RAD_SHOW:
+            g_rad_sel = get_cfg().fullscreen_key;
+            if (g_rad_sel < 0 || g_rad_sel >= NRADIAL) g_rad_sel = 0;
+            rad_show(true);
             break;
-        case GP_RAD_PICK:
+        case GP_RAD_SEL:
+            rad_select((int)lp);
+            break;
+        case GP_RAD_PICK: {
             rad_show(false);
             send_fullscreen(g_rad_sel);
+            // Remember it, so the flyout opens on the last one used.
+            EnterCriticalSection(&g_cs);
+            g_cfg.fullscreen_key = g_rad_sel;
+            Config fc = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(fc);
             break;
+        }
         case GP_KB_SEARCH:
             g_kb_external = false;
             // Hold: open straight into search, or switch an already-open
