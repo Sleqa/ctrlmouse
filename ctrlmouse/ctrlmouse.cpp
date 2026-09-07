@@ -3359,16 +3359,14 @@ static void d2d_release_rad() {
 static bool d2d_create_rad(HWND hwnd) {
     if (g_rt_rad) return true;
     if (!g_d2d_factory) return false;
-    // DWMSBT_TRANSIENTWINDOW: the flyout material Windows itself uses for a
-    // popup like this one, distinct from the flatter main-window Mica.
-    if (mica_create(g_mica_rad, hwnd, 3 /*DWMSBT_TRANSIENTWINDOW*/)) {
+    // DWMSBT_MAINWINDOW: the same backdrop the settings window uses. The
+    // transient/tooltip backdrop and window-corner-preference combination
+    // tried here first painted as a solid white plate instead of Mica - a
+    // WS_EX_TOOLWINDOW popup with no caption is not the window shape DWM
+    // expects for either of those, apparently. The shape still comes from
+    // our own alpha mask below either way, so nothing here needs it.
+    if (mica_create(g_mica_rad, hwnd, 2 /*DWMSBT_MAINWINDOW*/)) {
         g_rt_rad = g_mica_rad.dc;
-        // The window rectangle almost exactly is the card, so rounding the
-        // window itself is what keeps the backdrop material from filling the
-        // corners our own drawing leaves transparent.
-        DWORD pref = 2;  // DWMWCP_ROUND
-        DwmSetWindowAttribute(hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/,
-                              &pref, sizeof(pref));
     } else {
         D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_DEFAULT,
