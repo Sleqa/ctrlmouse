@@ -17,6 +17,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
 #include <dinput.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -2069,23 +2072,27 @@ static void d2d_release_main() {
 }
 
 // --- Mica backdrop ----------------------------------------------------------
-// The settings window would rather be a Mica window than a flat dark panel.
-// That needs the window pixels to be genuinely translucent, which an
-// ID2D1HwndRenderTarget cannot do - it always presents opaque. So this window
-// renders through a composition swap chain hosted on a DirectComposition
-// visual, the way WinUI does it: we clear to transparent, DWM draws the Mica
-// material behind us, and the cards sit on top as translucent layers.
+// A plain HWND render target always presents opaque, so any window that
+// wants Mica behind it - the settings window, and now the flyout - renders
+// through a composition swap chain hosted on a DirectComposition visual
+// instead, the way WinUI does it: clear to transparent, DWM draws the Mica
+// material behind that, and the content sits on top as translucent layers.
+// Bundled into one struct since more than one window does this now.
 //
-// Every step degrades to the plain opaque render target if it fails, which is
-// what happens on Windows 10, so nothing here is load-bearing.
-static ID3D11Device*        g_d3d = NULL;
-static ID2D1Device*         g_d2d_dev = NULL;
-static ID2D1DeviceContext*  g_dc_main = NULL;
-static IDXGISwapChain1*     g_swap = NULL;
-static IDCompositionDevice* g_dcomp = NULL;
-static IDCompositionTarget* g_dcomp_target = NULL;
-static IDCompositionVisual* g_dcomp_visual = NULL;
-static bool g_mica = false;
+// Every step degrades to the caller's plain opaque render target if it
+// fails, which is what happens on Windows 10, so nothing here is
+// load-bearing.
+struct MicaSurface {
+    ID3D11Device*        d3d = NULL;
+    ID2D1Device*         d2d_dev = NULL;
+    ID2D1DeviceContext*  dc = NULL;
+    IDXGISwapChain1*     swap = NULL;
+    IDCompositionDevice* dcomp = NULL;
+    IDCompositionTarget* dcomp_target = NULL;
+    IDCompositionVisual* dcomp_visual = NULL;
+    bool active = false;
+};
+
 static bool g_mica_capable = false;   // decided at startup; see WinMain
 
 // DWMWA_SYSTEMBACKDROP_TYPE only does anything from the Windows 11 22H2
@@ -2105,38 +2112,45 @@ static bool os_supports_mica() {
     return ok && _wtoi(buf) >= 22621;
 }
 
-static void mica_release() {
-    if (g_dc_main) g_dc_main->SetTarget(NULL);
-    if (g_dcomp_visual) { g_dcomp_visual->Release(); g_dcomp_visual = NULL; }
-    if (g_dcomp_target) { g_dcomp_target->Release(); g_dcomp_target = NULL; }
-    if (g_dcomp) { g_dcomp->Release(); g_dcomp = NULL; }
-    if (g_swap) { g_swap->Release(); g_swap = NULL; }
-    if (g_dc_main) { g_dc_main->Release(); g_dc_main = NULL; }
-    if (g_d2d_dev) { g_d2d_dev->Release(); g_d2d_dev = NULL; }
-    if (g_d3d) { g_d3d->Release(); g_d3d = NULL; }
-    g_mica = false;
+static void mica_release(MicaSurface& m) {
+    if (m.dc) m.dc->SetTarget(NULL);
+    if (m.dcomp_visual) { m.dcomp_visual->Release(); m.dcomp_visual = NULL; }
+    if (m.dcomp_target) { m.dcomp_target->Release(); m.dcomp_target = NULL; }
+    if (m.dcomp) { m.dcomp->Release(); m.dcomp = NULL; }
+    if (m.swap) { m.swap->Release(); m.swap = NULL; }
+    if (m.dc) { m.dc->Release(); m.dc = NULL; }
+    if (m.d2d_dev) { m.d2d_dev->Release(); m.d2d_dev = NULL; }
+    if (m.d3d) { m.d3d->Release(); m.d3d = NULL; }
+    m.active = false;
 }
 
-// Point the device context at the swap chain current back buffer.
-static bool mica_bind_target() {
+// Point the device context at the swap chain's current back buffer. Needed
+// every frame, not just on create/resize: the flip model rotates which
+// physical buffer GetBuffer(0) hands back on every Present, so a target
+// bound once would draw onto a buffer that isn't the one about to be shown
+// every other frame.
+static bool mica_bind_target(MicaSurface& m) {
     IDXGISurface* surf = NULL;
-    if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&surf)))) return false;
+    if (FAILED(m.swap->GetBuffer(0, IID_PPV_ARGS(&surf)))) return false;
     D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                           D2D1_ALPHA_MODE_PREMULTIPLIED),
         (float)g_dpi, (float)g_dpi);
     ID2D1Bitmap1* bmp = NULL;
-    HRESULT hr = g_dc_main->CreateBitmapFromDxgiSurface(surf, &bp, &bmp);
+    HRESULT hr = m.dc->CreateBitmapFromDxgiSurface(surf, &bp, &bmp);
     surf->Release();
     if (FAILED(hr)) return false;
-    g_dc_main->SetTarget(bmp);
+    m.dc->SetTarget(bmp);
     bmp->Release();
-    g_dc_main->SetDpi((float)g_dpi, (float)g_dpi);
+    m.dc->SetDpi((float)g_dpi, (float)g_dpi);
     return true;
 }
 
-static bool mica_create(HWND hwnd) {
+// backdrop: DWMSBT_MAINWINDOW (2) for a normal window, DWMSBT_TRANSIENTWINDOW
+// (3) for a popup like the flyout - transient windows get Mica's own
+// drop-shadowed "acrylic-ish" look rather than the flatter main-window one.
+static bool mica_create(MicaSurface& m, HWND hwnd, int backdrop) {
     if (!g_mica_capable || !g_d2d_factory) return false;
     // DirectComposition only ships on Windows 8 and later, and the backdrop
     // attribute only does anything on Windows 11, so both are late-bound.
@@ -2150,12 +2164,12 @@ static bool mica_create(HWND hwnd) {
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL got;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags,
-                                 NULL, 0, D3D11_SDK_VERSION, &g_d3d, &got,
+                                 NULL, 0, D3D11_SDK_VERSION, &m.d3d, &got,
                                  NULL)))
         return false;
     IDXGIDevice* dxgi_dev = NULL;
-    if (FAILED(g_d3d->QueryInterface(IID_PPV_ARGS(&dxgi_dev)))) {
-        mica_release();
+    if (FAILED(m.d3d->QueryInterface(IID_PPV_ARGS(&dxgi_dev)))) {
+        mica_release(m);
         return false;
     }
 
@@ -2163,9 +2177,9 @@ static bool mica_create(HWND hwnd) {
     IDXGIAdapter* adapter = NULL;
     IDXGIFactory2* dxgi_factory = NULL;
     do {
-        if (FAILED(g_d2d_factory->CreateDevice(dxgi_dev, &g_d2d_dev))) break;
-        if (FAILED(g_d2d_dev->CreateDeviceContext(
-                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_dc_main))) break;
+        if (FAILED(g_d2d_factory->CreateDevice(dxgi_dev, &m.d2d_dev))) break;
+        if (FAILED(m.d2d_dev->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &m.dc))) break;
 
         if (FAILED(dxgi_dev->GetAdapter(&adapter))) break;
         if (FAILED(adapter->GetParent(IID_PPV_ARGS(&dxgi_factory)))) break;
@@ -2182,52 +2196,53 @@ static bool mica_create(HWND hwnd) {
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;   // the whole point
         if (FAILED(dxgi_factory->CreateSwapChainForComposition(
-                dxgi_dev, &sd, NULL, &g_swap))) break;
+                dxgi_dev, &sd, NULL, &m.swap))) break;
 
-        if (FAILED(create_dev(dxgi_dev, IID_PPV_ARGS(&g_dcomp)))) break;
-        if (FAILED(g_dcomp->CreateTargetForHwnd(hwnd, TRUE, &g_dcomp_target)))
+        if (FAILED(create_dev(dxgi_dev, IID_PPV_ARGS(&m.dcomp)))) break;
+        if (FAILED(m.dcomp->CreateTargetForHwnd(hwnd, TRUE, &m.dcomp_target)))
             break;
-        if (FAILED(g_dcomp->CreateVisual(&g_dcomp_visual))) break;
-        if (FAILED(g_dcomp_visual->SetContent(g_swap))) break;
-        if (FAILED(g_dcomp_target->SetRoot(g_dcomp_visual))) break;
-        if (FAILED(g_dcomp->Commit())) break;
-        if (!mica_bind_target()) break;
+        if (FAILED(m.dcomp->CreateVisual(&m.dcomp_visual))) break;
+        if (FAILED(m.dcomp_visual->SetContent(m.swap))) break;
+        if (FAILED(m.dcomp_target->SetRoot(m.dcomp_visual))) break;
+        if (FAILED(m.dcomp->Commit())) break;
+        if (!mica_bind_target(m)) break;
         ok = true;
     } while (0);
 
     if (dxgi_factory) dxgi_factory->Release();
     if (adapter) adapter->Release();
     dxgi_dev->Release();
-    if (!ok) { mica_release(); return false; }
+    if (!ok) { mica_release(m); return false; }
 
-    // DWMSBT_MAINWINDOW. Pre-22H2 builds reject the attribute and would leave
-    // us with a see-through window, so check rather than assume.
-    int backdrop = 2;
+    // Pre-22H2 builds reject the attribute and would leave us with a
+    // see-through window, so check rather than assume.
     if (FAILED(DwmSetWindowAttribute(hwnd, 38 /*SYSTEMBACKDROP_TYPE*/,
                                      &backdrop, sizeof(backdrop)))) {
-        mica_release();
+        mica_release(m);
         return false;
     }
-    g_dc_main->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    m.dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     // ClearType has no background to blend against on a transparent target,
-    // so this page gets grayscale antialiasing.
-    g_dc_main->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    g_mica = true;
+    // so this surface gets grayscale antialiasing.
+    m.dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    m.active = true;
     return true;
 }
 
-static void mica_resize(UINT px_w, UINT px_h) {
-    if (!g_mica || !g_swap) return;
-    g_dc_main->SetTarget(NULL);
-    if (FAILED(g_swap->ResizeBuffers(0, px_w ? px_w : 1, px_h ? px_h : 1,
+static void mica_resize(MicaSurface& m, UINT px_w, UINT px_h) {
+    if (!m.active || !m.swap) return;
+    m.dc->SetTarget(NULL);
+    if (FAILED(m.swap->ResizeBuffers(0, px_w ? px_w : 1, px_h ? px_h : 1,
                                      DXGI_FORMAT_UNKNOWN, 0)))
         return;
-    mica_bind_target();
+    mica_bind_target(m);
 }
 
+static MicaSurface g_mica_main;
+
 static bool d2d_create_main(HWND hwnd) {
-    if (mica_create(hwnd)) {
-        g_rt_main = g_dc_main;
+    if (mica_create(g_mica_main, hwnd, 2 /*DWMSBT_MAINWINDOW*/)) {
+        g_rt_main = g_mica_main.dc;
     } else {
         g_rt_main_hwnd = d2d_create_rt(hwnd, false);
         g_rt_main = g_rt_main_hwnd;
@@ -2245,7 +2260,7 @@ static bool d2d_create_main(HWND hwnd) {
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
     // CardBackgroundFillColorDefault sits just above the page behind it -
     // as a translucent layer over Mica, as a solid colour without it.
-    if (g_mica)
+    if (g_mica_main.active)
         g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
                                          &g_br_main_card);
     else
@@ -3303,8 +3318,10 @@ static int  g_rad_sel = 0;
 static int  g_rad_prev_sel = 0;
 static ULONGLONG g_rad_move_t0 = 0;
 static ULONGLONG g_rad_in_t0 = 0;
-static ID2D1DCRenderTarget* g_rt_rad = NULL;
-static HDC     g_rad_dc = NULL;      // memory DC holding the DIB below
+static MicaSurface g_mica_rad;
+static ID2D1RenderTarget*   g_rt_rad = NULL;     // Mica DC, or the fallback one
+static ID2D1DCRenderTarget* g_rt_rad_dc = NULL;  // fallback path only
+static HDC     g_rad_dc = NULL;      // fallback path: memory DC holding the DIB
 static HBITMAP g_rad_dib = NULL;
 static int     g_rad_w = 0, g_rad_h = 0;
 static ID2D1SolidColorBrush*  g_br_rad_card = NULL;
@@ -3333,23 +3350,46 @@ static void d2d_release_rad() {
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
     if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
-    if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
+    if (g_rt_rad_dc) { g_rt_rad_dc->Release(); g_rt_rad_dc = NULL; }
+    if (g_mica_rad.active) mica_release(g_mica_rad);
+    g_rt_rad = NULL;
+    g_rad_w = g_rad_h = 0;
 }
 
-static bool d2d_create_rad() {
+static bool d2d_create_rad(HWND hwnd) {
     if (g_rt_rad) return true;
     if (!g_d2d_factory) return false;
-    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-        (float)g_dpi, (float)g_dpi);
-    if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &g_rt_rad))) {
-        g_rt_rad = NULL;
-        return false;
+    // DWMSBT_TRANSIENTWINDOW: the flyout material Windows itself uses for a
+    // popup like this one, distinct from the flatter main-window Mica.
+    if (mica_create(g_mica_rad, hwnd, 3 /*DWMSBT_TRANSIENTWINDOW*/)) {
+        g_rt_rad = g_mica_rad.dc;
+        // The window rectangle almost exactly is the card, so rounding the
+        // window itself is what keeps the backdrop material from filling the
+        // corners our own drawing leaves transparent.
+        DWORD pref = 2;  // DWMWCP_ROUND
+        DwmSetWindowAttribute(hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/,
+                              &pref, sizeof(pref));
+    } else {
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+            (float)g_dpi, (float)g_dpi);
+        if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &g_rt_rad_dc))) {
+            g_rt_rad_dc = NULL;
+            return false;
+        }
+        g_rt_rad = g_rt_rad_dc;
     }
+    if (!g_rt_rad) return false;
     g_rt_rad->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    // A shade above the flyout base, the way Windows' own flyouts sit.
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)), &g_br_rad_card);
+    // CardBackgroundFillColorDefault: translucent over Mica, solid without.
+    if (g_mica_rad.active)
+        g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
+                                        &g_br_rad_card);
+    else
+        g_rt_rad->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)),
+                                        &g_br_rad_card);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
     g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
@@ -3358,36 +3398,16 @@ static bool d2d_create_rad() {
     return true;
 }
 
-// Draw into the DIB and present with UpdateLayeredWindow, which is what gives
-// the card genuinely antialiased rounded corners over the desktop.
-static void rad_render() {
-    if (!g_rad || !d2d_create_rad()) return;
-    int w = dip_to_px(FLY_W), h = dip_to_px(FLY_H);
-    if (!g_rad_dib || g_rad_w != w || g_rad_h != h) {
-        if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
-        if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
-        BITMAPINFO bi = {};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;          // top-down
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        void* bits = NULL;
-        HDC screen = GetDC(NULL);
-        g_rad_dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-        g_rad_dc = CreateCompatibleDC(screen);
-        ReleaseDC(NULL, screen);
-        if (!g_rad_dib || !g_rad_dc) return;
-        SelectObject(g_rad_dc, g_rad_dib);
-        g_rad_w = w;
-        g_rad_h = h;
-    }
-
-    RECT bind = {0, 0, w, h};
-    if (FAILED(g_rt_rad->BindDC(g_rad_dc, &bind))) return;
-    g_rt_rad->BeginDraw();
+// Lays out the card into whichever render target is bound (the Mica swap
+// chain, or the fallback DC one) - everything here is identical between the
+// two paths, only how the result reaches the screen differs.
+static void rad_draw(float in) {
     g_rt_rad->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
+
+    ID2D1SolidColorBrush* bs[] = {g_br_rad_card, g_br_rad_border, g_br_rad_text,
+                                  g_br_rad_dim, g_br_rad_sel};
+    for (int i = 0; i < 5; i++)
+        if (bs[i]) bs[i]->SetOpacity(in);
 
     D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f, FLY_H - 0.5f);
     g_rt_rad->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
@@ -3411,8 +3431,8 @@ static void rad_render() {
         g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
-    // The underline glides to the new option rather than jumping, which is the
-    // part that makes it feel like a system flyout.
+    // The underline glides to the new option rather than jumping, which is
+    // the part that makes it feel like a system flyout.
     float t = ease_out(g_rad_move_t0, FLY_ANIM);
     float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
     float cx = from + (to - from) * t;
@@ -3421,15 +3441,67 @@ static void rad_render() {
         D2D1::RoundedRect(D2D1::RectF(cx - halfw, 72, cx + halfw, 75.5f),
                           1.8f, 1.8f),
         g_br_rad_sel);
+}
 
-    if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
-
+static void rad_render() {
+    if (!g_rad || !d2d_create_rad(g_rad)) return;
+    int w = dip_to_px(FLY_W), h = dip_to_px(FLY_H);
     float in = ease_out(g_rad_in_t0, FLY_IN);
+
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
                  wa.bottom - h - dip_to_px(72) +
                      (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
+
+    if (g_mica_rad.active) {
+        if (g_rad_w != w || g_rad_h != h) {
+            mica_resize(g_mica_rad, w, h);
+            g_rad_w = w;
+            g_rad_h = h;
+        }
+        mica_bind_target(g_mica_rad);
+        SetWindowPos(g_rad, HWND_TOPMOST, pos.x, pos.y, w, h, SWP_NOACTIVATE);
+        g_rt_rad->BeginDraw();
+        rad_draw(in);
+        g_rt_rad->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (g_rt_rad->EndDraw() != D2DERR_RECREATE_TARGET)
+            g_mica_rad.swap->Present(1, 0);
+        else
+            d2d_release_rad();
+        return;
+    }
+
+    // Fallback: draw into the DIB and present with UpdateLayeredWindow, which
+    // is what gives the card antialiased rounded corners over the desktop
+    // without DirectComposition.
+    if (!g_rad_dib || g_rad_w != w || g_rad_h != h) {
+        if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
+        if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;          // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HDC screen = GetDC(NULL);
+        g_rad_dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        g_rad_dc = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+        if (!g_rad_dib || !g_rad_dc) return;
+        SelectObject(g_rad_dc, g_rad_dib);
+        g_rad_w = w;
+        g_rad_h = h;
+    }
+
+    RECT bind = {0, 0, w, h};
+    if (FAILED(g_rt_rad_dc->BindDC(g_rad_dc, &bind))) return;
+    g_rt_rad->BeginDraw();
+    rad_draw(1.0f);   // whole-window alpha handles the fade instead
+    if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
+
     SIZE  size = {w, h};
     POINT src = {0, 0};
     BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)(255 * in), AC_SRC_ALPHA};
@@ -3441,7 +3513,7 @@ static void rad_render() {
 
 static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_TIMER) {
-        // Only runs while the underline is moving.
+        // Only runs while the underline is moving or the flyout is fading in.
         rad_render();
         ULONGLONG now = GetTickCount64();
         bool moving = g_rad_move_t0 && now - g_rad_move_t0 < FLY_ANIM;
@@ -3468,9 +3540,15 @@ static void rad_show(bool on) {
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.lpszClassName = L"ControllerMouseFlyout";
         RegisterClassW(&wc);
+        // Mica is presented through DirectComposition, which needs the
+        // window created without its own redirection surface; the fallback
+        // path instead presents through UpdateLayeredWindow, which needs the
+        // opposite (WS_EX_LAYERED). Which one depends on whether Mica will
+        // actually be attempted, decided once at startup.
+        DWORD ex = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+                   (g_mica_capable ? WS_EX_NOREDIRECTIONBITMAP : WS_EX_LAYERED);
         g_rad = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
+            ex, L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
             dip_to_px(FLY_W), dip_to_px(FLY_H), g_hwnd, NULL,
             GetModuleHandleW(NULL), NULL);
     }
@@ -3997,7 +4075,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (g_mica) mica_resize(LOWORD(lp), HIWORD(lp));
+        if (g_mica_main.active) mica_resize(g_mica_main, LOWORD(lp), HIWORD(lp));
         else if (g_rt_main_hwnd)
             g_rt_main_hwnd->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
         g_cw = px_to_dip(LOWORD(lp));
@@ -4147,11 +4225,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // draws onto a buffer that isn't the one about to be shown, and the
         // one actually presented still has last frame's (or the initial,
         // blank white) content on it.
-        if (g_mica) mica_bind_target();
+        if (g_mica_main.active) mica_bind_target(g_mica_main);
         if (g_rt_main) {
             g_rt_main->BeginDraw();
-            g_rt_main->Clear(g_mica ? D2D1::ColorF(0, 0.0f)
-                                    : d2d_clr(KB_CLR_BG));
+            g_rt_main->Clear(g_mica_main.active ? D2D1::ColorF(0, 0.0f)
+                                                : d2d_clr(KB_CLR_BG));
             g_rt_main->SetTransform(
                 D2D1::Matrix3x2F::Translation(0.0f, -(float)g_scroll));
             Config c = get_cfg();
@@ -4413,7 +4491,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             g_rt_main->SetTransform(D2D1::Matrix3x2F::Identity());
             HRESULT hr = g_rt_main->EndDraw();
-            if (g_mica && g_swap && SUCCEEDED(hr)) g_swap->Present(1, 0);
+            if (g_mica_main.active && SUCCEEDED(hr))
+                g_mica_main.swap->Present(1, 0);
             if (hr == D2DERR_RECREATE_TARGET) d2d_release_main();
         }
         EndPaint(hwnd, &ps);
@@ -4759,9 +4838,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // No redirection surface when Mica will be attempted: its content is
     // presented through DirectComposition instead, and leaving the normal
     // one in place is what showed through as a white window.
-#ifndef WS_EX_NOREDIRECTIONBITMAP
-#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
-#endif
     DWORD ex = g_mica_capable ? WS_EX_NOREDIRECTIONBITMAP : 0;
     g_hwnd = CreateWindowExW(
         ex, CLASS_NAME, L"ControllerMouse", style,
