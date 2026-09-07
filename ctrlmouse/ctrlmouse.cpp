@@ -64,10 +64,11 @@ extern "C" {
 // Every controller action is rebindable. Fullscreen and the launcher are hold
 // actions; the rest act on press or while held.
 enum { F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
-       F_LAUNCHER, F_TOGGLE, F_COUNT };
+       F_LAUNCHER, F_TOGGLE, F_FORWARD, F_BACK, F_COUNT };
 static const char* kBindKeyA[F_COUNT] = {
     "bind_lclick", "bind_rclick", "bind_keyboard", "bind_playpause",
-    "bind_fullscreen", "bind_launcher", "bind_toggle"};
+    "bind_fullscreen", "bind_launcher", "bind_toggle",
+    "bind_forward", "bind_back"};
 
 struct Config {
     double mouse_sensitivity;   // pixels per poll at full stick deflection
@@ -81,9 +82,10 @@ struct Config {
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-// Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad.
+// Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad,
+// R1 (forward), R2 (back).
 static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
-                                {1, 2, 3, 0, 0, 9, 13}};
+                                {1, 2, 3, 0, 0, 9, 13, 5, 7}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -334,6 +336,19 @@ static void send_fullscreen(int which) {
     }
 }
 
+// The mouse's side buttons, which is what browsers and Explorer listen to for
+// navigation - XBUTTON1 is back, XBUTTON2 forward.
+static void mouse_xbutton(int which) {
+    INPUT in[2] = {};
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_XDOWN;
+    in[0].mi.mouseData = (DWORD)which;
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = MOUSEEVENTF_XUP;
+    in[1].mi.mouseData = (DWORD)which;
+    SendInput(2, in, sizeof(INPUT));
+}
+
 static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
     if (pressed && !prev) {
         mouse_button(down);
@@ -357,7 +372,7 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE, GP_CAPTURED,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
-       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK };
+       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -729,6 +744,9 @@ static bool     g_hid_bt = false;          // Bluetooth transport (vs USB)
 // Bumped on every (re)open. The worker uses it to tell that its edge-detection
 // state refers to a handle that no longer exists.
 static unsigned g_hid_gen = 0;
+// Battery, as reported by the pad itself. -1 until a report carries it.
+static volatile int  g_pad_batt = -1;
+static volatile bool g_pad_charging = false;
 // False until a genuine report has been parsed on the current handle. Until
 // then hid_poll can only hand back the zeroed placeholder from the open, which
 // must not be mistaken for "every button released".
@@ -930,6 +948,20 @@ static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
     else if (buf[0] == 0x31) off = 2;          // Bluetooth extended
     else return false;
     if (len < (DWORD)off + 10) return false;
+
+    // Battery lives in the status byte 52 bytes into the payload, past the
+    // sensor and touch blocks. Low nibble is a 0-10 capacity, high nibble the
+    // charging state. Only the long reports carry it; the short Bluetooth one
+    // stops well before, so the last known value stands.
+    if (len >= (DWORD)off + 53) {
+        BYTE status = buf[off + 52];
+        int level = status & 0x0F;
+        int charge = (status >> 4) & 0x0F;
+        int pct = level * 10 + 5;
+        if (pct > 100) pct = 100;
+        g_pad_batt = pct;
+        g_pad_charging = (charge == 0x1 || charge == 0x2);
+    }
     st.lx = hid_axis(buf[off + 0]);
     st.ly = hid_axis(buf[off + 1]);
     st.rx = hid_axis(buf[off + 2]);
@@ -1352,6 +1384,11 @@ static DWORD WINAPI worker_thread(LPVOID) {
             if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
 
+            // Browser-style navigation on the shoulder buttons, sent as the
+            // mouse side buttons so it works wherever those already do.
+            if (went_down(F_BACK))    mouse_xbutton(XBUTTON1);
+            if (went_down(F_FORWARD)) mouse_xbutton(XBUTTON2);
+
             // Launcher is a hold, checked before the popups so it works
             // whichever of them happens to be up.
             if (is_down(F_LAUNCHER) && !hold_fired[F_LAUNCHER] &&
@@ -1383,6 +1420,11 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // Keep media state in step while the keyboard owns the D-pad,
                 // so closing it with a direction held doesn't fire.
                 media_dir = st.hat;
+                // While typing, the play/pause button is a shortcut to Enter -
+                // it moves the selection there rather than pressing it, so a
+                // second press is still a deliberate act.
+                if (went_down(F_PLAYPAUSE))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_ENTER, 0);
                 if (went_down(F_LCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SELECT, 0);
                 if (went_down(F_RCLICK))
@@ -1977,10 +2019,28 @@ static void kb_nav(int dir) {
             return;
         }
     }
-    if (dir == 0) g_kb_row = (g_kb_row + KB_NROWS - 1) % KB_NROWS;        // up
-    else if (dir == 2) g_kb_row = (g_kb_row + 1) % KB_NROWS;              // down
-    else if (dir == 1) g_kb_col = (g_kb_col + 1) % KB_COUNT[g_kb_row];    // right
-    else if (dir == 3) g_kb_col = (g_kb_col + KB_COUNT[g_kb_row] - 1) % KB_COUNT[g_kb_row];  // left
+    if (dir == 0 || dir == 2) {
+        // Move to the key physically nearest the current one, rather than
+        // keeping the column index. Index-based movement clamped into the
+        // three-key bottom row and always landed on Enter; this lands on
+        // whatever is actually under the key you left.
+        int nr = (dir == 0) ? (g_kb_row + KB_NROWS - 1) % KB_NROWS
+                            : (g_kb_row + 1) % KB_NROWS;
+        RECT cur = kb_key_rect(g_kb_row, g_kb_col);
+        int cx = (cur.left + cur.right) / 2;
+        int best = 0, bestd = 1 << 30;
+        for (int i = 0; i < KB_COUNT[nr]; i++) {
+            RECT r = kb_key_rect(nr, i);
+            int d = abs((r.left + r.right) / 2 - cx);
+            if (d < bestd) { bestd = d; best = i; }
+        }
+        g_kb_row = nr;
+        g_kb_col = best;
+    } else if (dir == 1) {
+        g_kb_col = (g_kb_col + 1) % KB_COUNT[g_kb_row];                   // right
+    } else if (dir == 3) {
+        g_kb_col = (g_kb_col + KB_COUNT[g_kb_row] - 1) % KB_COUNT[g_kb_row];
+    }
     if (g_kb_col >= KB_COUNT[g_kb_row]) g_kb_col = KB_COUNT[g_kb_row] - 1;
     if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
 }
@@ -2607,6 +2667,34 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_rt_lx->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
             }
 
+            // Controller battery, left of the header icons. Only shown once a
+            // report has actually carried it - a pad on the short Bluetooth
+            // report never sends one.
+            if (g_pad_batt >= 0 && g_tf_body) {
+                RECT first = lx_hdr_rect(0);
+                float bx = (float)first.left - 78;
+                float by = (float)first.top + 8;
+                D2D1_RECT_F shell = D2D1::RectF(bx + 34, by, bx + 60, by + 14);
+                g_rt_lx->DrawRoundedRectangle(D2D1::RoundedRect(shell, 3, 3),
+                                              g_br_lx_dim, 1.2f);
+                g_rt_lx->FillRectangle(
+                    D2D1::RectF(shell.right + 1.5f, by + 4, shell.right + 4, by + 10),
+                    g_br_lx_dim);
+                float fillw = (shell.right - shell.left - 4) * (g_pad_batt / 100.0f);
+                g_rt_lx->FillRectangle(
+                    D2D1::RectF(shell.left + 2, by + 2, shell.left + 2 + fillw,
+                                by + 12),
+                    g_pad_batt <= 20 ? g_br_lx_warn : g_br_lx_dim);
+                wchar_t bt[16];
+                swprintf(bt, 16, L"%d%%%s", (int)g_pad_batt,
+                         g_pad_charging ? L"+" : L"");
+                D2D1_RECT_F tr = D2D1::RectF(bx - 8, by - 4, bx + 30, by + 18);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                g_rt_lx->DrawText(bt, (UINT32)wcslen(bt), g_tf_body, tr,
+                                  g_br_lx_dim);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+
             for (int i = 0; i < LX_HDR_N; i++) {
                 RECT hr = lx_hdr_rect(i);
                 bool hsel = (g_lx_sel == lx_tiles() + i);
@@ -3142,7 +3230,7 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
 // whatever DPI the monitor reports.
 #define WIN_W 384
-#define WIN_H 788
+#define WIN_H 848
 
 static const RECT kStatusRect = {20, 14, 20 + 344, 14 + 24};
 static const RECT kHideRect   = {20, 44, 20 + 240, 44 + 20};
@@ -3194,26 +3282,26 @@ static const wchar_t* kFsName[NFSKEYS] = {L"F11", L"Alt+Ent", L"F", L"Radial"};
 // button showing the control bound to it - click to rebind. The two D-pad
 // rows are shown for reference and are not rebindable.
 static const RECT kLegendHdr = {20, 448, 20 + 344, 448 + 18};
-#define NROWS 9
+#define NROWS 11
 #define ROW_Y0   474
 #define ROW_STEP 30
 // icon kind
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB };
+       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
 // feature index, or -1 for a fixed row
 static const int kRowFeature[NROWS] = {
     F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
-    F_LAUNCHER, F_TOGGLE, -1, -1};
+    F_LAUNCHER, F_BACK, F_FORWARD, F_TOGGLE, -1, -1};
 static const int kRowIcon[NROWS] = {
     IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-    IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB};
+    IC_LAUNCHER, IC_BACK, IC_FORWARD, IC_POWER, IC_VOLUME, IC_SCRUB};
 static const wchar_t* kRowName[NROWS] = {
     L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
-    L"Fullscreen (hold)", L"App launcher (hold)", L"Toggle CtrlMouse",
-    L"Volume up / down", L"Seek / scrub"};
+    L"Fullscreen (hold)", L"App launcher (hold)", L"Back", L"Forward",
+    L"Toggle CtrlMouse", L"Volume up / down", L"Seek / scrub"};
 // Fixed rows draw a D-pad glyph in place of a bind button: 0 = none,
 // 1 = vertical axis, 2 = horizontal axis.
-static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 1, 2};
+static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2};
 
 static RECT row_btn_rect(int i) {
     int y = ROW_Y0 + i * ROW_STEP;
@@ -3221,7 +3309,7 @@ static RECT row_btn_rect(int i) {
     return r;
 }
 
-static const RECT kFooterRect = {20, 758, 20 + 344, 758 + 18};
+static const RECT kFooterRect = {20, 818, 20 + 344, 818 + 18};
 static const wchar_t* kFooterText =
     L"Close sends to tray; right-click the tray icon to quit.";
 
@@ -3338,6 +3426,16 @@ static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
                  D2D1::Point2F(cx - 10, cy), on);
         fill_tri(rt, D2D1::Point2F(cx + 2, cy - 7), D2D1::Point2F(cx + 2, cy + 7),
                  D2D1::Point2F(cx + 10, cy), on);
+        break;
+    }
+    case IC_BACK:
+    case IC_FORWARD: {
+        // An arrow: head plus a short shaft, mirrored for forward.
+        float d = (kind == IC_BACK) ? -1.0f : 1.0f;
+        fill_tri(rt, D2D1::Point2F(cx + d * 9, cy), D2D1::Point2F(cx + d * 1, cy - 7),
+                 D2D1::Point2F(cx + d * 1, cy + 7), on);
+        rt->FillRectangle(D2D1::RectF(cx - (d > 0 ? 9 : 1) * 1.0f, cy - 1.6f,
+                                      cx + (d > 0 ? 1 : 9) * 1.0f, cy + 1.6f), on);
         break;
     }
     }
@@ -3730,6 +3828,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case GP_KB_TOGGLE:
             if (g_kb_visible && g_kb_search) g_kb_search = false;
             kb_toggle();
+            break;
+        case GP_KB_ENTER:
+            // Jump the selection onto Enter without pressing it.
+            if (g_kb_visible) {
+                g_kb_row = KB_NROWS - 1;
+                g_kb_col = KB_COUNT[KB_NROWS - 1] - 1;
+                g_kb_in_res = false;
+                if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            }
             break;
         case GP_RAD_SHOW: rad_show(true); break;
         case GP_RAD_SEL:
