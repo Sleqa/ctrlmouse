@@ -44,10 +44,11 @@ the way video players expect — so it applies to the focused window.
 
 - **On-screen keyboard** — dark themed, animated, driven entirely by the
   controller. It never steals focus, so keys go to the app you're working in.
-- **App search** — hold the keyboard button and it opens with a search bar
-  instead. Typing filters your installed applications; D-pad up from the top
-  key row moves into the results, Cross launches. It searches the same Start
-  Menu shortcuts Windows does.
+- **Command search** — hold the keyboard button and it opens with a search bar.
+  It answers with installed apps, windows that are already open, a calculator
+  result, or a web search, and `>` before the query runs a command. D-pad up
+  from the top key row moves into the results, Cross acts on the highlighted
+  one. Apps come from the same Start Menu shortcuts Windows uses.
 - **Game auto-pause** — detects fullscreen games (exclusive and borderless)
   and pauses the mapping so your sticks don't fight the game. Checked at most
   every 2 seconds with a couple of API calls; effectively zero cost. Can be

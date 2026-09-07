@@ -1693,7 +1693,17 @@ static bool     g_index_built = false;
 
 static bool     g_kb_search = false;      // keyboard is in search mode
 static wchar_t  g_kb_query[64] = L"";
-static int      g_kb_res[KB_RES_MAX];     // indices into g_index
+// Results are heterogeneous, in the spirit of a command palette: an app, an
+// already-open window, a calculation, a command to run, a web search.
+enum { SR_APP, SR_WINDOW, SR_CALC, SR_RUN, SR_WEB };
+struct SearchResult {
+    int          kind;
+    std::wstring title;   // the row text
+    std::wstring hint;    // small right-aligned kind label
+    std::wstring data;    // path, command, or computed value
+    HWND         hwnd;    // for SR_WINDOW
+};
+static SearchResult g_kb_res[KB_RES_MAX];
 static int      g_kb_res_count = 0;
 static int      g_kb_res_sel = 0;
 static bool     g_kb_in_res = false;      // focus is in the results, not the keys
@@ -1746,36 +1756,233 @@ static std::wstring lower_of(const std::wstring& s) {
 
 // Prefix matches first, then anything containing the query - the same ordering
 // intuition as Start, without pretending to be a real ranker.
+// Defined with the launcher, which shares it: opening something already
+// running should switch to it rather than start a second copy.
+static bool activate_running(const std::wstring& path);
+
+// --- Calculator -------------------------------------------------------------
+// A small recursive-descent evaluator, so typing "1920/2.35" answers without
+// leaving the keyboard. Arithmetic only, deliberately.
+struct Calc { const wchar_t* p; bool ok; };
+
+static double calc_expr(Calc& c);
+
+static void calc_skip(Calc& c) { while (*c.p == L' ') c.p++; }
+
+static double calc_atom(Calc& c) {
+    calc_skip(c);
+    if (*c.p == L'(') {
+        c.p++;
+        double v = calc_expr(c);
+        calc_skip(c);
+        if (*c.p == L')') c.p++; else c.ok = false;
+        return v;
+    }
+    if (*c.p == L'-') { c.p++; return -calc_atom(c); }
+    if (*c.p == L'+') { c.p++; return calc_atom(c); }
+    wchar_t* end = NULL;
+    double v = wcstod(c.p, &end);
+    if (!end || end == c.p) { c.ok = false; return 0.0; }
+    c.p = end;
+    return v;
+}
+
+static double calc_term(Calc& c) {
+    double v = calc_atom(c);
+    for (;;) {
+        calc_skip(c);
+        wchar_t op = *c.p;
+        if (op != L'*' && op != L'/' && op != L'x' && op != L'%') return v;
+        c.p++;
+        double r = calc_atom(c);
+        if (op == L'/') { if (r == 0.0) { c.ok = false; return 0.0; } v /= r; }
+        else if (op == L'%') { if (r == 0.0) { c.ok = false; return 0.0; }
+                               v = fmod(v, r); }
+        else v *= r;
+    }
+}
+
+static double calc_expr(Calc& c) {
+    double v = calc_term(c);
+    for (;;) {
+        calc_skip(c);
+        wchar_t op = *c.p;
+        if (op != L'+' && op != L'-') return v;
+        c.p++;
+        double r = calc_term(c);
+        v = (op == L'+') ? v + r : v - r;
+    }
+}
+
+// Only treat the query as a sum when it actually looks like one, so ordinary
+// words cannot produce a spurious result row.
+static bool calc_eval(const wchar_t* q, double& out) {
+    bool digit = false, op = false;
+    for (const wchar_t* t = q; *t; t++) {
+        if (iswdigit(*t)) digit = true;
+        else if (wcschr(L"+-*/x%(", *t)) op = true;
+        else if (*t != L' ' && *t != L'.' && *t != L')') return false;
+    }
+    if (!digit || !op) return false;
+    Calc c = {q, true};
+    double v = calc_expr(c);
+    calc_skip(c);
+    if (!c.ok || *c.p) return false;
+    out = v;
+    return true;
+}
+
+// --- Open windows -----------------------------------------------------------
+struct WinHit { HWND h; std::wstring title; };
+static WinHit g_winhits[64];
+static int    g_winhit_count = 0;
+
+static BOOL CALLBACK collect_window_cb(HWND h, LPARAM) {
+    if (g_winhit_count >= 64) return FALSE;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    int len = GetWindowTextLengthW(h);
+    if (len <= 0 || len > 200) return TRUE;
+    wchar_t buf[256];
+    if (!GetWindowTextW(h, buf, 256)) return TRUE;
+    g_winhits[g_winhit_count].h = h;
+    g_winhits[g_winhit_count].title = buf;
+    g_winhit_count++;
+    return TRUE;
+}
+
+static void add_result(int kind, const std::wstring& title,
+                       const std::wstring& hint, const std::wstring& data,
+                       HWND h) {
+    if (g_kb_res_count >= KB_RES_MAX) return;
+    SearchResult& r = g_kb_res[g_kb_res_count++];
+    r.kind = kind;
+    r.title = title;
+    r.hint = hint;
+    r.data = data;
+    r.hwnd = h;
+}
+
 static void kb_search_update() {
     g_kb_res_count = 0;
     g_kb_res_sel = 0;
     if (!g_kb_query[0]) return;
-    build_index();
     std::wstring q = lower_of(g_kb_query);
-    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX; pass++) {
-        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX; i++) {
+
+    // A leading ">" runs a command, the way a command palette does.
+    if (g_kb_query[0] == L'>') {
+        std::wstring cmd = g_kb_query + 1;
+        if (!cmd.empty()) add_result(SR_RUN, cmd, L"run", cmd, NULL);
+        return;
+    }
+
+    // A calculation answers first, since it is unambiguous.
+    double val;
+    if (calc_eval(g_kb_query, val)) {
+        wchar_t buf[64];
+        if (val == (double)(long long)val)
+            swprintf(buf, 64, L"%lld", (long long)val);
+        else
+            swprintf(buf, 64, L"%.10g", val);
+        add_result(SR_CALC, buf, L"copy", buf, NULL);
+    }
+
+    // Installed applications, prefix matches ahead of substring ones. One slot
+    // is always held back for the web fallback.
+    build_index();
+    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX - 1; pass++) {
+        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX - 1; i++) {
             std::wstring n = lower_of(g_index[i].name);
             size_t at = n.find(q);
             if (at == std::wstring::npos) continue;
             if ((pass == 0) != (at == 0)) continue;
             bool dup = false;
             for (int j = 0; j < g_kb_res_count; j++)
-                if (g_kb_res[j] == i) dup = true;
-            if (!dup) g_kb_res[g_kb_res_count++] = i;
+                if (g_kb_res[j].kind == SR_APP &&
+                    g_kb_res[j].data == g_index[i].path) dup = true;
+            if (!dup)
+                add_result(SR_APP, g_index[i].name, L"app", g_index[i].path, NULL);
         }
     }
+
+    // Windows that are already open, so search doubles as a switcher.
+    g_winhit_count = 0;
+    EnumWindows(collect_window_cb, 0);
+    for (int i = 0; i < g_winhit_count && g_kb_res_count < KB_RES_MAX - 1; i++) {
+        if (lower_of(g_winhits[i].title).find(q) == std::wstring::npos) continue;
+        add_result(SR_WINDOW, g_winhits[i].title, L"window", L"", g_winhits[i].h);
+    }
+
+    // Web search sits at the bottom as the always-available fallback.
+    add_result(SR_WEB, g_kb_query, L"web", g_kb_query, NULL);
 }
 
-// Defined with the launcher, which shares it: launching something already
-// running should switch to it rather than start a second copy.
-static bool activate_running(const std::wstring& path);
+static void copy_to_clipboard(const std::wstring& text) {
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem) {
+        void* dst = GlobalLock(mem);
+        if (dst) {
+            memcpy(dst, text.c_str(), bytes);
+            GlobalUnlock(mem);
+            SetClipboardData(CF_UNICODETEXT, mem);
+        }
+    }
+    CloseClipboard();
+}
+
+static std::wstring url_escape(const std::wstring& in) {
+    std::wstring o;
+    for (size_t i = 0; i < in.size(); i++) {
+        wchar_t c = in[i];
+        if (iswalnum(c) || c == L'-' || c == L'_' || c == L'.' || c == L'~') o += c;
+        else if (c == L' ') o += L'+';
+        else {
+            wchar_t b[8];
+            swprintf(b, 8, L"%%%02X", (unsigned)(c & 0xFF));
+            o += b;
+        }
+    }
+    return o;
+}
 
 static void kb_search_launch() {
     if (g_kb_res_sel < 0 || g_kb_res_sel >= g_kb_res_count) return;
-    std::wstring path = g_index[g_kb_res[g_kb_res_sel]].path;
-    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);   // dismiss, then run
-    if (!activate_running(path))
-        ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    SearchResult r = g_kb_res[g_kb_res_sel];   // copied: the popup closes below
+    // A calculation leaves the keyboard up, since another sum usually follows.
+    if (r.kind != SR_CALC)
+        PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
+    switch (r.kind) {
+    case SR_APP:
+        if (!activate_running(r.data))
+            ShellExecuteW(NULL, L"open", r.data.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        break;
+    case SR_WINDOW:
+        if (r.hwnd) {
+            if (IsIconic(r.hwnd)) ShowWindow(r.hwnd, SW_RESTORE);
+            if (!SetForegroundWindow(r.hwnd)) {
+                typedef void(WINAPI * SwitchFn)(HWND, BOOL);
+                HMODULE u = GetModuleHandleW(L"user32.dll");
+                SwitchFn f = u ? (SwitchFn)GetProcAddress(u, "SwitchToThisWindow")
+                               : NULL;
+                if (f) f(r.hwnd, TRUE);
+            }
+        }
+        break;
+    case SR_CALC:
+        copy_to_clipboard(r.data);
+        break;
+    case SR_RUN:
+        ShellExecuteW(NULL, L"open", r.data.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        break;
+    case SR_WEB: {
+        std::wstring url = L"https://www.google.com/search?q=" + url_escape(r.data);
+        ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        break;
+    }
+    }
 }
 
 // The only GDI object left: the window-class background brush, which just
@@ -2182,13 +2389,22 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (rsel)
                         draw_control(g_rt_kb, rr, KB_RADIUS, g_br_kb_sel, NULL);
                     if (g_tf_body) {
-                        const std::wstring& nm = g_index[g_kb_res[r]].name;
+                        const SearchResult& res = g_kb_res[r];
+                        ID2D1Brush* rb = rsel ? (ID2D1Brush*)g_br_kb_onacc
+                                              : g_br_kb_text;
                         D2D1_RECT_F tr = D2D1::RectF(rr.left + 14, rr.top,
-                                                     rr.right - 14, rr.bottom);
-                        g_rt_kb->DrawText(nm.c_str(), (UINT32)nm.size(),
-                                          g_tf_body, tr,
-                                          rsel ? (ID2D1Brush*)g_br_kb_onacc
-                                               : g_br_kb_text);
+                                                     rr.right - 76, rr.bottom);
+                        g_rt_kb->DrawText(res.title.c_str(),
+                                          (UINT32)res.title.size(),
+                                          g_tf_body, tr, rb);
+                        // What acting on this row will do, right-aligned.
+                        D2D1_RECT_F hr2 = D2D1::RectF(rr.right - 72, rr.top,
+                                                      rr.right - 12, rr.bottom);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        g_rt_kb->DrawText(res.hint.c_str(),
+                                          (UINT32)res.hint.size(), g_tf_body,
+                                          hr2, rsel ? rb : (ID2D1Brush*)g_br_kb_dim);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
                 }
                 if (!g_kb_res_count && g_tf_body) {
