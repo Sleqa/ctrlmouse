@@ -1254,8 +1254,6 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
     bool radial_up = false;                // radial picker is on screen
-    int  rad_zone_cand = 1;                // debounced flyout zone (see below)
-    ULONGLONG rad_zone_t0 = 0;
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Media controls (D-pad + Square) while the on-screen keyboard is closed.
@@ -1612,25 +1610,21 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     radial_up = true;
                 }
                 if (radial_up && is_down(F_FULLSCREEN)) {
-                    // Three zones across the stick, so a push lands on an
-                    // option directly rather than stepping through them. The
-                    // middle zone only commits after sitting there a moment,
-                    // since the stick passes through it in transit every time
-                    // it springs back to centre on release - without that,
-                    // letting go of the stick looked identical to choosing
-                    // the middle option on purpose.
+                    // The stick springs back to dead centre - the middle
+                    // option's own zone - the instant it's let go, which is
+                    // indistinguishable from deliberately picking the middle
+                    // option if the middle zone is read like the other two.
+                    // So it isn't: only a clear push left or right ever
+                    // changes the selection, and a centred stick just leaves
+                    // whichever side was last chosen alone. The only way onto
+                    // the middle option is to never have pushed the stick at
+                    // all this hold, which is also why it's what the flyout
+                    // opens already selecting.
                     double sx = st.lx / 1000.0;
-                    int want = (sx < -0.33) ? 0 : (sx > 0.33 ? 2 : 1);
-                    if (want != rad_zone_cand) {
-                        rad_zone_cand = want;
-                        rad_zone_t0 = bnow;
-                    }
-                    if (want != 1 || bnow - rad_zone_t0 >= 90)
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, want);
-                }
-                if (radial_up && !is_down(F_FULLSCREEN)) {
-                    rad_zone_cand = 1;
-                    rad_zone_t0 = 0;
+                    if (sx < -0.33)
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, 0);
+                    else if (sx > 0.33)
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, 2);
                 }
                 if (radial_up && went_up(F_FULLSCREEN)) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
