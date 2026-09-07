@@ -1921,6 +1921,136 @@ static inline int    dip_to_px(int dip)   { return MulDiv(dip, (int)g_dpi, 96); 
 static inline int    px_to_dip(int px)    { return MulDiv(px, 96, (int)g_dpi); }
 
 static ID2D1Factory1*     g_d2d_factory = NULL;
+
+// Undocumented but stable since Windows 10: the API real flyouts and
+// tooltips use for frosted glass behind a borderless popup, as opposed to
+// the Windows 11 Mica APIs, which only render properly behind windows with a
+// real caption/frame - a plain WS_EX_TOOLWINDOW popup got a solid white
+// plate instead of material from those. Plain blur-behind rather than the
+// "acrylic" variant: acrylic's own noise-texture layer painted as a square
+// covering the whole window rectangle regardless of our own alpha mask,
+// showing as a boxy outline around the rounded card; this respects the
+// per-pixel alpha shape properly, the way custom-shaped overlays have relied
+// on it to for years.
+static void enable_acrylic(HWND hwnd) {
+    enum { WCA_ACCENT_POLICY = 19 };
+    enum { ACCENT_ENABLE_BLURBEHIND = 3 };
+    struct ACCENT_POLICY {
+        int   AccentState;
+        int   AccentFlags;
+        DWORD GradientColor;   // 0xAABBGGRR: alpha is the tint's own strength
+        int   AnimationId;
+    };
+    struct WINCOMPATTRDATA {
+        int   Attrib;
+        void* pvData;
+        SIZE  cbData;
+    };
+    typedef BOOL(WINAPI * SetWCA)(HWND, WINCOMPATTRDATA*);
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    SetWCA set = u ? (SetWCA)GetProcAddress(u, "SetWindowCompositionAttribute")
+                   : NULL;
+    if (!set) return;
+    ACCENT_POLICY accent = {ACCENT_ENABLE_BLURBEHIND, 0,
+                            (DWORD)((140u << 24) | RGB(32, 32, 36)), 0};
+    WINCOMPATTRDATA data = {WCA_ACCENT_POLICY, &accent, sizeof(accent)};
+    set(hwnd, &data);
+}
+
+// A window that needs per-pixel alpha - blur-behind, and any rounded corner
+// that isn't a plain rectangle, both need it - can't use an
+// ID2D1HwndRenderTarget: that always presents opaque. This is the DC render
+// target + DIB + UpdateLayeredWindow combination that gives real per-pixel
+// alpha instead, bundled up since three windows now use it.
+struct LayeredSurface {
+    ID2D1DCRenderTarget* rt = NULL;
+    HDC     dc = NULL;
+    HBITMAP dib = NULL;
+    int     w = 0, h = 0;
+};
+
+static void layered_release(LayeredSurface& s) {
+    if (s.dc) { DeleteDC(s.dc); s.dc = NULL; }
+    if (s.dib) { DeleteObject(s.dib); s.dib = NULL; }
+    if (s.rt) { s.rt->Release(); s.rt = NULL; }
+    s.w = s.h = 0;
+}
+
+// Binds the DIB (recreating it if the pixel size changed) and starts drawing.
+// Follow with the usual Direct2D calls, then layered_present().
+static bool layered_begin(LayeredSurface& s, int w, int h) {
+    if (!s.rt) {
+        if (!g_d2d_factory) return false;
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+            (float)g_dpi, (float)g_dpi);
+        if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &s.rt))) {
+            s.rt = NULL;
+            return false;
+        }
+        s.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    }
+    if (!s.dib || s.w != w || s.h != h) {
+        if (s.dc) { DeleteDC(s.dc); s.dc = NULL; }
+        if (s.dib) { DeleteObject(s.dib); s.dib = NULL; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;          // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HDC screen = GetDC(NULL);
+        s.dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        s.dc = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+        if (!s.dib || !s.dc) return false;
+        SelectObject(s.dc, s.dib);
+        s.w = w;
+        s.h = h;
+    }
+    RECT bind = {0, 0, w, h};
+    if (FAILED(s.rt->BindDC(s.dc, &bind))) return false;
+    s.rt->BeginDraw();
+    return true;
+}
+
+// alpha is the whole-window blend (0-255), for entry/exit fades. pos is the
+// window's screen position to move it to, or NULL to leave wherever it
+// already is - for a window whose position is driven separately (by
+// SetWindowPos, during a slide animation), moving it again here would fight
+// that rather than help it.
+static bool layered_present(LayeredSurface& s, HWND hwnd, const POINT* pos,
+                            BYTE alpha) {
+    if (s.rt->EndDraw() == D2DERR_RECREATE_TARGET) { layered_release(s); return false; }
+    SIZE size = {s.w, s.h};
+    POINT src = {0, 0};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    HDC screen = GetDC(NULL);
+    POINT ptbuf;
+    if (pos) ptbuf = *pos;
+    UpdateLayeredWindow(hwnd, screen, pos ? &ptbuf : NULL, &size, s.dc, &src,
+                        0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+    return true;
+}
+
+// Re-presents the already-drawn content at a new whole-window alpha, without
+// redrawing it - all a slide/fade animation tick needs, and much cheaper
+// than a full BeginDraw/EndDraw cycle every 15ms.
+static void layered_present_alpha(LayeredSurface& s, HWND hwnd, BYTE alpha) {
+    if (!s.dc) return;
+    SIZE size = {s.w, s.h};
+    POINT src = {0, 0};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    HDC screen = GetDC(NULL);
+    UpdateLayeredWindow(hwnd, screen, NULL, &size, s.dc, &src, 0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+}
+
 static IDWriteFactory*    g_dwrite_factory = NULL;
 // Sizes are DIPs, and a touch larger than the old GDI fonts: this is often
 // driven from a couch, so the text needs to hold up at a distance.
@@ -1946,7 +2076,9 @@ static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
 static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
 static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
 
-static ID2D1HwndRenderTarget* g_rt_kb = NULL;
+static LayeredSurface g_surf_kb;
+static float g_kb_alpha = 1.0f;   // whole-window blend for the slide/fade
+static ID2D1SolidColorBrush*  g_br_kb_bg = NULL;      // translucent card fill
 static ID2D1SolidColorBrush*  g_br_kb_key = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
@@ -2272,28 +2404,31 @@ static bool d2d_create_main(HWND hwnd) {
 }
 
 static void d2d_release_kb() {
-    ID2D1SolidColorBrush** bs[] = {&g_br_kb_key, &g_br_kb_sel, &g_br_kb_armed,
-                                   &g_br_kb_text, &g_br_kb_flash,
-                                   &g_br_kb_onacc, &g_br_kb_border,
-                                   &g_br_kb_dim};
-    for (int i = 0; i < 8; i++)
+    ID2D1SolidColorBrush** bs[] = {&g_br_kb_bg, &g_br_kb_key, &g_br_kb_sel,
+                                   &g_br_kb_armed, &g_br_kb_text,
+                                   &g_br_kb_flash, &g_br_kb_onacc,
+                                   &g_br_kb_border, &g_br_kb_dim};
+    for (int i = 0; i < 9; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    if (g_rt_kb) { g_rt_kb->Release(); g_rt_kb = NULL; }
+    layered_release(g_surf_kb);
 }
 
-static bool d2d_create_kb(HWND hwnd) {
-    g_rt_kb = d2d_create_rt(hwnd, true);
-    if (!g_rt_kb) return false;
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_key);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_kb_onacc);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_flash);
-    g_rt_kb->CreateSolidColorBrush(
-        D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_kb_border);
-    g_rt_kb->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_kb_dim);
-    return true;
+// Brushes only - the render target itself is created lazily by
+// layered_begin(), the first time kb_render() runs.
+static void d2d_create_kb() {
+    ID2D1RenderTarget* rt = g_surf_kb.rt;
+    // Background is partly transparent now, not the old flat fill: it's
+    // what lets the blur-behind material show through.
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_BG, 0.7f), &g_br_kb_bg);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_key);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_kb_onacc);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_flash);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                              &g_br_kb_border);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_kb_dim);
 }
 
 static COLORREF lerp_clr(COLORREF a, COLORREF b, double t) {
@@ -2429,7 +2564,8 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (t > 1.0) t = 1.0;
             double e = 1.0 - pow(1.0 - t, 3);                  // ease-out cubic
             double a = (g_kb_anim == 1) ? e : 1.0 - e;         // opening / closing
-            SetLayeredWindowAttributes(hwnd, 0, (BYTE)(255 * a), LWA_ALPHA);
+            g_kb_alpha = (float)a;
+            layered_present_alpha(g_surf_kb, hwnd, (BYTE)(255 * a));
             SetWindowPos(hwnd, NULL, g_kb_x,
                          g_kb_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
                          SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
@@ -2460,25 +2596,32 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
-        if (g_rt_kb) g_rt_kb->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        // No Resize() call needed: layered_begin() recreates the DIB to
+        // match whenever kb_render() next runs, off the window's own
+        // current client size.
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (!g_rt_kb) d2d_create_kb(hwnd);
-        if (g_rt_kb) {
-            // No manual double-buffering needed: ID2D1HwndRenderTarget is
-            // already back-buffered.
-            g_rt_kb->BeginDraw();
-            g_rt_kb->Clear(d2d_clr(KB_CLR_BG));
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        bool first = !g_surf_kb.rt;
+        if (layered_begin(g_surf_kb, rc.right - rc.left, rc.bottom - rc.top)) {
+            if (first) d2d_create_kb();
+            ID2D1RenderTarget* rt = g_surf_kb.rt;
+            rt->Clear(D2D1::ColorF(0, 0.0f));
 
-            // Flyout surface: flat base colour, a hairline border and the
-            // 8px radius Windows uses for menus and flyouts.
+            // Flyout surface: translucent base colour over the blur, a
+            // hairline border and the 8px radius Windows uses for menus and
+            // flyouts.
             {
-                D2D1_SIZE_F sz = g_rt_kb->GetSize();
+                D2D1_SIZE_F sz = rt->GetSize();
                 D2D1_RECT_F cr = D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
                                              sz.height - 0.5f);
-                g_rt_kb->DrawRoundedRectangle(
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                    g_br_kb_bg);
+                rt->DrawRoundedRectangle(
                     D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
                     g_br_kb_border, 1.0f);
             }
@@ -2489,14 +2632,14 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 D2D1_RECT_F fr = D2D1::RectF((float)KB_M, (float)KB_M,
                                              (float)(KB_W - KB_M),
                                              (float)(KB_M + KB_SEARCH_FIELD - 10));
-                draw_control(g_rt_kb, fr, KB_RADIUS, g_br_kb_key, g_br_kb_border);
+                draw_control(rt, fr, KB_RADIUS, g_br_kb_key, g_br_kb_border);
                 if (g_tf_key) {
                     D2D1_RECT_F tr = D2D1::RectF(fr.left + 14, fr.top,
                                                  fr.right - 14, fr.bottom);
                     g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     const wchar_t* q = g_kb_query[0] ? g_kb_query : L"Search";
-                    g_rt_kb->DrawText(q, (UINT32)wcslen(q), g_tf_key, tr,
-                                      g_kb_query[0] ? g_br_kb_text : g_br_kb_dim);
+                    rt->DrawText(q, (UINT32)wcslen(q), g_tf_key, tr,
+                                g_kb_query[0] ? g_br_kb_text : g_br_kb_dim);
                     g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 }
                 for (int r = 0; r < g_kb_res_count; r++) {
@@ -2506,15 +2649,15 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                  y + KB_RES_H - 4);
                     bool rsel = (g_kb_in_res && r == g_kb_res_sel);
                     if (rsel)
-                        draw_control(g_rt_kb, rr, KB_RADIUS, g_br_kb_sel, NULL);
+                        draw_control(rt, rr, KB_RADIUS, g_br_kb_sel, NULL);
                     if (g_tf_body) {
                         const std::wstring& nm = g_index[g_kb_res[r]].name;
                         D2D1_RECT_F tr = D2D1::RectF(rr.left + 14, rr.top,
                                                      rr.right - 14, rr.bottom);
-                        g_rt_kb->DrawText(nm.c_str(), (UINT32)nm.size(),
-                                          g_tf_body, tr,
-                                          rsel ? (ID2D1Brush*)g_br_kb_onacc
-                                               : g_br_kb_text);
+                        rt->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                    g_tf_body, tr,
+                                    rsel ? (ID2D1Brush*)g_br_kb_onacc
+                                         : g_br_kb_text);
                     }
                 }
                 if (!g_kb_res_count && g_tf_body) {
@@ -2523,8 +2666,8 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                  (float)(KB_W - KB_M), y + KB_RES_H);
                     const wchar_t* msg = g_kb_query[0]
                         ? L"No matching apps" : L"Type to search your apps";
-                    g_rt_kb->DrawText(msg, (UINT32)wcslen(msg), g_tf_body, tr,
-                                      g_br_kb_dim);
+                    rt->DrawText(msg, (UINT32)wcslen(msg), g_tf_body, tr,
+                                g_br_kb_dim);
                 }
             }
 
@@ -2561,7 +2704,7 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     } else if (armed) {
                         fill = g_br_kb_armed;
                     }
-                    draw_control(g_rt_kb, kf, KB_RADIUS, fill, border);
+                    draw_control(rt, kf, KB_RADIUS, fill, border);
 
                     // Letters follow the Shift state, so the keyboard shows
                     // what will actually be typed.
@@ -2573,12 +2716,11 @@ static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         lab = lower;
                     }
                     if (g_tf_key)
-                        g_rt_kb->DrawText(lab, (UINT32)wcslen(lab), g_tf_key, kf, tb);
+                        rt->DrawText(lab, (UINT32)wcslen(lab), g_tf_key, kf, tb);
                 }
             }
 
-            HRESULT hr = g_rt_kb->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) d2d_release_kb();
+            layered_present(g_surf_kb, hwnd, NULL, (BYTE)(255 * g_kb_alpha));
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -2618,7 +2760,7 @@ static void kb_ensure() {
 
     // Rounded window corners on Windows 11 (best-effort; harmless elsewhere).
     if (g_kb) {
-        SetLayeredWindowAttributes(g_kb, 0, 255, LWA_ALPHA);
+        enable_acrylic(g_kb);
         DWORD pref = 2;  // DWMWCP_ROUND
         DwmSetWindowAttribute(g_kb, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/,
                               &pref, sizeof(pref));
@@ -2651,7 +2793,8 @@ static void kb_toggle() {
         g_kb_shift = false;
         g_kb_in_res = false;
         kb_relayout();
-        SetLayeredWindowAttributes(g_kb, 0, 0, LWA_ALPHA);
+        g_kb_alpha = 0.0f;
+        layered_present_alpha(g_surf_kb, g_kb, 0);
         SetWindowPos(g_kb, HWND_TOPMOST, g_kb_x, g_kb_y + dip_to_px(KB_SLIDE), 0, 0,
                      SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_kb_visible = true;
@@ -2689,7 +2832,9 @@ static bool        g_lx_close_mode = false;
 static int         g_lx_close_anim = 0;    // 1 sliding in, 2 sliding out
 static ULONGLONG   g_lx_close_t0 = 0;
 
-static ID2D1HwndRenderTarget* g_rt_lx = NULL;
+static LayeredSurface g_surf_lx;
+static float g_lx_alpha = 1.0f;   // whole-window blend for the slide/fade
+static ID2D1SolidColorBrush*  g_br_lx_bg = NULL;      // translucent card fill
 static ID2D1SolidColorBrush*  g_br_lx_text = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_dim = NULL;
 static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
@@ -2943,28 +3088,32 @@ static void draw_desktop_icon(ID2D1RenderTarget* rt, float cx, float cy,
 }
 
 static void d2d_release_lx() {
-    ID2D1SolidColorBrush** bs[] = {&g_br_lx_text, &g_br_lx_dim, &g_br_lx_sel,
-                                   &g_br_lx_face, &g_br_lx_border,
-                                   &g_br_lx_onacc, &g_br_lx_warn};
-    for (int i = 0; i < 7; i++)
+    ID2D1SolidColorBrush** bs[] = {&g_br_lx_bg, &g_br_lx_text, &g_br_lx_dim,
+                                   &g_br_lx_sel, &g_br_lx_face,
+                                   &g_br_lx_border, &g_br_lx_onacc,
+                                   &g_br_lx_warn};
+    for (int i = 0; i < 8; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     lx_release_icons();
-    if (g_rt_lx) { g_rt_lx->Release(); g_rt_lx = NULL; }
+    layered_release(g_surf_lx);
 }
 
-static bool d2d_create_lx(HWND hwnd) {
-    g_rt_lx = d2d_create_rt(hwnd, true);
-    if (!g_rt_lx) return false;
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_lx_text);
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_lx_dim);
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_sel);
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_lx_onacc);
+// Brushes only - the render target itself is created lazily by
+// layered_begin(), the first time lx_proc's WM_PAINT runs.
+static void d2d_create_lx() {
+    ID2D1RenderTarget* rt = g_surf_lx.rt;
+    // Background is partly transparent now, not the old flat fill: it's
+    // what lets the blur-behind material show through.
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_BG, 0.7f), &g_br_lx_bg);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_lx_text);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_lx_dim);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_sel);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_lx_onacc);
     // CardBackgroundFillColorDefault sits a little above the flyout base.
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(RGB(45, 45, 45)), &g_br_lx_face);
-    g_rt_lx->CreateSolidColorBrush(
-        D2D1::ColorF(1, 1, 1, KB_BORDER_A), &g_br_lx_border);
-    g_rt_lx->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_warn);
-    return true;
+    rt->CreateSolidColorBrush(d2d_clr(RGB(45, 45, 45)), &g_br_lx_face);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                              &g_br_lx_border);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_warn);
 }
 
 static void draw_cog(ID2D1RenderTarget* rt, float cx, float cy, float r,
@@ -2994,7 +3143,8 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (t > 1.0) t = 1.0;
             double e = 1.0 - pow(1.0 - t, 3);
             double a = (g_lx_anim == 1) ? e : 1.0 - e;
-            SetLayeredWindowAttributes(hwnd, 0, (BYTE)(255 * a), LWA_ALPHA);
+            g_lx_alpha = (float)a;
+            layered_present_alpha(g_surf_lx, hwnd, (BYTE)(255 * a));
             SetWindowPos(hwnd, NULL, g_lx_x,
                          g_lx_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
                          SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
@@ -3021,25 +3171,33 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
-        if (g_rt_lx) g_rt_lx->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        // No Resize() call needed: layered_begin() recreates the DIB to
+        // match whenever the next paint runs, off the window's own current
+        // client size.
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (!g_rt_lx) d2d_create_lx(hwnd);
-        if (g_rt_lx) {
-            g_rt_lx->BeginDraw();
-            g_rt_lx->Clear(d2d_clr(KB_CLR_BG));
-            D2D1_SIZE_F sz = g_rt_lx->GetSize();
-            g_rt_lx->DrawRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
-                                              sz.height - 0.5f),
-                                  KB_CARD_RADIUS, KB_CARD_RADIUS),
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        bool first = !g_surf_lx.rt;
+        if (layered_begin(g_surf_lx, rc.right - rc.left, rc.bottom - rc.top)) {
+            if (first) d2d_create_lx();
+            ID2D1RenderTarget* rt = g_surf_lx.rt;
+            rt->Clear(D2D1::ColorF(0, 0.0f));
+            D2D1_SIZE_F sz = rt->GetSize();
+            D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                           sz.height - 0.5f);
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(card, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                g_br_lx_bg);
+            rt->DrawRoundedRectangle(
+                D2D1::RoundedRect(card, KB_CARD_RADIUS, KB_CARD_RADIUS),
                 g_br_lx_border, 1.0f);
             if (g_tf_header) {
                 D2D1_RECT_F hr = D2D1::RectF((float)LX_M, 14.0f,
                                              sz.width - LX_M, 14.0f + 24.0f);
-                g_rt_lx->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
+                rt->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
             }
 
             // Controller battery, left of the header icons. Only shown once a
@@ -3050,13 +3208,13 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 float bx = (float)first.left - 78;
                 float by = (float)first.top + 8;
                 D2D1_RECT_F shell = D2D1::RectF(bx + 34, by, bx + 60, by + 14);
-                g_rt_lx->DrawRoundedRectangle(D2D1::RoundedRect(shell, 3, 3),
+                rt->DrawRoundedRectangle(D2D1::RoundedRect(shell, 3, 3),
                                               g_br_lx_dim, 1.2f);
-                g_rt_lx->FillRectangle(
+                rt->FillRectangle(
                     D2D1::RectF(shell.right + 1.5f, by + 4, shell.right + 4, by + 10),
                     g_br_lx_dim);
                 float fillw = (shell.right - shell.left - 4) * (g_pad_batt / 100.0f);
-                g_rt_lx->FillRectangle(
+                rt->FillRectangle(
                     D2D1::RectF(shell.left + 2, by + 2, shell.left + 2 + fillw,
                                 by + 12),
                     g_pad_batt <= 20 ? g_br_lx_warn : g_br_lx_dim);
@@ -3065,7 +3223,7 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          g_pad_charging ? L"+" : L"");
                 D2D1_RECT_F tr = D2D1::RectF(bx - 8, by - 4, bx + 30, by + 18);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                g_rt_lx->DrawText(bt, (UINT32)wcslen(bt), g_tf_body, tr,
+                rt->DrawText(bt, (UINT32)wcslen(bt), g_tf_body, tr,
                                   g_br_lx_dim);
                 g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
@@ -3074,12 +3232,12 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT hr = lx_hdr_rect(i);
                 bool hsel = (g_lx_sel == lx_tiles() + i);
                 if (hsel)
-                    draw_control(g_rt_lx, to_f(hr), 6.0f, g_br_lx_sel, NULL);
+                    draw_control(rt, to_f(hr), 6.0f, g_br_lx_sel, NULL);
                 ID2D1Brush* hb = hsel ? (ID2D1Brush*)g_br_lx_onacc : g_br_lx_dim;
                 float hx = (float)((hr.left + hr.right) / 2);
                 float hy = (float)((hr.top + hr.bottom) / 2);
-                if (i == 0) draw_desktop_icon(g_rt_lx, hx, hy, hb);
-                else        draw_cog(g_rt_lx, hx, hy, 10.0f, hb);
+                if (i == 0) draw_desktop_icon(rt, hx, hy, hb);
+                else        draw_cog(rt, hx, hy, 10.0f, hb);
             }
 
             for (int i = 0; i < lx_tiles(); i++) {
@@ -3119,28 +3277,28 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         tb = g_br_lx_onacc;
                     }
                 }
-                draw_control(g_rt_lx, tf, KB_CARD_RADIUS, fill,
+                draw_control(rt, tf, KB_CARD_RADIUS, fill,
                              sel ? NULL : (ID2D1Brush*)g_br_lx_border);
 
                 float th = tf.bottom - tf.top;
                 if (cp > 0.0f)
-                    g_rt_lx->PushAxisAlignedClip(tf, D2D1_ANTIALIAS_MODE_ALIASED);
+                    rt->PushAxisAlignedClip(tf, D2D1_ANTIALIAS_MODE_ALIASED);
 
                 if (i == lx_add_index()) {
                     if (g_tf_key)
-                        g_rt_lx->DrawText(L"+", 1, g_tf_key, tf, tb);
+                        rt->DrawText(L"+", 1, g_tf_key, tf, tb);
                 } else if (g_tf_body) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
                     float dy = -cp * th;   // app content slides up and out
                     if (!g_lx_icon[i])
-                        g_lx_icon[i] = load_icon_bitmap(g_rt_lx, g_lx_apps[i].c_str());
+                        g_lx_icon[i] = load_icon_bitmap(rt, g_lx_apps[i].c_str());
                     if (g_lx_icon[i]) {
                         float cx = (tf.left + tf.right) / 2;
                         D2D1_RECT_F ir = D2D1::RectF(cx - 22, tf.top + 12 + dy,
                                                      cx + 22, tf.top + 56 + dy);
-                        g_rt_lx->DrawBitmap(g_lx_icon[i], ir, 1.0f,
+                        rt->DrawBitmap(g_lx_icon[i], ir, 1.0f,
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     }
                     std::wstring nm = lx_label(g_lx_apps[i]);
@@ -3149,7 +3307,7 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       tf.bottom - 6 + dy)
                         : D2D1::RectF(tf.left + 10, tf.top + 10 + dy, tf.right - 10,
                                       tf.bottom - 10 + dy);
-                    g_rt_lx->DrawText(nm.c_str(), (UINT32)nm.size(),
+                    rt->DrawText(nm.c_str(), (UINT32)nm.size(),
                                       g_tf_body, lr, tb);
 
                     // Confirmation rises from the bottom edge as the app leaves.
@@ -3160,19 +3318,19 @@ static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                          tf.right, tf.top + 58 + uy);
                             // U+2715 as an escape: a literal here would depend
                             // on the compiler's source codepage.
-                            g_rt_lx->DrawText(L"\x2715", 1, g_tf_key, xr, tb);
+                            rt->DrawText(L"\x2715", 1, g_tf_key, xr, tb);
                         }
                         D2D1_RECT_F qr = D2D1::RectF(tf.left + 8, tf.top + 60 + uy,
                                                      tf.right - 8, tf.bottom - 6 + uy);
-                        g_rt_lx->DrawText(L"Close?", 6, g_tf_body, qr, tb);
+                        rt->DrawText(L"Close?", 6, g_tf_body, qr, tb);
                     }
                     g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
-                if (cp > 0.0f) g_rt_lx->PopAxisAlignedClip();
+                if (cp > 0.0f) rt->PopAxisAlignedClip();
             }
-            HRESULT hr = g_rt_lx->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) d2d_release_lx();
+
+            layered_present(g_surf_lx, hwnd, NULL, (BYTE)(255 * g_lx_alpha));
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -3198,7 +3356,7 @@ static void lx_ensure() {
                            0, 0, dip_to_px(lx_width()), dip_to_px(lx_height()),
                            g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
     if (g_lx) {
-        SetLayeredWindowAttributes(g_lx, 0, 255, LWA_ALPHA);
+        enable_acrylic(g_lx);
         DWORD pref = 2;  // DWMWCP_ROUND
         DwmSetWindowAttribute(g_lx, 33, &pref, sizeof(pref));
     }
@@ -3231,7 +3389,8 @@ static void lx_toggle() {
         g_lx_close_anim = 0;
         if (g_lx_sel >= lx_total()) g_lx_sel = 0;
         lx_relayout();
-        SetLayeredWindowAttributes(g_lx, 0, 0, LWA_ALPHA);
+        g_lx_alpha = 0.0f;
+        layered_present_alpha(g_surf_lx, g_lx, 0);
         SetWindowPos(g_lx, HWND_TOPMOST, g_lx_x, g_lx_y + dip_to_px(KB_SLIDE),
                      0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_lx_visible = true;
@@ -3306,7 +3465,7 @@ static void lx_nav(int dir) {
 // only up while the button is held: the left stick slides the underline
 // between the options and letting go sends the one under it.
 #define FLY_W    310
-#define FLY_H     96
+#define FLY_H     64
 #define FLY_PAD   12
 #define FLY_ITEMW ((FLY_W - FLY_PAD * 2) / NRADIAL)
 #define FLY_ANIM  140      // underline glide, ms
@@ -3318,10 +3477,7 @@ static int  g_rad_sel = 0;
 static int  g_rad_prev_sel = 0;
 static ULONGLONG g_rad_move_t0 = 0;
 static ULONGLONG g_rad_in_t0 = 0;
-static ID2D1DCRenderTarget* g_rt_rad = NULL;
-static HDC     g_rad_dc = NULL;      // memory DC holding the DIB below
-static HBITMAP g_rad_dib = NULL;
-static int     g_rad_w = 0, g_rad_h = 0;
+static LayeredSurface g_surf_rad;
 static ID2D1SolidColorBrush*  g_br_rad_card = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_sel = NULL;
 static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
@@ -3341,138 +3497,63 @@ static float ease_out(ULONGLONG t0, int ms) {
     return (float)(1.0 - pow(1.0 - e, 3));
 }
 
-// Undocumented but stable since Windows 10: the API real flyouts and
-// tooltips use for frosted-glass behind a borderless popup, as opposed to
-// the Windows 11 Mica APIs, which turned out to only render properly behind
-// windows with a real caption/frame - a plain WS_EX_TOOLWINDOW popup like
-// this one got a solid white plate instead of material from those.
-static void enable_acrylic(HWND hwnd) {
-    enum { WCA_ACCENT_POLICY = 19 };
-    enum { ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 };
-    struct ACCENT_POLICY {
-        int   AccentState;
-        int   AccentFlags;
-        DWORD GradientColor;   // 0xAABBGGRR: alpha is the tint's own strength
-        int   AnimationId;
-    };
-    struct WINCOMPATTRDATA {
-        int   Attrib;
-        void* pvData;
-        SIZE  cbData;
-    };
-    typedef BOOL(WINAPI * SetWCA)(HWND, WINCOMPATTRDATA*);
-    HMODULE u = GetModuleHandleW(L"user32.dll");
-    SetWCA set = u ? (SetWCA)GetProcAddress(u, "SetWindowCompositionAttribute")
-                   : NULL;
-    if (!set) return;
-    ACCENT_POLICY accent = {ACCENT_ENABLE_ACRYLICBLURBEHIND, 0,
-                            (DWORD)((140u << 24) | RGB(32, 32, 36)), 0};
-    WINCOMPATTRDATA data = {WCA_ACCENT_POLICY, &accent, sizeof(accent)};
-    set(hwnd, &data);
-}
-
 static void d2d_release_rad() {
     ID2D1SolidColorBrush** bs[] = {&g_br_rad_card, &g_br_rad_sel, &g_br_rad_text,
                                    &g_br_rad_dim, &g_br_rad_border};
     for (int i = 0; i < 5; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
-    if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
-    if (g_rt_rad) { g_rt_rad->Release(); g_rt_rad = NULL; }
+    layered_release(g_surf_rad);
 }
 
-static bool d2d_create_rad() {
-    if (g_rt_rad) return true;
-    if (!g_d2d_factory) return false;
-    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-        (float)g_dpi, (float)g_dpi);
-    if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &g_rt_rad))) {
-        g_rt_rad = NULL;
-        return false;
-    }
-    g_rt_rad->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    // Partly transparent, not the old flat fill: the whole point of acrylic
-    // is the blurred desktop showing through the card, which needs this
-    // pixel's own alpha to actually be less than opaque.
-    g_rt_rad->CreateSolidColorBrush(
-        D2D1::ColorF(32.0f / 255, 32.0f / 255, 36.0f / 255, 0.6f),
-        &g_br_rad_card);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
-    g_rt_rad->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
-    g_rt_rad->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
-                                    &g_br_rad_border);
-    return true;
-}
-
-// Draw into the DIB and present with UpdateLayeredWindow, which is what gives
-// the card genuinely antialiased rounded corners over the desktop, and lets
-// the accent policy's blur see the same per-pixel alpha to shape itself to.
 static void rad_render() {
-    if (!g_rad || !d2d_create_rad()) return;
+    if (!g_rad) return;
     int w = dip_to_px(FLY_W), h = dip_to_px(FLY_H);
-    if (!g_rad_dib || g_rad_w != w || g_rad_h != h) {
-        if (g_rad_dc) { DeleteDC(g_rad_dc); g_rad_dc = NULL; }
-        if (g_rad_dib) { DeleteObject(g_rad_dib); g_rad_dib = NULL; }
-        BITMAPINFO bi = {};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;          // top-down
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        void* bits = NULL;
-        HDC screen = GetDC(NULL);
-        g_rad_dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-        g_rad_dc = CreateCompatibleDC(screen);
-        ReleaseDC(NULL, screen);
-        if (!g_rad_dib || !g_rad_dc) return;
-        SelectObject(g_rad_dc, g_rad_dib);
-        g_rad_w = w;
-        g_rad_h = h;
+    bool first = !g_surf_rad.rt;
+    if (!layered_begin(g_surf_rad, w, h)) return;
+    if (first) {
+        // Brushes need creating once, on the same render target instance.
+        ID2D1RenderTarget* rt = g_surf_rad.rt;
+        rt->CreateSolidColorBrush(
+            D2D1::ColorF(32.0f / 255, 32.0f / 255, 36.0f / 255, 0.6f),
+            &g_br_rad_card);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
+        rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                  &g_br_rad_border);
     }
-
-    RECT bind = {0, 0, w, h};
-    if (FAILED(g_rt_rad->BindDC(g_rad_dc, &bind))) return;
-    g_rt_rad->BeginDraw();
-    g_rt_rad->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
+    ID2D1RenderTarget* rt = g_surf_rad.rt;
+    rt->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
 
     D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f, FLY_H - 0.5f);
-    g_rt_rad->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
-                                   g_br_rad_card);
-    g_rt_rad->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
-                                   g_br_rad_border, 1.0f);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f), g_br_rad_card);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                             g_br_rad_border, 1.0f);
 
     if (g_tf_fly) {
         g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        D2D1_RECT_F t = D2D1::RectF(0, 12, FLY_W, 32);
-        g_rt_rad->DrawText(L"Fullscreen", 10, g_tf_fly, t, g_br_rad_dim);
         for (int i = 0; i < NRADIAL; i++) {
-            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + (float)FLY_ITEMW * i, 40,
+            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + (float)FLY_ITEMW * i, 14,
                                          FLY_PAD + (float)FLY_ITEMW * (i + 1),
-                                         66);
-            g_rt_rad->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
-                               g_tf_fly, ir,
-                               i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
-                                              : g_br_rad_dim);
+                                         40);
+            rt->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
+                        g_tf_fly, ir,
+                        i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
+                                       : g_br_rad_dim);
         }
         g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
-    // The underline glides to the new option rather than jumping, which is the
-    // part that makes it feel like a system flyout.
+    // The underline glides to the new option rather than jumping, which is
+    // the part that makes it feel like a system flyout.
     float t = ease_out(g_rad_move_t0, FLY_ANIM);
     float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
     float cx = from + (to - from) * t;
     float halfw = FLY_ITEMW * 0.30f;
-    g_rt_rad->FillRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(cx - halfw, 72, cx + halfw, 75.5f),
+    rt->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(cx - halfw, 46, cx + halfw, 49.5f),
                           1.8f, 1.8f),
         g_br_rad_sel);
-
-    if (g_rt_rad->EndDraw() == D2DERR_RECREATE_TARGET) { d2d_release_rad(); return; }
 
     float in = ease_out(g_rad_in_t0, FLY_IN);
     RECT wa;
@@ -3480,13 +3561,7 @@ static void rad_render() {
     POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
                  wa.bottom - h - dip_to_px(72) +
                      (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
-    SIZE  size = {w, h};
-    POINT src = {0, 0};
-    BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)(255 * in), AC_SRC_ALPHA};
-    HDC screen = GetDC(NULL);
-    UpdateLayeredWindow(g_rad, screen, &pos, &size, g_rad_dc, &src, 0, &bf,
-                        ULW_ALPHA);
-    ReleaseDC(NULL, screen);
+    layered_present(g_surf_rad, g_rad, &pos, (BYTE)(255 * in));
 }
 
 static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4659,7 +4734,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // popup to match, and take the window rect Windows suggests.
         g_dpi = HIWORD(wp);
         if (g_rt_main) g_rt_main->SetDpi((float)g_dpi, (float)g_dpi);
-        if (g_rt_kb)   g_rt_kb->SetDpi((float)g_dpi, (float)g_dpi);
+        if (g_surf_kb.rt) g_surf_kb.rt->SetDpi((float)g_dpi, (float)g_dpi);
         if (g_kb) {
             RECT wa;
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
