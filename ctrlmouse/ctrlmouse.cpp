@@ -2085,6 +2085,24 @@ static IDCompositionDevice* g_dcomp = NULL;
 static IDCompositionTarget* g_dcomp_target = NULL;
 static IDCompositionVisual* g_dcomp_visual = NULL;
 static bool g_mica = false;
+static bool g_mica_capable = false;   // decided at startup; see WinMain
+
+// DWMWA_SYSTEMBACKDROP_TYPE only does anything from the Windows 11 22H2
+// build onward - earlier builds silently ignore or reject it.
+static bool os_supports_mica() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0,
+            KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    wchar_t buf[32] = {};
+    DWORD sz = sizeof(buf), type = 0;
+    bool ok = RegQueryValueExW(k, L"CurrentBuildNumber", NULL, &type,
+                               (BYTE*)buf, &sz) == ERROR_SUCCESS &&
+              type == REG_SZ;
+    RegCloseKey(k);
+    return ok && _wtoi(buf) >= 22621;
+}
 
 static void mica_release() {
     if (g_dc_main) g_dc_main->SetTarget(NULL);
@@ -2118,7 +2136,7 @@ static bool mica_bind_target() {
 }
 
 static bool mica_create(HWND hwnd) {
-    if (!g_d2d_factory) return false;
+    if (!g_mica_capable || !g_d2d_factory) return false;
     // DirectComposition only ships on Windows 8 and later, and the backdrop
     // attribute only does anything on Windows 11, so both are late-bound.
     HMODULE dc_dll = LoadLibraryW(L"dcomp.dll");
@@ -4733,11 +4751,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         }
     }
 
+    g_mica_capable = os_supports_mica();
+
     RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
     DWORD style = WS_OVERLAPPEDWINDOW;   // resizable: content reflows
     AdjustWindowRect(&r, style, FALSE);
-    g_hwnd = CreateWindowW(
-        CLASS_NAME, L"ControllerMouse", style,
+    // No redirection surface when Mica will be attempted: its content is
+    // presented through DirectComposition instead, and leaving the normal
+    // one in place is what showed through as a white window.
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+    DWORD ex = g_mica_capable ? WS_EX_NOREDIRECTIONBITMAP : 0;
+    g_hwnd = CreateWindowExW(
+        ex, CLASS_NAME, L"ControllerMouse", style,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         NULL, NULL, hInst, NULL);
     BOOL dark = TRUE;   // dark title bar to match (Win10 1809+ / Win11)
