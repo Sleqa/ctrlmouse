@@ -14,6 +14,9 @@ than one action can share a button when one is a tap and the other a hold.
 The D-pad is bindable too - its four directions are actions like any other,
 and just start out on volume and seek.
 
+L2 and R2 are drawn in rather than part of the artwork: it is a front-on view,
+so the triggers face away and are not in the picture.
+
 | Controller | Action |
 |---|---|
 | Left stick | Move the mouse cursor |
@@ -123,3 +126,8 @@ line). Settings written by older builds are moved there on first run.
 ## License
 
 [MIT](LICENSE)
+
+`dualsense.png`, the controller artwork on the button-layout page, is not
+mine: it was supplied for this project and its background removed. Confirm
+its licence permits redistribution before publishing a release, since it ships
+inside the binary.

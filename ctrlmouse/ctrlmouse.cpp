@@ -2065,6 +2065,8 @@ static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
 static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
 static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
 static ID2D1SolidColorBrush*  g_br_main_panel = NULL;   // opaque flyout surface
+static ID2D1SolidColorBrush*  g_br_main_trig = NULL;    // L2/R2, matched to the art
+static ID2D1Bitmap*           g_pad_bmp = NULL;       // controller artwork
 static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
 
 static LayeredSurface g_surf_kb;
@@ -2188,9 +2190,11 @@ static void d2d_release_main() {
                                    &g_br_main_dim, &g_br_main_white,
                                    &g_br_main_status, &g_br_main_glow,
                                    &g_br_main_onacc, &g_br_main_card,
-                                   &g_br_main_panel, &g_br_main_border};
-    for (int i = 0; i < 13; i++)
+                                   &g_br_main_panel, &g_br_main_trig,
+                                   &g_br_main_border};
+    for (int i = 0; i < 14; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    if (g_pad_bmp) { g_pad_bmp->Release(); g_pad_bmp = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
 
@@ -2384,6 +2388,7 @@ static bool d2d_create_main(HWND hwnd) {
     // CardBackgroundFillColorDefault sits just above the page behind it -
     // as a translucent layer over Mica, as a solid colour without it.
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_panel);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(9, 16, 26)), &g_br_main_trig);
     if (g_mica_main.active)
         g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
                                          &g_br_main_card);
@@ -3956,11 +3961,15 @@ static int g_page = 0;          // 0 settings, 1 controller
 static int g_pad_popup = -1;    // button the action list is open for, -1 none
 static int g_pad_hover = -1;    // button under the cursor
 
-#define PADV_W  380             // the drawing's own coordinate space
-#define PADV_H  250
+// The artwork is 515x369 and the trigger strip adds 26 above it; the page
+// draws it at PADV_W wide and scales to suit, so every coordinate below stays
+// in the artwork's own pixels.
+#define PADV_W  430             // drawn width, DIPs
 #define PADV_Y  92              // where it starts down the page
+#define PADV_H  ((PADV_W * (369 + 26)) / 515)
 
 static int padv_x() { return content_x() + (content_w() - PADV_W) / 2; }
+static float padv_scale() { return (float)PADV_W / 515.0f; }
 
 static RECT back_btn_rect() {
     int rx = content_x() + content_w();
@@ -3978,39 +3987,39 @@ struct PadBtn {
 };
 #define NPADBTN 18
 static const PadBtn kPadBtn[NPADBTN] = {
-    { 6,  95,  14, 28, 11, false, L"L2"},
-    { 7, 285,  14, 28, 11, false, L"R2"},
-    { 4,  95,  40, 28,  9, false, L"L1"},
-    { 5, 285,  40, 28,  9, false, L"R1"},
-    {BTN_DPAD_UP,    100.0f,  84.5f, 11.0f,  8.5f, false, L""},
-    {BTN_DPAD_DOWN,  100.0f, 123.5f, 11.0f,  8.5f, false, L""},
-    {BTN_DPAD_LEFT,   80.5f, 104.0f,  8.5f, 11.0f, false, L""},
-    {BTN_DPAD_RIGHT, 119.5f, 104.0f,  8.5f, 11.0f, false, L""},
-    { 3, 285,  83, 13,  0, true,  L"Triangle"},
-    { 2, 307, 105, 13,  0, true,  L"Circle"},
-    { 1, 285, 127, 13,  0, true,  L"Cross"},
-    { 0, 263, 105, 13,  0, true,  L"Square"},
-    { 8, 137,  70,  6, 11, false, L"Create"},
-    {13, 190,  84, 38, 22, false, L"Touchpad"},
-    { 9, 243,  70,  6, 11, false, L"Options"},
-    {12, 190, 180,  8,  0, true,  L"PS"},
-    {10, 157, 155, 23,  0, true,  L"L3"},
-    {11, 223, 155, 23,  0, true,  L"R3"},
+    { 6, 121,  12, 22, 10, false, L"L2"},
+    { 7, 393,  12, 22, 10, false, L"R2"},
+    { 4, 121,  40, 16,  9, false, L"L1"},
+    { 5, 393,  40, 16,  9, false, L"R1"},
+    {BTN_DPAD_UP,    101, 100, 15, 16, false, L"D-pad Up"},
+    {BTN_DPAD_DOWN,  101, 156, 15, 16, false, L"D-pad Down"},
+    {BTN_DPAD_LEFT,   74, 127, 16, 15, false, L"D-pad Left"},
+    {BTN_DPAD_RIGHT, 129, 127, 16, 15, false, L"D-pad Right"},
+    { 3, 415,  91, 20,  0, true,  L"Triangle"},
+    { 0, 375, 128, 20,  0, true,  L"Square"},
+    { 2, 452, 128, 20,  0, true,  L"Circle"},
+    { 1, 415, 161, 20,  0, true,  L"Cross"},
+    { 8, 141,  71,  8, 12, false, L"Create"},
+    {13, 257, 100, 88, 50, false, L"Touchpad"},
+    { 9, 378,  70,  8, 12, false, L"Options"},
+    {10, 181, 194, 32,  0, true,  L"L3"},
+    {11, 340, 194, 32,  0, true,  L"R3"},
+    {12, 260, 223, 10,  0, true,  L"PS"},
 };
 
 // Which pad button is at this point, or -1. Coordinates are page coordinates.
 static int padv_hit(POINT pt) {
-    float ox = (float)padv_x(), oy = (float)PADV_Y;
+    float sc = padv_scale();
+    float x = (pt.x - padv_x()) / sc, y = (pt.y - PADV_Y) / sc;
     for (int i = 0; i < NPADBTN; i++) {
         const PadBtn& b = kPadBtn[i];
-        if (b.btn < 0) continue;               // the D-pad isn't rebindable
-        float cx = ox + b.x, cy = oy + b.y;
+        if (b.btn < 0) continue;
         if (b.round) {
-            float dx = pt.x - cx, dy = pt.y - cy;
+            float dx = x - b.x, dy = y - b.y;
             if (dx * dx + dy * dy <= b.w * b.w) return b.btn;
         } else {
-            if (pt.x >= cx - b.w && pt.x <= cx + b.w &&
-                pt.y >= cy - b.h && pt.y <= cy + b.h) return b.btn;
+            if (x >= b.x - b.w && x <= b.x + b.w &&
+                y >= b.y - b.h && y <= b.y + b.h) return b.btn;
         }
     }
     return -1;
@@ -4222,114 +4231,79 @@ static void draw_face_icon(ID2D1RenderTarget* rt, float cx, float cy, int which,
     }
 }
 
-// The controller itself. Drawn rather than shipped as a photo: a top-down
-// photograph can't show L1/L2/R1/R2 at all - they're on the far edge - and
-// four of the bindable buttons having nowhere to sit rather defeats the
-// point. Drawing it also keeps it sharp at any DPI, lets it take the theme's
-// own colours, and puts the hit regions exactly where the shapes are.
+// The controller. Artwork embedded as a resource and decoded with WIC, with
+// the hit regions measured off it - see kPadBtn, whose coordinates are in the
+// artwork's own pixels.
 //
-// Coordinates are the drawing's own space (PADV_W x PADV_H), offset to ox,oy.
-static ID2D1PathGeometry* g_pad_shell = NULL;   // outline, device-independent
-static ID2D1PathGeometry* g_pad_inner = NULL;   // the dark section around the
-                                                // sticks
-static ID2D1PathGeometry* g_pad_cross = NULL;   // the D-pad
+// L2 and R2 are drawn rather than part of the picture: it's a front-on view,
+// so the triggers face away from the camera and simply aren't in it. They go
+// in the strip above, in the same colour the bumpers are drawn in.
+#define PADIMG_W 515            // the artwork's own size
+#define PADIMG_H 369
+#define PAD_TRIG  26            // strip above it, where the triggers go
 
-// x,y then three control-point pairs per curve, as one flat run.
-static ID2D1PathGeometry* pad_geom(const float* pts, int curves) {
-    ID2D1PathGeometry* geom = NULL;
-    if (FAILED(g_d2d_factory->CreatePathGeometry(&geom))) return NULL;
-    ID2D1GeometrySink* sink = NULL;
-    if (FAILED(geom->Open(&sink))) { geom->Release(); return NULL; }
-    sink->BeginFigure(D2D1::Point2F(pts[0], pts[1]), D2D1_FIGURE_BEGIN_FILLED);
-    for (int i = 0; i < curves; i++) {
-        const float* c = pts + 2 + i * 6;
-        sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(c[0], c[1]),
-                                            D2D1::Point2F(c[2], c[3]),
-                                            D2D1::Point2F(c[4], c[5])));
-    }
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    sink->Close();
-    sink->Release();
-    return geom;
+// Decode the artwork out of our own resources. Device-dependent, so it lives
+// and dies with the render target.
+static ID2D1Bitmap* load_pad_bitmap(ID2D1RenderTarget* rt) {
+    if (!rt || !g_wic) return NULL;
+    HMODULE self = GetModuleHandleW(NULL);
+    HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(200), RT_RCDATA);
+    if (!res) return NULL;
+    HGLOBAL h = LoadResource(self, res);
+    void* data = h ? LockResource(h) : NULL;
+    DWORD size = SizeofResource(self, res);
+    if (!data || !size) return NULL;
+
+    IWICStream* stream = NULL;
+    IWICBitmapDecoder* dec = NULL;
+    IWICBitmapFrameDecode* frame = NULL;
+    IWICFormatConverter* fc = NULL;
+    ID2D1Bitmap* out = NULL;
+    if (SUCCEEDED(g_wic->CreateStream(&stream)) &&
+        SUCCEEDED(stream->InitializeFromMemory((BYTE*)data, size)) &&
+        SUCCEEDED(g_wic->CreateDecoderFromStream(stream, NULL,
+                      WICDecodeMetadataCacheOnLoad, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) &&
+        SUCCEEDED(g_wic->CreateFormatConverter(&fc)) &&
+        SUCCEEDED(fc->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
+                                 WICBitmapDitherTypeNone, NULL, 0.0,
+                                 WICBitmapPaletteTypeMedianCut)))
+        rt->CreateBitmapFromWicBitmap(fc, NULL, &out);
+    if (fc) fc->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    if (stream) stream->Release();
+    return out;
 }
 
-static void pad_build_geometry() {
-    if (g_pad_shell || !g_d2d_factory) return;
+// Coordinates are the artwork's pixels; sc scales them into DIPs.
+static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy, float sc,
+                     const Config& c, ID2D1Brush* accent, ID2D1Brush* line,
+                     ID2D1Brush* trig, ID2D1Brush* onacc) {
+    if (!g_pad_bmp) g_pad_bmp = load_pad_bitmap(rt);
 
-    static const float shell[] = {
-        112, 50,
-        150, 44, 230, 44, 268, 50,
-        296, 54, 312, 66, 316, 92,
-        320, 120, 314, 150, 304, 176,
-        294, 212, 280, 240, 254, 242,
-        230, 244, 216, 220, 212, 188,
-        208, 166, 202, 157, 190, 157,
-        178, 157, 172, 166, 168, 188,
-        164, 220, 150, 244, 126, 242,
-        100, 240,  86, 212,  76, 176,
-         66, 150,  60, 120,  64,  92,
-         68,  66,  84,  54, 112,  50,
-    };
-    static const float inner[] = {
-        152, 114,
-        142, 122, 136, 138, 135, 157,
-        134, 176, 141, 192, 155, 196,
-        169, 199, 175, 188, 179, 176,
-        183, 166, 185, 163, 190, 163,
-        195, 163, 197, 166, 201, 176,
-        205, 188, 211, 199, 225, 196,
-        239, 192, 246, 176, 245, 157,
-        244, 138, 238, 122, 228, 114,
-        210, 107, 170, 107, 152, 114,
-    };
-    g_pad_shell = pad_geom(shell, 11);
-    g_pad_inner = pad_geom(inner, 9);
-
-    // The D-pad is a plain cross, so it goes in as lines rather than curves.
-    if (SUCCEEDED(g_d2d_factory->CreatePathGeometry(&g_pad_cross))) {
-        ID2D1GeometrySink* sink = NULL;
-        if (SUCCEEDED(g_pad_cross->Open(&sink))) {
-            static const D2D1_POINT_2F p[] = {
-                { 89,  76}, {111,  76}, {111,  93}, {128,  93},
-                {128, 115}, {111, 115}, {111, 132}, { 89, 132},
-                { 89, 115}, { 72, 115}, { 72,  93}, { 89,  93},
-            };
-            sink->BeginFigure(p[0], D2D1_FIGURE_BEGIN_FILLED);
-            for (int i = 1; i < 12; i++) sink->AddLine(p[i]);
-            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink->Close();
-            sink->Release();
-        }
-    }
-}
-
-static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
-                     const Config& c, ID2D1Brush* body, ID2D1Brush* face,
-                     ID2D1Brush* accent, ID2D1Brush* line, ID2D1Brush* text,
-                     ID2D1Brush* onacc, ID2D1Brush* dark,
-                     IDWriteTextFormat* tf) {
-    pad_build_geometry();
-
-    // Everything is authored around the origin, so one translate puts the
-    // whole thing where it belongs.
     D2D1_MATRIX_3X2_F base;
     rt->GetTransform(&base);
-    rt->SetTransform(D2D1::Matrix3x2F::Translation(ox, oy) * base);
+    rt->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc) *
+                     D2D1::Matrix3x2F::Translation(ox, oy) * base);
 
-    // Shoulders and triggers, behind the shell's top edge.
+    // The triggers first, so the artwork's bumpers overlap them the way the
+    // real ones do.
     for (int i = 0; i < NPADBTN; i++) {
         const PadBtn& b = kPadBtn[i];
-        if (b.btn < 4 || b.btn > 7) continue;
-        D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), body);
+        if (b.btn != 6 && b.btn != 7) continue;
+        D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
+            D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h), 7, 7);
+        rt->FillRoundedRectangle(r, trig);
     }
 
-    if (g_pad_shell) {
-        rt->FillGeometry(g_pad_shell, body);
-        rt->DrawGeometry(g_pad_shell, line, 1.0f);
-    }
-    if (g_pad_inner) rt->FillGeometry(g_pad_inner, dark);
+    if (g_pad_bmp)
+        rt->DrawBitmap(g_pad_bmp,
+                       D2D1::RectF(0, PAD_TRIG, PADIMG_W, PAD_TRIG + PADIMG_H),
+                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 
+    // Anything already carrying an action gets a ring; whatever is under the
+    // cursor gets a wash as well, so it's obvious the picture is clickable.
     for (int i = 0; i < NPADBTN; i++) {
         const PadBtn& b = kPadBtn[i];
         if (b.btn < 0) continue;
@@ -4337,107 +4311,29 @@ static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
         for (int f = 0; f < F_COUNT; f++)
             if (c.bind[f] == b.btn) bound = true;
         bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-        ID2D1Brush* fill = hot ? accent : (bound ? face : body);
+        if (!bound && !hot) continue;
 
-        if (b.btn >= BTN_DPAD_UP) {
-            // The cross is drawn once, below; the arms only paint when they
-            // have something to say.
-            if (!hot && !bound) continue;
-            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
-                                        b.x + b.w, b.y + b.h);
-            rt->FillRectangle(r, fill);
-        } else if (b.btn >= 4 && b.btn <= 7) {
-            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
-                                        b.x + b.w, b.y + b.h);
-            if (hot || bound)
-                rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), fill);
-            rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 6, 6), line, 1.0f);
-        } else if (b.round) {
+        if (b.round) {
             D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(b.x, b.y), b.w, b.w);
-            // Sticks: a dished well with the cap sitting in it.
-            if (b.btn == 10 || b.btn == 11) {
-                rt->FillEllipse(e, dark);
-                rt->DrawEllipse(e, line, 1.0f);
-                rt->FillEllipse(D2D1::Ellipse(e.point, b.w - 8, b.w - 8), fill);
-            } else {
-                rt->FillEllipse(e, fill);
-                rt->DrawEllipse(e, line, 1.0f);
+            if (hot) {
+                accent->SetOpacity(0.35f);
+                rt->FillEllipse(e, accent);
+                accent->SetOpacity(1.0f);
             }
+            rt->DrawEllipse(e, accent, hot ? 2.5f : 2.0f);
         } else {
-            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
-                                        b.x + b.w, b.y + b.h);
-            float rad = (b.btn == 13) ? 8.0f : 3.0f;
-            // The touchpad reads as part of the shell until it has a reason
-            // not to.
-            rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad),
-                                     (b.btn == 13 && !hot && !bound) ? dark
-                                                                     : fill);
-            rt->DrawRoundedRectangle(D2D1::RoundedRect(r, rad, rad), line, 1.0f);
+            float rad = (b.btn == 13) ? 10.0f : 5.0f;
+            D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
+                D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h),
+                rad, rad);
+            if (hot) {
+                accent->SetOpacity(0.35f);
+                rt->FillRoundedRectangle(r, accent);
+                accent->SetOpacity(1.0f);
+            }
+            rt->DrawRoundedRectangle(r, accent, hot ? 2.5f : 2.0f);
         }
     }
-
-    // The cross outline goes over the arm fills, so the shape stays whole.
-    if (g_pad_cross) rt->DrawGeometry(g_pad_cross, line, 1.0f);
-
-    // Arrow heads, so each arm says which way it points.
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        if (b.btn < BTN_DPAD_UP) continue;
-        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-        ID2D1Brush* g = hot ? onacc : text;
-        float a = 3.4f, dx = 0, dy = 0;
-        if (b.btn == BTN_DPAD_UP)    dy = -1;
-        if (b.btn == BTN_DPAD_DOWN)  dy =  1;
-        if (b.btn == BTN_DPAD_LEFT)  dx = -1;
-        if (b.btn == BTN_DPAD_RIGHT) dx =  1;
-        D2D1_POINT_2F tip = D2D1::Point2F(b.x + dx * a, b.y + dy * a);
-        D2D1_POINT_2F l = D2D1::Point2F(b.x - dx * a + dy * a,
-                                        b.y - dy * a + dx * a);
-        D2D1_POINT_2F r = D2D1::Point2F(b.x - dx * a - dy * a,
-                                        b.y - dy * a - dx * a);
-        rt->DrawLine(l, tip, g, 1.3f);
-        rt->DrawLine(tip, r, g, 1.3f);
-    }
-
-    // The four face buttons carry their shapes, which is how anyone reads a
-    // PlayStation pad at a glance.
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        if (b.btn < 0 || b.btn > 3) continue;
-        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-        ID2D1Brush* g = hot ? onacc : text;
-        float cx = b.x, cy = b.y, s = 5.5f;
-        if (b.btn == 0) {
-            rt->DrawRectangle(D2D1::RectF(cx - s, cy - s, cx + s, cy + s), g, 1.4f);
-        } else if (b.btn == 1) {
-            rt->DrawLine(D2D1::Point2F(cx - s, cy - s), D2D1::Point2F(cx + s, cy + s), g, 1.4f);
-            rt->DrawLine(D2D1::Point2F(cx + s, cy - s), D2D1::Point2F(cx - s, cy + s), g, 1.4f);
-        } else if (b.btn == 2) {
-            rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), s, s), g, 1.4f);
-        } else {
-            rt->DrawLine(D2D1::Point2F(cx, cy - s - 1), D2D1::Point2F(cx + s + 1, cy + s), g, 1.4f);
-            rt->DrawLine(D2D1::Point2F(cx + s + 1, cy + s), D2D1::Point2F(cx - s - 1, cy + s), g, 1.4f);
-            rt->DrawLine(D2D1::Point2F(cx - s - 1, cy + s), D2D1::Point2F(cx, cy - s - 1), g, 1.4f);
-        }
-    }
-
-    // Labels for the ones whose shape doesn't say what they are.
-    if (tf) {
-        tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        for (int i = 0; i < NPADBTN; i++) {
-            const PadBtn& b = kPadBtn[i];
-            if (b.btn < 0 || !b.label[0]) continue;
-            bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-            float ly = b.y - 8;
-            if (b.btn == 8 || b.btn == 9) ly = b.y - 30;   // Create / Options
-            if (b.btn == 12) ly = b.y + 10;                // PS
-            D2D1_RECT_F lr = D2D1::RectF(b.x - 34, ly, b.x + 34, ly + 16);
-            rt->DrawText(b.label, (UINT32)wcslen(b.label), tf, lr,
-                         hot ? onacc : text);
-        }
-        tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    }
-
     rt->SetTransform(base);
 }
 
@@ -4772,10 +4668,24 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
                                         to_f(hr2), g_br_main_dim);
                 }
-                draw_pad(g_rt_main, (float)padv_x(), (float)PADV_Y, c,
-                         g_br_main_key, g_br_main_armed, g_br_main_sel,
-                         g_br_main_border, g_br_main_text, g_br_main_onacc,
-                         g_br_main_panel, g_tf_label);
+                draw_pad(g_rt_main, (float)padv_x(), (float)PADV_Y,
+                         padv_scale(), c, g_br_main_sel, g_br_main_border,
+                         g_br_main_trig, g_br_main_onacc);
+
+                // Names whatever is under the cursor, below the artwork
+                // rather than over it.
+                if (g_tf_label) {
+                    int b = (g_pad_hover >= 0) ? g_pad_hover : g_pad_popup;
+                    const wchar_t* nm = L"";
+                    for (int i = 0; i < NPADBTN && b >= 0; i++)
+                        if (kPadBtn[i].btn == b) nm = kPadBtn[i].label;
+                    RECT cr = {content_x(), PADV_Y + PADV_H + 6,
+                               content_x() + content_w(), PADV_Y + PADV_H + 26};
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(nm, (UINT32)wcslen(nm), g_tf_label,
+                                        to_f(cr), g_br_main_text);
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
 
                 // The action list for whichever button was clicked.
                 if (g_pad_popup >= 0) {
