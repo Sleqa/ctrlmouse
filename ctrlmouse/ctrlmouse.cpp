@@ -295,7 +295,7 @@ static Config load_config() {
     if (parse_double(s, "toggle_button", tb)) c.bind[F_TOGGLE] = (int)tb;
     for (int i = 0; i < F_COUNT; i++) {
         double v;
-        if (parse_double(s, kBindKeyA[i], v) && v >= 0 && v < 32)
+        if (parse_double(s, kBindKeyA[i], v) && v >= -1 && v < 32)
             c.bind[i] = (int)v;
     }
     double fk;
@@ -463,7 +463,7 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 // window/state manipulation happens on the UI thread.
 #define WM_GAMEPAD (WM_APP + 2)
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
-       GP_TOGGLE, GP_CAPTURED,
+       GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
        GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH };
 
@@ -480,8 +480,6 @@ static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
 // --- Game detection / toggle-bind state (shared with the worker) -----------
 static volatile bool g_game_active = false;  // fullscreen game detected
 static volatile bool g_override    = false;  // user forced mapping on in-game
-static volatile bool g_capture     = false;  // waiting for a new bind press
-static volatile int  g_capture_feature = -1; // which action is being rebound
 
 // True when a fullscreen game (or other fullscreen app) is in front. Two cheap
 // checks, no process enumeration: the shell's own notification state (which
@@ -1400,23 +1398,13 @@ static DWORD WINAPI worker_thread(LPVOID) {
         for (int f = 0; f < F_COUNT; f++)
             if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
 
-        if (g_capture) {
-            // Rebinding: the first newly pressed button is the new binding.
-            unsigned fresh = mask & ~prev_mask;
-            if (fresh) {
-                int idx = 0;
-                while (!(fresh & (1u << idx))) idx++;
-                PostMessageW(g_hwnd, WM_GAMEPAD, GP_CAPTURED, idx);
-            }
-        } else {
-            // Works even while the mapping is off, so it can turn it back on.
-            // Debounced: toggling rebuilds the device stack and a touchpad
-            // click can bounce, either of which can present a second edge
-            // within a few tens of milliseconds.
-            if (went_down(F_TOGGLE) && bnow - tbtn_last_fire >= 300) {
-                tbtn_last_fire = bnow;
-                PostMessageW(g_hwnd, WM_GAMEPAD, GP_TOGGLE, 0);
-            }
+        // Works even while the mapping is off, so it can turn it back on.
+        // Debounced: toggling rebuilds the device stack and a touchpad click
+        // can bounce, either of which can present a second edge within a few
+        // tens of milliseconds.
+        if (went_down(F_TOGGLE) && bnow - tbtn_last_fire >= 300) {
+            tbtn_last_fire = bnow;
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_TOGGLE, 0);
         }
         btn_mask_prev = mask;
 
@@ -1460,7 +1448,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         bool mapping_on = cfg.enabled &&
                           !(cfg.game_pause && g_game_active && !g_override);
 
-        if (mapping_on && !g_capture) {
+        if (mapping_on) {
             // Stick to cursor movement. Three things matter here for fine
             // control, and they have to work together:
             //
@@ -1696,7 +1684,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // handle is what hands the controller back to other apps, so this is
         // also what makes the toggle button work as a "give me my pad back"
         // gesture mid-stream.
-        bool now_exclusive = mapping_on && !g_capture;
+        bool now_exclusive = mapping_on;
         if (now_exclusive != want_exclusive) {
             want_exclusive = now_exclusive;
             if (g_hid != INVALID_HANDLE_VALUE && g_hid_exclusive != now_exclusive)
@@ -2074,6 +2062,7 @@ static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
 static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
 static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
 static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
+static ID2D1SolidColorBrush*  g_br_main_panel = NULL;   // opaque flyout surface
 static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
 
 static LayeredSurface g_surf_kb;
@@ -2197,8 +2186,8 @@ static void d2d_release_main() {
                                    &g_br_main_dim, &g_br_main_white,
                                    &g_br_main_status, &g_br_main_glow,
                                    &g_br_main_onacc, &g_br_main_card,
-                                   &g_br_main_border};
-    for (int i = 0; i < 12; i++)
+                                   &g_br_main_panel, &g_br_main_border};
+    for (int i = 0; i < 13; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
@@ -2392,6 +2381,7 @@ static bool d2d_create_main(HWND hwnd) {
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
     // CardBackgroundFillColorDefault sits just above the page behind it -
     // as a translucent layer over Mica, as a solid colour without it.
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_panel);
     if (g_mica_main.active)
         g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
                                          &g_br_main_card);
@@ -3808,51 +3798,19 @@ static RECT search_key_rect() {
     return r;
 }
 
-// --- Controls section -------------------------------------------------------
-// Collapsible: eleven rows is most of the window, and it is only wanted while
-// rebinding something.
+// --- Controls ---------------------------------------------------------------
+// One card, which opens the controller page. The old inline list of rows with
+// a "press a button" box each is gone: picking the button first and the action
+// second reads far better on a picture of the pad than a list of names ever
+// did, and it's the only way to see at a glance what a given button already
+// does.
 #define SEC3_Y   (SEARCH_Y + CARD_H + 20)
-#define ROW_Y0   (SEC3_Y + 30)
-#define ROW_STEP 38
-#define NROWS 11
-enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
-static const int kRowFeature[NROWS] = {
-    F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
-    F_LAUNCHER, F_BACK, F_FORWARD, F_TOGGLE, -1, -1};
-static const int kRowIcon[NROWS] = {
-    IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-    IC_LAUNCHER, IC_BACK, IC_FORWARD, IC_POWER, IC_VOLUME, IC_SCRUB};
-static const wchar_t* kRowName[NROWS] = {
-    L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
-    L"Fullscreen", L"App launcher", L"Back", L"Forward",
-    L"Turn mapping on / off", L"Volume", L"Seek"};
-static const wchar_t* kRowDesc[NROWS] = {
-    L"Hold to drag.",
-    L"Opens context menus.",
-    L"Tap to type on screen. Hold to search instead.",
-    L"Sent to whatever is playing, even in the background.",
-    L"Hold. Sends the shortcut chosen above.",
-    L"Hold. A grid of apps you pick, with a search and Windows Settings.",
-    L"Goes back, like the side button on a mouse.",
-    L"Goes forward.",
-    L"Works even while the mapping is off, so you can switch it back on.",
-    L"D-pad up and down. Hold to keep changing.",
-    L"D-pad left and right. Hold to scrub through video.",
-};
-static const int kRowDpad[NROWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2};
+#define MAP_Y    (SEC3_Y + 28)
 
-static bool g_controls_open = false;
-
-static RECT row_card(int i) {
-    RECT r = {content_x(), ROW_Y0 + i * ROW_STEP,
-              content_x() + content_w(), ROW_Y0 + i * ROW_STEP + 34};
-    return r;
-}
-static RECT row_btn_rect(int i) {
-    int y = ROW_Y0 + i * ROW_STEP;
+static RECT map_card() { return card_rect(MAP_Y); }
+static RECT map_btn_rect() {
     int rx = content_x() + content_w();
-    RECT r = {rx - 126, y + 4, rx - 10, y + 30};
+    RECT r = {rx - 116, MAP_Y + 18, rx - 14, MAP_Y + 44};
     return r;
 }
 static RECT sec3_header() {
@@ -3860,10 +3818,121 @@ static RECT sec3_header() {
     return r;
 }
 
+// --- Controller page --------------------------------------------------------
+// Page 1 of the settings window: a picture of the pad, where clicking a button
+// opens a list of actions to put on it.
+enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
+
+static int g_page = 0;          // 0 settings, 1 controller
+static int g_pad_popup = -1;    // button the action list is open for, -1 none
+static int g_pad_hover = -1;    // button under the cursor
+
+#define PADV_W  380             // the drawing's own coordinate space
+#define PADV_H  250
+#define PADV_Y  92              // where it starts down the page
+
+static int padv_x() { return content_x() + (content_w() - PADV_W) / 2; }
+
+static RECT back_btn_rect() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 84, 16, rx, 44};
+    return r;
+}
+
+// Every button on the pad, in the drawing's coordinates. Round ones are a
+// centre and a radius; the rest are a centre and a half-size.
+struct PadBtn {
+    int   btn;                  // index into Config::bind, or -1 for the D-pad
+    float x, y, w, h;           // w is the radius when round
+    bool  round;
+    const wchar_t* label;
+};
+#define NPADBTN 15
+static const PadBtn kPadBtn[NPADBTN] = {
+    { 6,  95,  14, 28, 11, false, L"L2"},
+    { 7, 285,  14, 28, 11, false, L"R2"},
+    { 4,  95,  40, 28,  9, false, L"L1"},
+    { 5, 285,  40, 28,  9, false, L"R1"},
+    {-1, 100, 105, 20, 20, false, L"D-pad"},      // fixed: volume and seek
+    { 3, 285,  85, 13,  0, true,  L"Triangle"},
+    { 2, 305, 105, 13,  0, true,  L"Circle"},
+    { 1, 285, 125, 13,  0, true,  L"Cross"},
+    { 0, 265, 105, 13,  0, true,  L"Square"},
+    { 8, 152,  78,  8, 11, false, L"Create"},
+    {13, 190,  88, 28, 19, false, L"Touchpad"},
+    { 9, 228,  78,  8, 11, false, L"Options"},
+    {12, 190, 122,  9,  0, true,  L"PS"},
+    {10, 152, 148, 24,  0, true,  L"L3"},
+    {11, 238, 148, 24,  0, true,  L"R3"},
+};
+
+// Which pad button is at this point, or -1. Coordinates are page coordinates.
+static int padv_hit(POINT pt) {
+    float ox = (float)padv_x(), oy = (float)PADV_Y;
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        if (b.btn < 0) continue;               // the D-pad isn't rebindable
+        float cx = ox + b.x, cy = oy + b.y;
+        if (b.round) {
+            float dx = pt.x - cx, dy = pt.y - cy;
+            if (dx * dx + dy * dy <= b.w * b.w) return b.btn;
+        } else {
+            if (pt.x >= cx - b.w && pt.x <= cx + b.w &&
+                pt.y >= cy - b.h && pt.y <= cy + b.h) return b.btn;
+        }
+    }
+    return -1;
+}
+
+// The action list, anchored under the button it belongs to.
+#define POP_W   232
+#define POP_ROW 30
+#define POP_TOP 32
+static int pop_height() { return POP_TOP + F_COUNT * POP_ROW + 8; }
+
+static RECT pop_rect() {
+    int y = PADV_Y;
+    int right = padv_x() + PADV_W + 8;
+    int left  = padv_x() - 8 - POP_W;
+    int x;
+    if (right + POP_W <= content_x() + content_w()) x = right;
+    else if (left >= content_x())                   x = left;
+    else {
+        // Narrow window: no room either side, so it lands over the pad.
+        x = content_x() + (content_w() - POP_W) / 2;
+        y = PADV_Y + 20;
+    }
+    RECT r = {x, y, x + POP_W, y + pop_height()};
+    return r;
+}
+
+static RECT pop_row_rect(int f) {
+    RECT p = pop_rect();
+    RECT r = {p.left + 6, p.top + POP_TOP + f * POP_ROW, p.right - 6,
+              p.top + POP_TOP + f * POP_ROW + POP_ROW - 2};
+    return r;
+}
+
+static const wchar_t* kFeatName[F_COUNT] = {
+    L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
+    L"Fullscreen", L"App launcher", L"Turn mapping on / off",
+    L"Forward", L"Back"};
+// Which of them are holds, so the list says so rather than leaving it to be
+// discovered.
+static const wchar_t* kFeatHint[F_COUNT] = {
+    L"", L"", L"tap / hold", L"tap", L"hold", L"hold", L"", L"", L""};
+static const int kFeatIcon[F_COUNT] = {
+    IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+    IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK};
+
 static int win_height() {
-    int h = SEC3_Y + 30;
-    if (g_controls_open) h += NROWS * ROW_STEP + 10;
-    return h + 20;
+    if (g_page == 1) {
+        int h = PADV_Y + PADV_H + 56;
+        int p = PADV_Y + pop_height() + 44;   // room for the list beside it
+        return h > p ? h : p;
+    }
+    return MAP_Y + CARD_H + 54;
 }
 
 static const wchar_t* kFooterText =
@@ -4034,6 +4103,129 @@ static void draw_dpad_icon(ID2D1RenderTarget* rt, float cx, float cy, bool verti
     rt->FillRectangle(D2D1::RectF(cx - a, cy - a, cx + a, cy + a), off);
 }
 
+// The controller itself. Drawn rather than shipped as an image so it stays
+// sharp at any DPI and picks up the theme's own colours - and so the button
+// under the cursor, and every button that already has something on it, can be
+// lit without needing a second asset.
+//
+// Coordinates are the drawing's own space (PADV_W x PADV_H), offset to ox,oy.
+static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
+                     const Config& c, ID2D1Brush* body, ID2D1Brush* face,
+                     ID2D1Brush* accent, ID2D1Brush* line, ID2D1Brush* text,
+                     ID2D1Brush* onacc, IDWriteTextFormat* tf) {
+    // Grips first, so the body sits over where they meet it.
+    D2D1_MATRIX_3X2_F base;
+    rt->GetTransform(&base);
+    for (int side = 0; side < 2; side++) {
+        float gx = ox + (side ? 258.0f : 122.0f);
+        float gy = oy + 190.0f;
+        float ang = side ? 16.0f : -16.0f;
+        rt->SetTransform(
+            D2D1::Matrix3x2F::Rotation(ang, D2D1::Point2F(gx, gy)) * base);
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(gx - 27, gy - 60, gx + 27, gy + 58),
+                              26.0f, 26.0f), body);
+    }
+    rt->SetTransform(base);
+
+    // Shoulders and triggers, behind the body's top edge.
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        if (b.btn != 4 && b.btn != 5 && b.btn != 6 && b.btn != 7) continue;
+        D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
+                                    ox + b.x + b.w, oy + b.y + b.h);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), body);
+    }
+
+    // Body.
+    rt->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(ox + 58, oy + 52, ox + 322, oy + 168),
+                          28.0f, 28.0f), body);
+
+    // Touchpad is part of the shell rather than a button on it, so it gets
+    // the face colour and a hairline instead of a filled cap.
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        bool bound = false;
+        if (b.btn >= 0)
+            for (int f = 0; f < F_COUNT; f++)
+                if (c.bind[f] == b.btn) bound = true;
+        bool hot = (b.btn >= 0 && (b.btn == g_pad_hover || b.btn == g_pad_popup));
+        ID2D1Brush* fill = hot ? accent : (bound ? face : body);
+
+        if (b.btn < 0) {
+            // The D-pad: fixed to volume and seek, so it's drawn as part of
+            // the shell and never lights up.
+            draw_dpad_icon(rt, ox + b.x, oy + b.y, false, face, face);
+            continue;
+        }
+        if (b.btn == 4 || b.btn == 5 || b.btn == 6 || b.btn == 7) {
+            D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
+                                        ox + b.x + b.w, oy + b.y + b.h);
+            if (hot || bound)
+                rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), fill);
+            rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 6, 6), line, 1.0f);
+        } else if (b.round) {
+            D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(ox + b.x, oy + b.y),
+                                           b.w, b.w);
+            rt->FillEllipse(e, fill);
+            rt->DrawEllipse(e, line, 1.0f);
+            // Sticks get an inner ring, so they read as sticks not buttons.
+            if (b.btn == 10 || b.btn == 11)
+                rt->DrawEllipse(D2D1::Ellipse(e.point, b.w - 7, b.w - 7),
+                                line, 1.0f);
+        } else {
+            D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
+                                        ox + b.x + b.w, oy + b.y + b.h);
+            float rad = (b.btn == 13) ? 8.0f : 4.0f;
+            rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad),
+                                     (b.btn == 13 && !hot && !bound) ? face : fill);
+            rt->DrawRoundedRectangle(D2D1::RoundedRect(r, rad, rad), line, 1.0f);
+        }
+    }
+
+    // The four face buttons carry their shapes, which is how anyone reads a
+    // PlayStation pad at a glance.
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        if (b.btn < 0 || b.btn > 3) continue;
+        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
+        ID2D1Brush* g = hot ? onacc : text;
+        float cx = ox + b.x, cy = oy + b.y, s = 5.5f;
+        if (b.btn == 0) {                                   // Square
+            rt->DrawRectangle(D2D1::RectF(cx - s, cy - s, cx + s, cy + s), g, 1.4f);
+        } else if (b.btn == 1) {                            // Cross
+            rt->DrawLine(D2D1::Point2F(cx - s, cy - s), D2D1::Point2F(cx + s, cy + s), g, 1.4f);
+            rt->DrawLine(D2D1::Point2F(cx + s, cy - s), D2D1::Point2F(cx - s, cy + s), g, 1.4f);
+        } else if (b.btn == 2) {                            // Circle
+            rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), s, s), g, 1.4f);
+        } else {                                            // Triangle
+            rt->DrawLine(D2D1::Point2F(cx, cy - s - 1), D2D1::Point2F(cx + s + 1, cy + s), g, 1.4f);
+            rt->DrawLine(D2D1::Point2F(cx + s + 1, cy + s), D2D1::Point2F(cx - s - 1, cy + s), g, 1.4f);
+            rt->DrawLine(D2D1::Point2F(cx - s - 1, cy + s), D2D1::Point2F(cx, cy - s - 1), g, 1.4f);
+        }
+    }
+
+    // Labels for the ones whose shape doesn't say what they are.
+    if (!tf) return;
+    tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        const wchar_t* l = b.label;
+        if (b.btn >= 0 && b.btn <= 3) continue;             // drawn as shapes
+        if (b.btn == 13 || b.btn < 0) continue;             // labelled below
+        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
+        // Shoulders and sticks take the label inside; the small ones can't
+        // hold one, so theirs sits clear of the shape.
+        float ly = oy + b.y - 8;
+        if (b.btn == 8 || b.btn == 9) ly = oy + b.y - 30;   // Create / Options
+        if (b.btn == 12) ly = oy + b.y + 12;                // PS
+        D2D1_RECT_F lr = D2D1::RectF(ox + b.x - 34, ly, ox + b.x + 34, ly + 16);
+        rt->DrawText(l, (UINT32)wcslen(l), tf, lr, hot ? onacc : text);
+    }
+    tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
 // Layout coordinates are in unscrolled document space, so a click has to be
 // pushed back down by however far the list has been scrolled.
@@ -4175,6 +4367,39 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         POINT pt = lparam_to_dip(lp);
         Config c = get_cfg();
+        if (g_page == 1) {
+            RECT bb = back_btn_rect();
+            if (PtInRect(&bb, pt)) {
+                g_page = 0;
+                g_pad_popup = -1;
+                g_scroll = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            // A row in the open action list assigns - or, if it's already on
+            // this button, clears - that action. The list stays up, since
+            // more than one action can share a button (a tap and a hold).
+            if (g_pad_popup >= 0) {
+                for (int f = 0; f < F_COUNT; f++) {
+                    RECT rr = pop_row_rect(f);
+                    if (!PtInRect(&rr, pt)) continue;
+                    EnterCriticalSection(&g_cs);
+                    g_cfg.bind[f] = (g_cfg.bind[f] == g_pad_popup)
+                                        ? -1 : g_pad_popup;
+                    Config nc = g_cfg;
+                    LeaveCriticalSection(&g_cs);
+                    save_config(nc);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                RECT pr = pop_rect();
+                if (PtInRect(&pr, pt)) return 0;   // swallow, don't dismiss
+            }
+            int b = padv_hit(pt);
+            g_pad_popup = (b >= 0 && b == g_pad_popup) ? -1 : b;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         int idx = hit_test_track(pt);
         if (idx >= 0) {
             g_drag_track = idx;
@@ -4200,12 +4425,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        // Collapsing the controls list changes the window height.
         {
-            RECT sh = sec3_header();
-            sh.bottom += 6;
-            if (PtInRect(&sh, pt)) {
-                g_controls_open = !g_controls_open;
+            RECT mb = map_btn_rect();
+            if (PtInRect(&mb, pt)) {
+                g_page = 1;
+                g_pad_popup = -1;
+                g_scroll = 0;
                 clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
@@ -4219,16 +4444,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
-        }
-        for (int i = 0; g_controls_open && i < NROWS; i++) {
-            int f = kRowFeature[i];
-            if (f < 0) continue;
-            RECT br = row_btn_rect(i);
-            if (!PtInRect(&br, pt)) continue;
-            g_capture_feature = f;
-            g_capture = true;   // worker reports the next pressed button
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
         }
         for (int i = 0; i < NSEARCH; i++) {
             { RECT t = search_seg(i); if (!PtInRect(&t, pt)) continue; }
@@ -4253,9 +4468,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_drag_track >= 0) {
             POINT pt = lparam_to_dip(lp);
             apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
+        } else if (g_page == 1) {
+            // Light the button under the cursor, so it's obvious the pad is
+            // something you click rather than a picture.
+            POINT pt = lparam_to_dip(lp);
+            int b = padv_hit(pt);
+            if (b != g_pad_hover) {
+                g_pad_hover = b;
+                InvalidateRect(hwnd, NULL, FALSE);
+                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+            }
         }
         return 0;
     }
+    case WM_MOUSELEAVE:
+        if (g_pad_hover >= 0) {
+            g_pad_hover = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
     case WM_LBUTTONUP: {
         if (g_drag_track >= 0) {
             g_drag_track = -1;
@@ -4282,258 +4514,322 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 D2D1::Matrix3x2F::Translation(0.0f, -(float)g_scroll));
             Config c = get_cfg();
 
-            if (g_tf_title && g_br_main_text)
-                g_rt_main->DrawText(L"ctrlmouse", 9, g_tf_title,
+            if (g_tf_title && g_br_main_text) {
+                const wchar_t* t = (g_page == 1) ? L"Button layout"
+                                                 : L"ctrlmouse";
+                g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_title,
                                     to_f(title_rect()), g_br_main_text);
+            }
 
             // Status label (4-state color, same logic as before).
-            COLORREF sc = RGB(240, 110, 110);
-            if (g_status_state == 1) sc = RGB(88, 210, 128);
-            else if (g_status_state == 2) sc = RGB(235, 180, 80);
-            else if (g_status_state == 3) sc = RGB(150, 150, 158);
-            if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
-            if (g_tf_header && g_br_main_status)
-                g_rt_main->DrawText(g_status_txt, (UINT32)wcslen(g_status_txt),
-                                    g_tf_header, to_f(status_rect()), g_br_main_status);
-
-            // Cards first, so every label and control lands on one.
-            for (int i = 0; i < NTRACKS; i++)
-                draw_control(g_rt_main, to_f(slide_card(i)), CARD_R,
-                             g_br_main_card, g_br_main_border);
-            for (int i = 0; i < NTOGGLES; i++)
-                draw_control(g_rt_main, to_f(toggle_card(i)), CARD_R,
-                             g_br_main_card, g_br_main_border);
-            draw_control(g_rt_main, to_f(search_card()), CARD_R,
-                         g_br_main_card, g_br_main_border);
-            for (int i = 0; g_controls_open && i < NROWS; i++)
-                draw_control(g_rt_main, to_f(row_card(i)), CARD_R,
-                             g_br_main_card, g_br_main_border);
-            {
-                // A small glyph on the left of each card, as WinUI does.
-                const int slideIcon[NTRACKS] = {IC_LCLICK, IC_SCRUB, IC_POWER,
-                                                IC_FORWARD};
-                for (int i = 0; i < NTRACKS; i++) {
-                    RECT c = slide_card(i);
-                    draw_feature_icon(g_rt_main, (float)(c.left + 24),
-                                      (float)((c.top + c.bottom) / 2),
-                                      slideIcon[i], g_br_main_dim, g_br_main_dim);
-                }
-                const int togIcon[NTOGGLES] = {IC_POWER, IC_FULLSCREEN,
-                                               IC_LAUNCHER};
-                for (int i = 0; i < NTOGGLES; i++) {
-                    RECT c = toggle_card(i);
-                    draw_feature_icon(g_rt_main, (float)(c.left + 24),
-                                      (float)((c.top + c.bottom) / 2),
-                                      togIcon[i], g_br_main_dim, g_br_main_dim);
-                }
-                RECT sc = search_card();
-                draw_feature_icon(g_rt_main, (float)(sc.left + 24),
-                                  (float)((sc.top + sc.bottom) / 2),
-                                  IC_KEYBOARD, g_br_main_dim, g_br_main_dim);
+            if (g_page == 0) {
+                COLORREF sc = RGB(240, 110, 110);
+                if (g_status_state == 1) sc = RGB(88, 210, 128);
+                else if (g_status_state == 2) sc = RGB(235, 180, 80);
+                else if (g_status_state == 3) sc = RGB(150, 150, 158);
+                if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
+                if (g_tf_header && g_br_main_status)
+                    g_rt_main->DrawText(g_status_txt,
+                                        (UINT32)wcslen(g_status_txt),
+                                        g_tf_header, to_f(status_rect()),
+                                        g_br_main_status);
             }
 
-            // Section labels (were native STATIC controls; now DirectWrite so
-            // they stay sharp at any DPI).
-            if (g_tf_label) {
-                const wchar_t* hs = hide_status_text();
-                g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
-                                    to_f(hide_rect()), g_br_main_dim);
-                for (int i = 0; i < NTRACKS; i++)
-                    g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
-                                        g_tf_label, to_f(slide_label(i)), g_br_main_dim);
-                for (int i = 0; i < NTOGGLES; i++)
-                    g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
-                                        g_tf_label, to_f(toggle_label(i)), g_br_main_text);
-                // Each setting says what it does, in a line under it.
-                for (int i = 0; i < NTRACKS; i++)
-                    g_rt_main->DrawText(kTrackDesc[i], (UINT32)wcslen(kTrackDesc[i]),
-                                        g_tf_label, to_f(slide_desc(i)), g_br_main_dim);
-                for (int i = 0; i < NTOGGLES; i++)
-                    g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
-                                        g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
-
-                RECT sl = {PAD + CARD_ICON, SEARCH_Y + 11,
-                           content_x() + content_w() - 250, SEARCH_Y + 29};
-                g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
-                                    g_br_main_text);
-                RECT sd = {PAD + CARD_ICON, SEARCH_Y + 30,
-                           content_x() + content_w() - 250, SEARCH_Y + 48};
-                const wchar_t* sdt = (c.search_mode == 1)
-                    ? L"Presses your hotkey to open the launcher you already use."
-                    : L"Shows a simple list of your installed apps.";
-                g_rt_main->DrawText(sdt, (UINT32)wcslen(sdt), g_tf_label,
-                                    to_f(sd), g_br_main_dim);
-
-                // Section headings.
-                RECT s1 = {PAD, SEC1_Y, PAD + CONTENT, SEC1_Y + 20};
-                g_rt_main->DrawText(L"POINTER", 7, g_tf_label, to_f(s1),
-                                    g_br_main_dim);
-                RECT s2 = {PAD, SEC2_Y, PAD + CONTENT, SEC2_Y + 20};
-                g_rt_main->DrawText(L"BEHAVIOUR", 9, g_tf_label, to_f(s2),
-                                    g_br_main_dim);
-                RECT s3 = sec3_header();
-                g_rt_main->DrawText(g_controls_open
-                                        ? L"CONTROLS      (click to hide)"
-                                        : L"CONTROLS      (click to show)",
-                                    29, g_tf_label, to_f(s3), g_br_main_dim);
-
-                RECT fr = footer_rect();
-                g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
-                                    g_tf_label, to_f(fr), g_br_main_dim);
-            }
-
-            // Feature rows: icon, name, what it does, and its binding.
-            for (int i = 0; g_controls_open && i < NROWS; i++) {
-                float cy = (float)(ROW_Y0 + i * ROW_STEP) + 17.0f;
-                int f = kRowFeature[i];
-                draw_feature_icon(g_rt_main, (float)(PAD + 22), cy, kRowIcon[i],
-                                  g_br_main_sel, g_br_main_dim);
+            if (g_page == 1) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
                 if (g_tf_label) {
-                    int y = ROW_Y0 + i * ROW_STEP;
-                    RECT nr = {PAD + CARD_ICON, y + 2, PAD + CARD_ICON + 200,
-                               y + 20};
-                    g_rt_main->DrawText(kRowName[i], (UINT32)wcslen(kRowName[i]),
-                                        g_tf_label, to_f(nr), g_br_main_text);
-                    RECT dr = {content_x() + CARD_ICON, y + 17,
-                               content_x() + content_w() - 136,
-                               y + 33};
-                    g_rt_main->DrawText(kRowDesc[i], (UINT32)wcslen(kRowDesc[i]),
-                                        g_tf_label, to_f(dr), g_br_main_dim);
+                    const wchar_t* h =
+                        L"Click a button to choose what it does. The D-pad is "
+                        L"fixed to volume and seek.";
+                    RECT hr2 = {content_x(), 56, content_x() + content_w(), 76};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
                 }
-                RECT br = row_btn_rect(i);
-                bool capturing = (g_capture && g_capture_feature == f && f >= 0);
-                if (f >= 0) {
-                    draw_control(g_rt_main, to_f(br), 6.0f,
-                                 capturing ? g_br_main_armed : g_br_main_key,
-                                 NULL);
+                draw_pad(g_rt_main, (float)padv_x(), (float)PADV_Y, c,
+                         g_br_main_key, g_br_main_armed, g_br_main_sel,
+                         g_br_main_border, g_br_main_text, g_br_main_onacc,
+                         g_tf_label);
+
+                // The action list for whichever button was clicked.
+                if (g_pad_popup >= 0) {
+                    RECT pr = pop_rect();
+                    draw_control(g_rt_main, to_f(pr), 8.0f, g_br_main_panel,
+                                 g_br_main_border);
+                    if (g_tf_label) {
+                        wchar_t bn[32];
+                        button_name(g_pad_popup, bn, 32);
+                        RECT th = {pr.left + 12, pr.top + 8, pr.right - 12,
+                                   pr.top + 26};
+                        g_rt_main->DrawText(bn, (UINT32)wcslen(bn), g_tf_label,
+                                            to_f(th), g_br_main_dim);
+                    }
+                    for (int f = 0; f < F_COUNT; f++) {
+                        RECT rr = pop_row_rect(f);
+                        bool on = (c.bind[f] == g_pad_popup);
+                        if (on)
+                            draw_control(g_rt_main, to_f(rr), 5.0f,
+                                         g_br_main_sel, NULL);
+                        draw_feature_icon(g_rt_main, (float)(rr.left + 16),
+                                          (float)((rr.top + rr.bottom) / 2),
+                                          kFeatIcon[f],
+                                          on ? (ID2D1Brush*)g_br_main_onacc
+                                             : g_br_main_sel,
+                                          on ? (ID2D1Brush*)g_br_main_onacc
+                                             : g_br_main_dim);
+                        if (!g_tf_label) continue;
+                        RECT nr = {rr.left + 34, rr.top, rr.right - 56,
+                                   rr.bottom};
+                        g_rt_main->DrawText(kFeatName[f],
+                                            (UINT32)wcslen(kFeatName[f]),
+                                            g_tf_label, to_f(nr),
+                                            on ? (ID2D1Brush*)g_br_main_onacc
+                                               : g_br_main_text);
+                        if (!kFeatHint[f][0]) continue;
+                        RECT hr3 = {rr.right - 54, rr.top, rr.right - 10,
+                                    rr.bottom};
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        g_rt_main->DrawText(kFeatHint[f],
+                                            (UINT32)wcslen(kFeatHint[f]),
+                                            g_tf_label, to_f(hr3),
+                                            on ? (ID2D1Brush*)g_br_main_onacc
+                                               : g_br_main_dim);
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+            } else {
+                // Cards first, so every label and control lands on one.
+                for (int i = 0; i < NTRACKS; i++)
+                    draw_control(g_rt_main, to_f(slide_card(i)), CARD_R,
+                                 g_br_main_card, g_br_main_border);
+                for (int i = 0; i < NTOGGLES; i++)
+                    draw_control(g_rt_main, to_f(toggle_card(i)), CARD_R,
+                                 g_br_main_card, g_br_main_border);
+                draw_control(g_rt_main, to_f(search_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
+                draw_control(g_rt_main, to_f(map_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
+                {
+                    // A small glyph on the left of each card, as WinUI does.
+                    const int slideIcon[NTRACKS] = {IC_LCLICK, IC_SCRUB, IC_POWER,
+                                                    IC_FORWARD};
+                    for (int i = 0; i < NTRACKS; i++) {
+                        RECT c = slide_card(i);
+                        draw_feature_icon(g_rt_main, (float)(c.left + 24),
+                                          (float)((c.top + c.bottom) / 2),
+                                          slideIcon[i], g_br_main_dim, g_br_main_dim);
+                    }
+                    const int togIcon[NTOGGLES] = {IC_POWER, IC_FULLSCREEN,
+                                                   IC_LAUNCHER};
+                    for (int i = 0; i < NTOGGLES; i++) {
+                        RECT c = toggle_card(i);
+                        draw_feature_icon(g_rt_main, (float)(c.left + 24),
+                                          (float)((c.top + c.bottom) / 2),
+                                          togIcon[i], g_br_main_dim, g_br_main_dim);
+                    }
+                    RECT sc = search_card();
+                    draw_feature_icon(g_rt_main, (float)(sc.left + 24),
+                                      (float)((sc.top + sc.bottom) / 2),
+                                      IC_KEYBOARD, g_br_main_dim, g_br_main_dim);
+                }
+
+                // Section labels (were native STATIC controls; now DirectWrite so
+                // they stay sharp at any DPI).
+                if (g_tf_label) {
+                    const wchar_t* hs = hide_status_text();
+                    g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
+                                        to_f(hide_rect()), g_br_main_dim);
+                    for (int i = 0; i < NTRACKS; i++)
+                        g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
+                                            g_tf_label, to_f(slide_label(i)), g_br_main_dim);
+                    for (int i = 0; i < NTOGGLES; i++)
+                        g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
+                                            g_tf_label, to_f(toggle_label(i)), g_br_main_text);
+                    // Each setting says what it does, in a line under it.
+                    for (int i = 0; i < NTRACKS; i++)
+                        g_rt_main->DrawText(kTrackDesc[i], (UINT32)wcslen(kTrackDesc[i]),
+                                            g_tf_label, to_f(slide_desc(i)), g_br_main_dim);
+                    for (int i = 0; i < NTOGGLES; i++)
+                        g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
+                                            g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
+
+                    RECT sl = {PAD + CARD_ICON, SEARCH_Y + 11,
+                               content_x() + content_w() - 250, SEARCH_Y + 29};
+                    g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
+                                        g_br_main_text);
+                    RECT sd = {PAD + CARD_ICON, SEARCH_Y + 30,
+                               content_x() + content_w() - 250, SEARCH_Y + 48};
+                    const wchar_t* sdt = (c.search_mode == 1)
+                        ? L"Presses your hotkey to open the launcher you already use."
+                        : L"Shows a simple list of your installed apps.";
+                    g_rt_main->DrawText(sdt, (UINT32)wcslen(sdt), g_tf_label,
+                                        to_f(sd), g_br_main_dim);
+
+                    // Section headings.
+                    RECT s1 = {content_x(), SEC1_Y,
+                               content_x() + content_w(), SEC1_Y + 20};
+                    g_rt_main->DrawText(L"POINTER", 7, g_tf_label, to_f(s1),
+                                        g_br_main_dim);
+                    RECT s2 = {content_x(), SEC2_Y,
+                               content_x() + content_w(), SEC2_Y + 20};
+                    g_rt_main->DrawText(L"BEHAVIOUR", 9, g_tf_label, to_f(s2),
+                                        g_br_main_dim);
+                    RECT s3 = sec3_header();
+                    g_rt_main->DrawText(L"CONTROLS", 8, g_tf_label, to_f(s3),
+                                        g_br_main_dim);
+
+                    RECT fr = footer_rect();
+                    g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
+                                        g_tf_label, to_f(fr), g_br_main_dim);
+                }
+
+                // The card that opens the controller page.
+                {
+                    int y = MAP_Y;
+                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
+                                      (float)y + CARD_H / 2, IC_LAUNCHER,
+                                      g_br_main_sel, g_br_main_dim);
+                    if (g_tf_label) {
+                        RECT nr = {content_x() + CARD_ICON, y + 11,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 29};
+                        g_rt_main->DrawText(L"Button layout", 13, g_tf_label,
+                                            to_f(nr), g_br_main_text);
+                        RECT dr = {content_x() + CARD_ICON, y + 30,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 48};
+                        const wchar_t* d =
+                            L"Choose what each button on the pad does.";
+                        g_rt_main->DrawText(d, (UINT32)wcslen(d), g_tf_label,
+                                            to_f(dr), g_br_main_dim);
+                    }
+                    RECT mb = map_btn_rect();
+                    draw_control(g_rt_main, to_f(mb), 6.0f, g_br_main_key, NULL);
                     if (g_tf_body) {
-                        wchar_t buf[32];
-                        const wchar_t* t = L"Press a button";
-                        if (!capturing) { button_name(c.bind[f], buf, 32); t = buf; }
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_body,
-                                            to_f(br), g_br_main_text);
+                        g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(mb),
+                                            g_br_main_text);
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
-                } else if (kRowDpad[i]) {
-                    // Fixed to the D-pad: show the pad itself with the axis
-                    // that drives this action lit, rather than arrow glyphs.
-                    draw_dpad_icon(g_rt_main, (float)((br.left + br.right) / 2),
-                                   (float)((br.top + br.bottom) / 2),
-                                   kRowDpad[i] == 1, g_br_main_sel, g_br_main_key);
                 }
-            }
 
-            // Trackbars: rounded channel            // Trackbars: rounded channel + accent fill + round thumb.
-            for (int i = 0; i < NTRACKS; i++) {
-                RECT r = slide_track(i);
-                float left = (float)r.left, right = (float)r.right;
-                float cy = (float)((r.top + r.bottom) / 2);
-                g_rt_main->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 2.5f, 2.5f),
-                    g_br_main_key);
-                int pos = track_current_pos(i);
-                double frac = (double)(pos - kTrackLo[i]) / (double)(kTrackHi[i] - kTrackLo[i]);
-                float tx = left + (float)(frac * (right - left));
-                if (tx > left + 4)
+                // Trackbars: rounded channel            // Trackbars: rounded channel + accent fill + round thumb.
+                for (int i = 0; i < NTRACKS; i++) {
+                    RECT r = slide_track(i);
+                    float left = (float)r.left, right = (float)r.right;
+                    float cy = (float)((r.top + r.bottom) / 2);
                     g_rt_main->FillRoundedRectangle(
-                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 2.5f, 2.5f),
-                        g_br_main_sel);
-                // Glow under the thumb while dragging - feedback the old flat
-                // GDI Ellipse couldn't give.
-                D2D1_ELLIPSE thumb = D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f);
-                if (g_drag_track == i && g_br_main_glow) {
-                    for (int k = 3; k >= 1; k--) {
-                        g_br_main_glow->SetOpacity(0.22f / k);
-                        g_rt_main->FillEllipse(
-                            D2D1::Ellipse(thumb.point, 8.0f + 3.5f * k, 8.0f + 3.5f * k),
-                            g_br_main_glow);
+                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 2.5f, 2.5f),
+                        g_br_main_key);
+                    int pos = track_current_pos(i);
+                    double frac = (double)(pos - kTrackLo[i]) / (double)(kTrackHi[i] - kTrackLo[i]);
+                    float tx = left + (float)(frac * (right - left));
+                    if (tx > left + 4)
+                        g_rt_main->FillRoundedRectangle(
+                            D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 2.5f, 2.5f),
+                            g_br_main_sel);
+                    // Glow under the thumb while dragging - feedback the old flat
+                    // GDI Ellipse couldn't give.
+                    D2D1_ELLIPSE thumb = D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f);
+                    if (g_drag_track == i && g_br_main_glow) {
+                        for (int k = 3; k >= 1; k--) {
+                            g_br_main_glow->SetOpacity(0.22f / k);
+                            g_rt_main->FillEllipse(
+                                D2D1::Ellipse(thumb.point, 8.0f + 3.5f * k, 8.0f + 3.5f * k),
+                                g_br_main_glow);
+                        }
+                        g_br_main_glow->SetOpacity(1.0f);
                     }
-                    g_br_main_glow->SetOpacity(1.0f);
+                    g_rt_main->FillEllipse(thumb, g_br_main_sel);
+                    // Small white centre so the thumb reads against the fill.
+                    g_rt_main->FillEllipse(D2D1::Ellipse(thumb.point, 3.0f, 3.0f),
+                                           g_br_main_white);
                 }
-                g_rt_main->FillEllipse(thumb, g_br_main_sel);
-                // Small white centre so the thumb reads against the fill.
-                g_rt_main->FillEllipse(D2D1::Ellipse(thumb.point, 3.0f, 3.0f),
-                                       g_br_main_white);
-            }
 
-            // Value readouts, right-aligned like the old SS_RIGHT statics.
-            if (g_tf_body) {
-                const wchar_t* vals[NTRACKS] = {g_mouse_val_txt, g_scroll_val_txt,
-                                                g_dz_val_txt, g_curve_val_txt};
-                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                for (int i = 0; i < NTRACKS; i++)
-                    g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
-                                        g_tf_body, to_f(slide_value(i)), g_br_main_text);
-                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            }
-
-            // Toggle switches: pill track + sliding white knob.
-            bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause,
-                                        startup_enabled()};
-            for (int i = 0; i < NTOGGLES; i++) {
-                RECT r = toggle_rect(i);
-                float h = (float)(r.bottom - r.top);
-                g_rt_main->FillRoundedRectangle(
-                    D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
-                                                  (float)r.right, (float)r.bottom), h / 2, h / 2),
-                    toggle_on[i] ? g_br_main_sel : g_br_main_toggle_off);
-                float d = h - 6;
-                float kx = toggle_on[i] ? (float)r.right - 3 - d : (float)r.left + 3;
-                // Windows 11 dark theme puts a black knob on the accent fill
-                // and a white one on the off state, since the dark accent is a
-                // light blue.
-                g_rt_main->FillEllipse(
-                    D2D1::Ellipse(D2D1::Point2F(kx + d / 2, (float)r.top + 3 + d / 2), d / 2, d / 2),
-                    toggle_on[i] ? (ID2D1Brush*)g_br_main_onacc : g_br_main_white);
-            }
-
-
-
-            // Which search the keyboard-hold opens.
-            for (int i = 0; i < NSEARCH; i++) {
-                D2D1_ROUNDED_RECT rr =
-                    D2D1::RoundedRect(to_f(search_seg(i)), 8.0f, 8.0f);
-                bool on = (c.search_mode == i);
-                if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
-                else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
+                // Value readouts, right-aligned like the old SS_RIGHT statics.
                 if (g_tf_body) {
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(kSearchName[i],
-                                        (UINT32)wcslen(kSearchName[i]),
-                                        g_tf_body, to_f(search_seg(i)),
-                                        on ? (ID2D1Brush*)g_br_main_onacc
-                                           : g_br_main_dim);
+                    const wchar_t* vals[NTRACKS] = {g_mouse_val_txt, g_scroll_val_txt,
+                                                    g_dz_val_txt, g_curve_val_txt};
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    for (int i = 0; i < NTRACKS; i++)
+                        g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
+                                            g_tf_body, to_f(slide_value(i)), g_br_main_text);
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
-            }
 
-            // The hotkey that summons the third-party launcher.
-            if (c.search_mode == 1) {
-                RECT hk = search_key_rect();
-                draw_control(g_rt_main, to_f(hk), 6.0f,
-                             g_hotkey_capture ? g_br_main_armed : g_br_main_key,
-                             NULL);
-                if (g_tf_body) {
-                    wchar_t kn[48];
-                    if (g_hotkey_capture) wcscpy(kn, L"Press keys...");
-                    else hotkey_name(c.search_mods, c.search_vk, kn, 48);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_body,
-                                        to_f(hk), g_br_main_text);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                // Toggle switches: pill track + sliding white knob.
+                bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause,
+                                            startup_enabled()};
+                for (int i = 0; i < NTOGGLES; i++) {
+                    RECT r = toggle_rect(i);
+                    float h = (float)(r.bottom - r.top);
+                    g_rt_main->FillRoundedRectangle(
+                        D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
+                                                      (float)r.right, (float)r.bottom), h / 2, h / 2),
+                        toggle_on[i] ? g_br_main_sel : g_br_main_toggle_off);
+                    float d = h - 6;
+                    float kx = toggle_on[i] ? (float)r.right - 3 - d : (float)r.left + 3;
+                    // Windows 11 dark theme puts a black knob on the accent fill
+                    // and a white one on the off state, since the dark accent is a
+                    // light blue.
+                    g_rt_main->FillEllipse(
+                        D2D1::Ellipse(D2D1::Point2F(kx + d / 2, (float)r.top + 3 + d / 2), d / 2, d / 2),
+                        toggle_on[i] ? (ID2D1Brush*)g_br_main_onacc : g_br_main_white);
                 }
-            }
 
-            // Install button, only while HidHide is missing.
-            if (g_hh == INVALID_HANDLE_VALUE) {
-                RECT r = hid_btn_rect();
-                g_rt_main->FillRoundedRectangle(
-                    D2D1::RoundedRect(to_f(r), 10.0f, 10.0f), g_br_main_key);
-                if (g_tf_body) {
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(L"Install", 7, g_tf_body, to_f(r), g_br_main_text);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+
+                // Which search the keyboard-hold opens.
+                for (int i = 0; i < NSEARCH; i++) {
+                    D2D1_ROUNDED_RECT rr =
+                        D2D1::RoundedRect(to_f(search_seg(i)), 8.0f, 8.0f);
+                    bool on = (c.search_mode == i);
+                    if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
+                    else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(kSearchName[i],
+                                            (UINT32)wcslen(kSearchName[i]),
+                                            g_tf_body, to_f(search_seg(i)),
+                                            on ? (ID2D1Brush*)g_br_main_onacc
+                                               : g_br_main_dim);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // The hotkey that summons the third-party launcher.
+                if (c.search_mode == 1) {
+                    RECT hk = search_key_rect();
+                    draw_control(g_rt_main, to_f(hk), 6.0f,
+                                 g_hotkey_capture ? g_br_main_armed : g_br_main_key,
+                                 NULL);
+                    if (g_tf_body) {
+                        wchar_t kn[48];
+                        if (g_hotkey_capture) wcscpy(kn, L"Press keys...");
+                        else hotkey_name(c.search_mods, c.search_vk, kn, 48);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_body,
+                                            to_f(hk), g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // Install button, only while HidHide is missing.
+                if (g_hh == INVALID_HANDLE_VALUE) {
+                    RECT r = hid_btn_rect();
+                    g_rt_main->FillRoundedRectangle(
+                        D2D1::RoundedRect(to_f(r), 10.0f, 10.0f), g_br_main_key);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Install", 7, g_tf_body, to_f(r), g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
                 }
             }
 
@@ -4691,20 +4987,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
-            InvalidateRect(hwnd, NULL, FALSE);
-            break;
-        }
-        case GP_CAPTURED: {
-            int f = g_capture_feature;
-            if (f >= 0 && f < F_COUNT) {
-                EnterCriticalSection(&g_cs);
-                g_cfg.bind[f] = (int)lp;
-                Config c = g_cfg;
-                LeaveCriticalSection(&g_cs);
-                save_config(c);
-            }
-            g_capture = false;
-            g_capture_feature = -1;
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
