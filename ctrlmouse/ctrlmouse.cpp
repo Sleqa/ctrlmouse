@@ -1254,6 +1254,8 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool want_exclusive = false;
     int  open_fail_streak = 0;             // consecutive failures to see any pad
     bool radial_up = false;                // radial picker is on screen
+    int  rad_zone_cand = 1;                // debounced flyout zone (see below)
+    ULONGLONG rad_zone_t0 = 0;
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Media controls (D-pad + Square) while the on-screen keyboard is closed.
@@ -1515,8 +1517,14 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
             if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
                 bnow - hold_t0[F_KEYBOARD] >= 500) {
+                // Already open: close it, rather than sending the search
+                // hotkey a second time. Several launchers treat that hotkey
+                // as their own open/close toggle, so resending it looked
+                // like ctrlmouse itself was fighting to close the search.
                 PostMessageW(g_hwnd, WM_GAMEPAD,
-                             cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH, 0);
+                             g_kb_visible ? GP_KB_TOGGLE
+                             : (cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH),
+                             0);
                 hold_fired[F_KEYBOARD] = true;
             }
             if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
@@ -1605,10 +1613,24 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 }
                 if (radial_up && is_down(F_FULLSCREEN)) {
                     // Three zones across the stick, so a push lands on an
-                    // option directly rather than stepping through them.
+                    // option directly rather than stepping through them. The
+                    // middle zone only commits after sitting there a moment,
+                    // since the stick passes through it in transit every time
+                    // it springs back to centre on release - without that,
+                    // letting go of the stick looked identical to choosing
+                    // the middle option on purpose.
                     double sx = st.lx / 1000.0;
                     int want = (sx < -0.33) ? 0 : (sx > 0.33 ? 2 : 1);
-                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, want);
+                    if (want != rad_zone_cand) {
+                        rad_zone_cand = want;
+                        rad_zone_t0 = bnow;
+                    }
+                    if (want != 1 || bnow - rad_zone_t0 >= 90)
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, want);
+                }
+                if (radial_up && !is_down(F_FULLSCREEN)) {
+                    rad_zone_cand = 1;
+                    rad_zone_t0 = 0;
                 }
                 if (radial_up && went_up(F_FULLSCREEN)) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
@@ -4100,6 +4122,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
         if (!g_rt_main) d2d_create_main(hwnd);
+        // A flip-model swap chain rotates which physical buffer GetBuffer(0)
+        // returns on every Present, so the D2D bitmap has to be rebound to
+        // the current one before each frame - otherwise every other frame
+        // draws onto a buffer that isn't the one about to be shown, and the
+        // one actually presented still has last frame's (or the initial,
+        // blank white) content on it.
+        if (g_mica) mica_bind_target();
         if (g_rt_main) {
             g_rt_main->BeginDraw();
             g_rt_main->Clear(g_mica ? D2D1::ColorF(0, 0.0f)
