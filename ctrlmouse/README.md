@@ -11,7 +11,8 @@ XInput pads.
 Every action below is rebindable: open **Button layout** in the settings
 window, click a button on the controller, and pick what it should do. More
 than one action can share a button when one is a tap and the other a hold.
-The D-pad media bindings are fixed.
+The D-pad is bindable too - its four directions are actions like any other,
+and just start out on volume and seek.
 
 | Controller | Action |
 |---|---|
@@ -25,7 +26,7 @@ The D-pad media bindings are fixed.
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
 | Triangle / Y | Open / close the on-screen keyboard |
 | Triangle *(hold)* | Open the keyboard with an app search bar |
-| Options *(hold)* | Open the app launcher |
+| Options | Open / close the app launcher |
 | D-pad *(launcher open)* | Move between apps |
 | Cross *(launcher open)* | Launch the highlighted app |
 | Circle *(launcher open)* | Close the launcher |
@@ -36,7 +37,7 @@ The D-pad media bindings are fixed.
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
 | Cross *(keyboard open)* | Type the highlighted key |
 | Circle *(keyboard open)* | Backspace |
-| Touchpad click *(customizable)* | Toggle the mapping on / off |
+| Touchpad click *(customizable)* | Toggle the mapping on / off, with a flyout saying which |
 
 Volume and play/pause use the system media keys, so they reach whichever app
 owns playback even in the background. Seeking sends left/right arrow keys —
@@ -112,7 +113,7 @@ line). Settings written by older builds are moved there on first run.
 | `scroll_sensitivity` | Scroll speed at full deflection | `1.0` |
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
-| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` | Controller button index per action, or -1 for none; set from Button layout | `1, 2, 3, 0, 0, 9, 13, 5, 4` |
+| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` / `bind_volume_up` / `bind_volume_down` / `bind_seek_fwd` / `bind_seek_back` | Controller button index per action, or -1 for none; set from Button layout. 0-13 are the pad's buttons, 16-19 the D-pad directions | `1, 2, 3, 0, 0, 9, 13, 5, 4, 16, 18, 17, 19` |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Last shortcut picked in the fullscreen flyout: 0 = F11, 1 = Alt+Enter, 2 = F | `0` |

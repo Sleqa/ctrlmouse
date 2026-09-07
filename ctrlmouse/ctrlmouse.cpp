@@ -74,11 +74,21 @@ extern "C" {
 // Every controller action is rebindable. Fullscreen and the launcher are hold
 // actions; the rest act on press or while held.
 enum { F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
-       F_LAUNCHER, F_TOGGLE, F_FORWARD, F_BACK, F_COUNT };
+       F_LAUNCHER, F_TOGGLE, F_FORWARD, F_BACK,
+       F_VOLUP, F_VOLDOWN, F_SEEKFWD, F_SEEKBACK, F_COUNT };
 static const char* kBindKeyA[F_COUNT] = {
     "bind_lclick", "bind_rclick", "bind_keyboard", "bind_playpause",
     "bind_fullscreen", "bind_launcher", "bind_toggle",
-    "bind_forward", "bind_back"};
+    "bind_forward", "bind_back",
+    "bind_volume_up", "bind_volume_down", "bind_seek_fwd", "bind_seek_back"};
+
+// The D-pad is bindable like anything else. It arrives as a hat rather than
+// four bits, so its directions are folded into the button mask above the ones
+// the pad itself uses - everything downstream then treats them as buttons.
+#define BTN_DPAD_UP    16
+#define BTN_DPAD_RIGHT 17
+#define BTN_DPAD_DOWN  18
+#define BTN_DPAD_LEFT  19
 
 struct Config {
     double mouse_sensitivity;   // pixels per poll at full stick deflection
@@ -95,11 +105,14 @@ struct Config {
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
-// Cross, Circle, Triangle, Square, Square (hold), Options (hold), Touchpad,
-// R1 (forward), L1 (back).
+// Cross, Circle, Triangle, Square, Square (hold), Options, Touchpad,
+// R1 (forward), L1 (back), then the D-pad: up and down for volume, right and
+// left to seek.
 static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
                                 0, MOD_ALT, VK_SPACE,
-                                {1, 2, 3, 0, 0, 9, 13, 5, 4}};
+                                {1, 2, 3, 0, 0, 9, 13, 5, 4,
+                                 BTN_DPAD_UP, BTN_DPAD_DOWN,
+                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -1259,11 +1272,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
     int  rad_deflect = -1;                 // -1 centred, 0 left, 2 right
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
-    // Media controls (D-pad + Square) while the on-screen keyboard is closed.
-    int       media_dir = -1;              // D-pad direction being held
-    ULONGLONG media_t0 = 0, media_last = 0;
-    int       media_reps = 0;              // repeats so far, drives acceleration
-
+    // Volume and seek repeat state, one set each, in F_VOLUP order.
+    ULONGLONG media_t0[4] = {}, media_last[4] = {};
+    int       media_reps[4] = {};          // repeats so far, drives acceleration
 
     while (g_running) {
         Config cfg = get_cfg();
@@ -1347,6 +1358,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
 
         g_connected = true;
         unsigned mask = st.mask;
+        if (st.hat >= 0) mask |= 1u << (BTN_DPAD_UP + st.hat);
 
         // A reopened handle starts with no history, so a button still held
         // across the reopen would look like a brand new press. That is what
@@ -1366,7 +1378,6 @@ static DWORD WINAPI worker_thread(LPVOID) {
             btn_mask_prev = mask;              // adopt every button at once
             for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
             dpad_prev = st.hat;
-            media_dir = st.hat;
         }
 
         // Edge helpers over the raw mask, so every action reads its own bound
@@ -1528,17 +1539,13 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 if (went_down(F_FORWARD)) mouse_xbutton(XBUTTON2);
             }
 
-            // Launcher is a hold, checked before the popups so it works
-            // whichever of them happens to be up.
-            if (is_down(F_LAUNCHER) && !hold_fired[F_LAUNCHER] &&
-                bnow - hold_t0[F_LAUNCHER] >= 500) {
+            // Checked before the popups so it works whichever of them
+            // happens to be up.
+            if (went_down(F_LAUNCHER))
                 PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_TOGGLE, 0);
-                hold_fired[F_LAUNCHER] = true;
-            }
 
             if (g_lx_visible) {
                 // Launcher owns navigation and the click buttons while up.
-                media_dir = st.hat;
                 if (went_down(F_LCLICK))
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_SELECT, 0);
                 if (went_down(F_RCLICK))
@@ -1556,9 +1563,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     dpad_last = bnow;
                 }
             } else if (g_kb_visible) {
-                // Keep media state in step while the keyboard owns the D-pad,
-                // so closing it with a direction held doesn't fire.
-                media_dir = st.hat;
+
                 // PowerToys owns the result list, and our D-pad is busy with
                 // the keys, so the shoulder buttons walk it.
                 if (g_kb_external) {
@@ -1638,29 +1643,28 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     tap_key(VK_MEDIA_PLAY_PAUSE);
                 }
 
-                // Media on the D-pad: up/down are system-wide volume keys,
-                // left/right send arrow keys, which is how players seek.
-                int dir = st.hat;
-                WORD mk = 0;
-                if (dir == 0)      mk = VK_VOLUME_UP;
-                else if (dir == 2) mk = VK_VOLUME_DOWN;
-                else if (dir == 1) mk = VK_RIGHT;
-                else if (dir == 3) mk = VK_LEFT;
-                if (dir != media_dir) {
-                    media_dir = dir;
-                    media_t0 = media_last = bnow;
-                    media_reps = 0;
-                    if (mk) tap_key(mk);
-                } else if (mk && bnow - media_t0 >= 350) {
-                    // Speeds up the longer it is held: 140ms down to 40ms.
-                    // Signed on purpose - in unsigned this wrapped once the
-                    // subtraction went negative and stalled the repeat.
-                    int gap = 140 - media_reps * 8;
-                    if (gap < 40) gap = 40;
-                    if (bnow - media_last >= (ULONGLONG)gap) {
-                        tap_key(mk);
-                        media_last = bnow;
-                        media_reps++;
+                // Volume and seek. Ordinary actions now rather than the
+                // D-pad specifically, so they can be moved anywhere; they
+                // just start out on it. Each holds to repeat, and speeds up
+                // the longer it is held: 140ms down to 40ms. The gap is
+                // signed on purpose - in unsigned it wrapped once the
+                // subtraction went negative and stalled the repeat.
+                static const WORD kMediaVk[4] = {
+                    VK_VOLUME_UP, VK_VOLUME_DOWN, VK_RIGHT, VK_LEFT};
+                for (int m = 0; m < 4; m++) {
+                    int f = F_VOLUP + m;
+                    if (went_down(f)) {
+                        media_t0[m] = media_last[m] = bnow;
+                        media_reps[m] = 0;
+                        tap_key(kMediaVk[m]);
+                    } else if (is_down(f) && bnow - media_t0[m] >= 350) {
+                        int gap = 140 - media_reps[m] * 8;
+                        if (gap < 40) gap = 40;
+                        if (bnow - media_last[m] >= (ULONGLONG)gap) {
+                            tap_key(kMediaVk[m]);
+                            media_last[m] = bnow;
+                            media_reps[m]++;
+                        }
                     }
                 }
             }
@@ -1669,9 +1673,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             scroll_vel = 0.0;
             move_ax = move_ay = 0.0;
             dpad_prev = -1;
-            // Track the pad while paused too, so re-enabling with something
-            // already held does not fire an action.
-            media_dir = st.hat;
+
             for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
         }
 
@@ -3614,6 +3616,132 @@ static void rad_select(int i) {
     }
 }
 
+// --- Status flyout ----------------------------------------------------------
+// Shown whenever the mapping is switched on or off, so the toggle button says
+// what it did without needing the settings window open. Same shape and motion
+// as the fullscreen flyout: the name, underlined in the accent while the
+// mapping is on, and dimmed with it while it is off.
+#define ST_W    190
+#define ST_H     64
+#define ST_HOLD 1400            // how long it stays up, ms
+#define ST_TIMER 4
+
+static HWND g_st = NULL;
+static bool g_st_on = true;             // what the flyout is currently saying
+static ULONGLONG g_st_t0 = 0;           // when it appeared
+static LayeredSurface g_surf_st;
+static ID2D1SolidColorBrush* g_br_st_card = NULL;
+static ID2D1SolidColorBrush* g_br_st_text = NULL;
+static ID2D1SolidColorBrush* g_br_st_dim = NULL;
+static ID2D1SolidColorBrush* g_br_st_sel = NULL;
+static ID2D1SolidColorBrush* g_br_st_border = NULL;
+
+static void d2d_release_st() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_st_card, &g_br_st_text, &g_br_st_dim,
+                                   &g_br_st_sel, &g_br_st_border};
+    for (int i = 0; i < 5; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    layered_release(g_surf_st);
+}
+
+static void st_render() {
+    if (!g_st) return;
+    int w = dip_to_px(ST_W), h = dip_to_px(ST_H);
+    bool first = !g_surf_st.rt;
+    if (!layered_begin(g_surf_st, w, h)) return;
+    ID2D1RenderTarget* rt = g_surf_st.rt;
+    if (first) {
+        rt->CreateSolidColorBrush(
+            D2D1::ColorF(32.0f / 255, 32.0f / 255, 36.0f / 255, 0.6f),
+            &g_br_st_card);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_st_text);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_st_dim);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_st_sel);
+        rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                  &g_br_st_border);
+    }
+
+    // Fades out over the last stretch rather than vanishing.
+    float in = ease_out(g_st_t0, FLY_IN);
+    float out = 1.0f;
+    if (g_st_t0) {
+        ULONGLONG age = GetTickCount64() - g_st_t0;
+        if (age > ST_HOLD) {
+            double e = (double)(age - ST_HOLD) / FLY_IN;
+            out = (e >= 1.0) ? 0.0f : (float)(1.0 - e);
+        }
+    }
+
+    rt->Clear(D2D1::ColorF(0, 0.0f));
+    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, ST_W - 0.5f, ST_H - 0.5f);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f), g_br_st_card);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                             g_br_st_border, 1.0f);
+
+    // Off is the same layout with the life taken out of it, so the two states
+    // read as the same thing in two conditions rather than two messages.
+    ID2D1Brush* tb = g_st_on ? (ID2D1Brush*)g_br_st_text : g_br_st_dim;
+    ID2D1Brush* ub = g_st_on ? (ID2D1Brush*)g_br_st_sel : g_br_st_dim;
+    if (!g_st_on && g_br_st_dim) g_br_st_dim->SetOpacity(0.45f);
+    if (g_tf_fly) {
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        D2D1_RECT_F t = D2D1::RectF(0, 16, ST_W, 40);
+        rt->DrawText(L"ctrlmouse", 9, g_tf_fly, t, tb);
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    rt->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(ST_W / 2 - 34.0f, 44, ST_W / 2 + 34.0f,
+                                      47.5f), 1.8f, 1.8f), ub);
+    if (!g_st_on && g_br_st_dim) g_br_st_dim->SetOpacity(1.0f);
+
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
+                 wa.bottom - h - dip_to_px(72) +
+                     (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
+    layered_present(g_surf_st, g_st, &pos, (BYTE)(255 * in * out));
+}
+
+static LRESULT CALLBACK st_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TIMER) {
+        st_render();
+        if (g_st_t0 && GetTickCount64() - g_st_t0 >= (ULONGLONG)ST_HOLD + FLY_IN) {
+            KillTimer(hwnd, ST_TIMER);
+            ShowWindow(hwnd, SW_HIDE);
+            g_st_t0 = 0;
+        }
+        return 0;
+    }
+    if (msg == WM_DESTROY) { d2d_release_st(); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Called whenever the mapping is switched, from wherever.
+static void st_show(bool on) {
+    if (!g_st) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = st_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"ControllerMouseStatus";
+        RegisterClassW(&wc);
+        g_st = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            L"ControllerMouseStatus", L"", WS_POPUP, 0, 0,
+            dip_to_px(ST_W), dip_to_px(ST_H), g_hwnd, NULL,
+            GetModuleHandleW(NULL), NULL);
+        if (g_st) enable_acrylic(g_st);
+    }
+    if (!g_st) return;
+    g_st_on = on;
+    g_st_t0 = GetTickCount64();
+    st_render();
+    ShowWindow(g_st, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_st, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetTimer(g_st, ST_TIMER, 15, NULL);
+}
+
 // --- System tray -----------------------------------------------------------
 #define WM_TRAYICON   (WM_APP + 1)
 #define ID_TRAY_SHOW  2001
@@ -3848,23 +3976,26 @@ struct PadBtn {
     bool  round;
     const wchar_t* label;
 };
-#define NPADBTN 15
+#define NPADBTN 18
 static const PadBtn kPadBtn[NPADBTN] = {
     { 6,  95,  14, 28, 11, false, L"L2"},
     { 7, 285,  14, 28, 11, false, L"R2"},
     { 4,  95,  40, 28,  9, false, L"L1"},
     { 5, 285,  40, 28,  9, false, L"R1"},
-    {-1, 100, 105, 20, 20, false, L"D-pad"},      // fixed: volume and seek
-    { 3, 285,  85, 13,  0, true,  L"Triangle"},
-    { 2, 305, 105, 13,  0, true,  L"Circle"},
-    { 1, 285, 125, 13,  0, true,  L"Cross"},
-    { 0, 265, 105, 13,  0, true,  L"Square"},
-    { 8, 152,  78,  8, 11, false, L"Create"},
-    {13, 190,  88, 28, 19, false, L"Touchpad"},
-    { 9, 228,  78,  8, 11, false, L"Options"},
-    {12, 190, 122,  9,  0, true,  L"PS"},
-    {10, 152, 148, 24,  0, true,  L"L3"},
-    {11, 238, 148, 24,  0, true,  L"R3"},
+    {BTN_DPAD_UP,    100.0f,  84.5f, 11.0f,  8.5f, false, L""},
+    {BTN_DPAD_DOWN,  100.0f, 123.5f, 11.0f,  8.5f, false, L""},
+    {BTN_DPAD_LEFT,   80.5f, 104.0f,  8.5f, 11.0f, false, L""},
+    {BTN_DPAD_RIGHT, 119.5f, 104.0f,  8.5f, 11.0f, false, L""},
+    { 3, 285,  83, 13,  0, true,  L"Triangle"},
+    { 2, 307, 105, 13,  0, true,  L"Circle"},
+    { 1, 285, 127, 13,  0, true,  L"Cross"},
+    { 0, 263, 105, 13,  0, true,  L"Square"},
+    { 8, 137,  70,  6, 11, false, L"Create"},
+    {13, 190,  84, 38, 22, false, L"Touchpad"},
+    { 9, 243,  70,  6, 11, false, L"Options"},
+    {12, 190, 180,  8,  0, true,  L"PS"},
+    {10, 157, 155, 23,  0, true,  L"L3"},
+    {11, 223, 155, 23,  0, true,  L"R3"},
 };
 
 // Which pad button is at this point, or -1. Coordinates are page coordinates.
@@ -3917,14 +4048,17 @@ static RECT pop_row_rect(int f) {
 static const wchar_t* kFeatName[F_COUNT] = {
     L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
     L"Fullscreen", L"App launcher", L"Turn mapping on / off",
-    L"Forward", L"Back"};
+    L"Forward", L"Back",
+    L"Volume up", L"Volume down", L"Seek forward", L"Seek back"};
 // Which of them are holds, so the list says so rather than leaving it to be
 // discovered.
 static const wchar_t* kFeatHint[F_COUNT] = {
-    L"", L"", L"tap / hold", L"tap", L"hold", L"hold", L"", L"", L""};
+    L"", L"", L"tap / hold", L"tap", L"hold", L"", L"", L"", L"",
+    L"repeats", L"repeats", L"repeats", L"repeats"};
 static const int kFeatIcon[F_COUNT] = {
     IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-    IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK};
+    IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK,
+    IC_VOLUME, IC_VOLUME, IC_SCRUB, IC_SCRUB};
 
 static int win_height() {
     if (g_page == 1) {
@@ -4088,100 +4222,181 @@ static void draw_face_icon(ID2D1RenderTarget* rt, float cx, float cy, int which,
     }
 }
 
-// A D-pad cross with one axis highlighted; `vertical` picks up/down vs left/right.
-static void draw_dpad_icon(ID2D1RenderTarget* rt, float cx, float cy, bool vertical,
-                           ID2D1Brush* on, ID2D1Brush* off) {
-    const float a = 3.2f, b = 10.0f;   // arm half-width, arm reach
-    D2D1_RECT_F up    = D2D1::RectF(cx - a, cy - b, cx + a, cy - a);
-    D2D1_RECT_F down  = D2D1::RectF(cx - a, cy + a, cx + a, cy + b);
-    D2D1_RECT_F left  = D2D1::RectF(cx - b, cy - a, cx - a, cy + a);
-    D2D1_RECT_F right = D2D1::RectF(cx + a, cy - a, cx + b, cy + a);
-    rt->FillRectangle(up,    vertical ? on : off);
-    rt->FillRectangle(down,  vertical ? on : off);
-    rt->FillRectangle(left,  vertical ? off : on);
-    rt->FillRectangle(right, vertical ? off : on);
-    rt->FillRectangle(D2D1::RectF(cx - a, cy - a, cx + a, cy + a), off);
-}
-
-// The controller itself. Drawn rather than shipped as an image so it stays
-// sharp at any DPI and picks up the theme's own colours - and so the button
-// under the cursor, and every button that already has something on it, can be
-// lit without needing a second asset.
+// The controller itself. Drawn rather than shipped as a photo: a top-down
+// photograph can't show L1/L2/R1/R2 at all - they're on the far edge - and
+// four of the bindable buttons having nowhere to sit rather defeats the
+// point. Drawing it also keeps it sharp at any DPI, lets it take the theme's
+// own colours, and puts the hit regions exactly where the shapes are.
 //
 // Coordinates are the drawing's own space (PADV_W x PADV_H), offset to ox,oy.
+static ID2D1PathGeometry* g_pad_shell = NULL;   // outline, device-independent
+static ID2D1PathGeometry* g_pad_inner = NULL;   // the dark section around the
+                                                // sticks
+static ID2D1PathGeometry* g_pad_cross = NULL;   // the D-pad
+
+// x,y then three control-point pairs per curve, as one flat run.
+static ID2D1PathGeometry* pad_geom(const float* pts, int curves) {
+    ID2D1PathGeometry* geom = NULL;
+    if (FAILED(g_d2d_factory->CreatePathGeometry(&geom))) return NULL;
+    ID2D1GeometrySink* sink = NULL;
+    if (FAILED(geom->Open(&sink))) { geom->Release(); return NULL; }
+    sink->BeginFigure(D2D1::Point2F(pts[0], pts[1]), D2D1_FIGURE_BEGIN_FILLED);
+    for (int i = 0; i < curves; i++) {
+        const float* c = pts + 2 + i * 6;
+        sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(c[0], c[1]),
+                                            D2D1::Point2F(c[2], c[3]),
+                                            D2D1::Point2F(c[4], c[5])));
+    }
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    sink->Close();
+    sink->Release();
+    return geom;
+}
+
+static void pad_build_geometry() {
+    if (g_pad_shell || !g_d2d_factory) return;
+
+    static const float shell[] = {
+        112, 50,
+        150, 44, 230, 44, 268, 50,
+        296, 54, 312, 66, 316, 92,
+        320, 120, 314, 150, 304, 176,
+        294, 212, 280, 240, 254, 242,
+        230, 244, 216, 220, 212, 188,
+        208, 166, 202, 157, 190, 157,
+        178, 157, 172, 166, 168, 188,
+        164, 220, 150, 244, 126, 242,
+        100, 240,  86, 212,  76, 176,
+         66, 150,  60, 120,  64,  92,
+         68,  66,  84,  54, 112,  50,
+    };
+    static const float inner[] = {
+        152, 114,
+        142, 122, 136, 138, 135, 157,
+        134, 176, 141, 192, 155, 196,
+        169, 199, 175, 188, 179, 176,
+        183, 166, 185, 163, 190, 163,
+        195, 163, 197, 166, 201, 176,
+        205, 188, 211, 199, 225, 196,
+        239, 192, 246, 176, 245, 157,
+        244, 138, 238, 122, 228, 114,
+        210, 107, 170, 107, 152, 114,
+    };
+    g_pad_shell = pad_geom(shell, 11);
+    g_pad_inner = pad_geom(inner, 9);
+
+    // The D-pad is a plain cross, so it goes in as lines rather than curves.
+    if (SUCCEEDED(g_d2d_factory->CreatePathGeometry(&g_pad_cross))) {
+        ID2D1GeometrySink* sink = NULL;
+        if (SUCCEEDED(g_pad_cross->Open(&sink))) {
+            static const D2D1_POINT_2F p[] = {
+                { 89,  76}, {111,  76}, {111,  93}, {128,  93},
+                {128, 115}, {111, 115}, {111, 132}, { 89, 132},
+                { 89, 115}, { 72, 115}, { 72,  93}, { 89,  93},
+            };
+            sink->BeginFigure(p[0], D2D1_FIGURE_BEGIN_FILLED);
+            for (int i = 1; i < 12; i++) sink->AddLine(p[i]);
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink->Close();
+            sink->Release();
+        }
+    }
+}
+
 static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
                      const Config& c, ID2D1Brush* body, ID2D1Brush* face,
                      ID2D1Brush* accent, ID2D1Brush* line, ID2D1Brush* text,
-                     ID2D1Brush* onacc, IDWriteTextFormat* tf) {
-    // Grips first, so the body sits over where they meet it.
+                     ID2D1Brush* onacc, ID2D1Brush* dark,
+                     IDWriteTextFormat* tf) {
+    pad_build_geometry();
+
+    // Everything is authored around the origin, so one translate puts the
+    // whole thing where it belongs.
     D2D1_MATRIX_3X2_F base;
     rt->GetTransform(&base);
-    for (int side = 0; side < 2; side++) {
-        float gx = ox + (side ? 258.0f : 122.0f);
-        float gy = oy + 190.0f;
-        float ang = side ? 16.0f : -16.0f;
-        rt->SetTransform(
-            D2D1::Matrix3x2F::Rotation(ang, D2D1::Point2F(gx, gy)) * base);
-        rt->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(gx - 27, gy - 60, gx + 27, gy + 58),
-                              26.0f, 26.0f), body);
-    }
-    rt->SetTransform(base);
+    rt->SetTransform(D2D1::Matrix3x2F::Translation(ox, oy) * base);
 
-    // Shoulders and triggers, behind the body's top edge.
+    // Shoulders and triggers, behind the shell's top edge.
     for (int i = 0; i < NPADBTN; i++) {
         const PadBtn& b = kPadBtn[i];
-        if (b.btn != 4 && b.btn != 5 && b.btn != 6 && b.btn != 7) continue;
-        D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
-                                    ox + b.x + b.w, oy + b.y + b.h);
+        if (b.btn < 4 || b.btn > 7) continue;
+        D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h);
         rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), body);
     }
 
-    // Body.
-    rt->FillRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(ox + 58, oy + 52, ox + 322, oy + 168),
-                          28.0f, 28.0f), body);
+    if (g_pad_shell) {
+        rt->FillGeometry(g_pad_shell, body);
+        rt->DrawGeometry(g_pad_shell, line, 1.0f);
+    }
+    if (g_pad_inner) rt->FillGeometry(g_pad_inner, dark);
 
-    // Touchpad is part of the shell rather than a button on it, so it gets
-    // the face colour and a hairline instead of a filled cap.
     for (int i = 0; i < NPADBTN; i++) {
         const PadBtn& b = kPadBtn[i];
+        if (b.btn < 0) continue;
         bool bound = false;
-        if (b.btn >= 0)
-            for (int f = 0; f < F_COUNT; f++)
-                if (c.bind[f] == b.btn) bound = true;
-        bool hot = (b.btn >= 0 && (b.btn == g_pad_hover || b.btn == g_pad_popup));
+        for (int f = 0; f < F_COUNT; f++)
+            if (c.bind[f] == b.btn) bound = true;
+        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
         ID2D1Brush* fill = hot ? accent : (bound ? face : body);
 
-        if (b.btn < 0) {
-            // The D-pad: fixed to volume and seek, so it's drawn as part of
-            // the shell and never lights up.
-            draw_dpad_icon(rt, ox + b.x, oy + b.y, false, face, face);
-            continue;
-        }
-        if (b.btn == 4 || b.btn == 5 || b.btn == 6 || b.btn == 7) {
-            D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
-                                        ox + b.x + b.w, oy + b.y + b.h);
+        if (b.btn >= BTN_DPAD_UP) {
+            // The cross is drawn once, below; the arms only paint when they
+            // have something to say.
+            if (!hot && !bound) continue;
+            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
+                                        b.x + b.w, b.y + b.h);
+            rt->FillRectangle(r, fill);
+        } else if (b.btn >= 4 && b.btn <= 7) {
+            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
+                                        b.x + b.w, b.y + b.h);
             if (hot || bound)
                 rt->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), fill);
             rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 6, 6), line, 1.0f);
         } else if (b.round) {
-            D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(ox + b.x, oy + b.y),
-                                           b.w, b.w);
-            rt->FillEllipse(e, fill);
-            rt->DrawEllipse(e, line, 1.0f);
-            // Sticks get an inner ring, so they read as sticks not buttons.
-            if (b.btn == 10 || b.btn == 11)
-                rt->DrawEllipse(D2D1::Ellipse(e.point, b.w - 7, b.w - 7),
-                                line, 1.0f);
+            D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(b.x, b.y), b.w, b.w);
+            // Sticks: a dished well with the cap sitting in it.
+            if (b.btn == 10 || b.btn == 11) {
+                rt->FillEllipse(e, dark);
+                rt->DrawEllipse(e, line, 1.0f);
+                rt->FillEllipse(D2D1::Ellipse(e.point, b.w - 8, b.w - 8), fill);
+            } else {
+                rt->FillEllipse(e, fill);
+                rt->DrawEllipse(e, line, 1.0f);
+            }
         } else {
-            D2D1_RECT_F r = D2D1::RectF(ox + b.x - b.w, oy + b.y - b.h,
-                                        ox + b.x + b.w, oy + b.y + b.h);
-            float rad = (b.btn == 13) ? 8.0f : 4.0f;
+            D2D1_RECT_F r = D2D1::RectF(b.x - b.w, b.y - b.h,
+                                        b.x + b.w, b.y + b.h);
+            float rad = (b.btn == 13) ? 8.0f : 3.0f;
+            // The touchpad reads as part of the shell until it has a reason
+            // not to.
             rt->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad),
-                                     (b.btn == 13 && !hot && !bound) ? face : fill);
+                                     (b.btn == 13 && !hot && !bound) ? dark
+                                                                     : fill);
             rt->DrawRoundedRectangle(D2D1::RoundedRect(r, rad, rad), line, 1.0f);
         }
+    }
+
+    // The cross outline goes over the arm fills, so the shape stays whole.
+    if (g_pad_cross) rt->DrawGeometry(g_pad_cross, line, 1.0f);
+
+    // Arrow heads, so each arm says which way it points.
+    for (int i = 0; i < NPADBTN; i++) {
+        const PadBtn& b = kPadBtn[i];
+        if (b.btn < BTN_DPAD_UP) continue;
+        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
+        ID2D1Brush* g = hot ? onacc : text;
+        float a = 3.4f, dx = 0, dy = 0;
+        if (b.btn == BTN_DPAD_UP)    dy = -1;
+        if (b.btn == BTN_DPAD_DOWN)  dy =  1;
+        if (b.btn == BTN_DPAD_LEFT)  dx = -1;
+        if (b.btn == BTN_DPAD_RIGHT) dx =  1;
+        D2D1_POINT_2F tip = D2D1::Point2F(b.x + dx * a, b.y + dy * a);
+        D2D1_POINT_2F l = D2D1::Point2F(b.x - dx * a + dy * a,
+                                        b.y - dy * a + dx * a);
+        D2D1_POINT_2F r = D2D1::Point2F(b.x - dx * a - dy * a,
+                                        b.y - dy * a - dx * a);
+        rt->DrawLine(l, tip, g, 1.3f);
+        rt->DrawLine(tip, r, g, 1.3f);
     }
 
     // The four face buttons carry their shapes, which is how anyone reads a
@@ -4191,15 +4406,15 @@ static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
         if (b.btn < 0 || b.btn > 3) continue;
         bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
         ID2D1Brush* g = hot ? onacc : text;
-        float cx = ox + b.x, cy = oy + b.y, s = 5.5f;
-        if (b.btn == 0) {                                   // Square
+        float cx = b.x, cy = b.y, s = 5.5f;
+        if (b.btn == 0) {
             rt->DrawRectangle(D2D1::RectF(cx - s, cy - s, cx + s, cy + s), g, 1.4f);
-        } else if (b.btn == 1) {                            // Cross
+        } else if (b.btn == 1) {
             rt->DrawLine(D2D1::Point2F(cx - s, cy - s), D2D1::Point2F(cx + s, cy + s), g, 1.4f);
             rt->DrawLine(D2D1::Point2F(cx + s, cy - s), D2D1::Point2F(cx - s, cy + s), g, 1.4f);
-        } else if (b.btn == 2) {                            // Circle
+        } else if (b.btn == 2) {
             rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), s, s), g, 1.4f);
-        } else {                                            // Triangle
+        } else {
             rt->DrawLine(D2D1::Point2F(cx, cy - s - 1), D2D1::Point2F(cx + s + 1, cy + s), g, 1.4f);
             rt->DrawLine(D2D1::Point2F(cx + s + 1, cy + s), D2D1::Point2F(cx - s - 1, cy + s), g, 1.4f);
             rt->DrawLine(D2D1::Point2F(cx - s - 1, cy + s), D2D1::Point2F(cx, cy - s - 1), g, 1.4f);
@@ -4207,23 +4422,23 @@ static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy,
     }
 
     // Labels for the ones whose shape doesn't say what they are.
-    if (!tf) return;
-    tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        const wchar_t* l = b.label;
-        if (b.btn >= 0 && b.btn <= 3) continue;             // drawn as shapes
-        if (b.btn == 13 || b.btn < 0) continue;             // labelled below
-        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-        // Shoulders and sticks take the label inside; the small ones can't
-        // hold one, so theirs sits clear of the shape.
-        float ly = oy + b.y - 8;
-        if (b.btn == 8 || b.btn == 9) ly = oy + b.y - 30;   // Create / Options
-        if (b.btn == 12) ly = oy + b.y + 12;                // PS
-        D2D1_RECT_F lr = D2D1::RectF(ox + b.x - 34, ly, ox + b.x + 34, ly + 16);
-        rt->DrawText(l, (UINT32)wcslen(l), tf, lr, hot ? onacc : text);
+    if (tf) {
+        tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        for (int i = 0; i < NPADBTN; i++) {
+            const PadBtn& b = kPadBtn[i];
+            if (b.btn < 0 || !b.label[0]) continue;
+            bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
+            float ly = b.y - 8;
+            if (b.btn == 8 || b.btn == 9) ly = b.y - 30;   // Create / Options
+            if (b.btn == 12) ly = b.y + 10;                // PS
+            D2D1_RECT_F lr = D2D1::RectF(b.x - 34, ly, b.x + 34, ly + 16);
+            rt->DrawText(b.label, (UINT32)wcslen(b.label), tf, lr,
+                         hot ? onacc : text);
+        }
+        tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    tf->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    rt->SetTransform(base);
 }
 
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
@@ -4262,7 +4477,11 @@ static void button_name(int b, wchar_t* out, size_t n) {
     static const wchar_t* names[] = {
         L"Square", L"Cross", L"Circle", L"Triangle", L"L1", L"R1", L"L2",
         L"R2", L"Create", L"Options", L"L3", L"R3", L"PS", L"Touchpad"};
+    static const wchar_t* dpad[] = {
+        L"D-pad Up", L"D-pad Right", L"D-pad Down", L"D-pad Left"};
     if (b >= 0 && b < 14) swprintf(out, n, L"%s", names[b]);
+    else if (b >= BTN_DPAD_UP && b <= BTN_DPAD_LEFT)
+                          swprintf(out, n, L"%s", dpad[b - BTN_DPAD_UP]);
     else if (b >= 0)      swprintf(out, n, L"Button %d", b);
     else                  swprintf(out, n, L"Unbound");
 }
@@ -4422,6 +4641,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
+            if (i == 0) st_show(c.enabled);
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
@@ -4546,8 +4766,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (g_tf_label) {
                     const wchar_t* h =
-                        L"Click a button to choose what it does. The D-pad is "
-                        L"fixed to volume and seek.";
+                        L"Click a button to choose what it does. More than "
+                        L"one action can share a button.";
                     RECT hr2 = {content_x(), 56, content_x() + content_w(), 76};
                     g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
                                         to_f(hr2), g_br_main_dim);
@@ -4555,7 +4775,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 draw_pad(g_rt_main, (float)padv_x(), (float)PADV_Y, c,
                          g_br_main_key, g_br_main_armed, g_br_main_sel,
                          g_br_main_border, g_br_main_text, g_br_main_onacc,
-                         g_tf_label);
+                         g_br_main_panel, g_tf_label);
 
                 // The action list for whichever button was clicked.
                 if (g_pad_popup >= 0) {
@@ -4784,7 +5004,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
 
 
-
                 // Which search the keyboard-hold opens.
                 for (int i = 0; i < NSEARCH; i++) {
                     D2D1_ROUNDED_RECT rr =
@@ -4987,6 +5206,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Config c = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(c);
+            st_show(!effective);
             InvalidateRect(hwnd, NULL, FALSE);
             break;
         }
