@@ -75,12 +75,13 @@ extern "C" {
 // actions; the rest act on press or while held.
 enum { F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
        F_LAUNCHER, F_TOGGLE, F_FORWARD, F_BACK,
-       F_VOLUP, F_VOLDOWN, F_SEEKFWD, F_SEEKBACK, F_COUNT };
+       F_VOLUP, F_VOLDOWN, F_SEEKFWD, F_SEEKBACK, F_MEDIAFLY, F_COUNT };
 static const char* kBindKeyA[F_COUNT] = {
     "bind_lclick", "bind_rclick", "bind_keyboard", "bind_playpause",
     "bind_fullscreen", "bind_launcher", "bind_toggle",
     "bind_forward", "bind_back",
-    "bind_volume_up", "bind_volume_down", "bind_seek_fwd", "bind_seek_back"};
+    "bind_volume_up", "bind_volume_down", "bind_seek_fwd", "bind_seek_back",
+    "bind_media"};
 
 // The D-pad is bindable like anything else. It arrives as a hat rather than
 // four bits, so its directions are folded into the button mask above the ones
@@ -120,7 +121,7 @@ static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
                                 0, MOD_ALT, VK_SPACE,
                                 {1, 2, 3, 0, 0, 9, 13, 5, 4,
                                  BTN_DPAD_UP, BTN_DPAD_DOWN,
-                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT},
+                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT, 8},
                                 {-1, -1, -1, -1, -1, -1,
                                  -1, -1, -1, -1, -1, -1},
                                 {0}, {0}};
@@ -509,7 +510,7 @@ enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
        GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
-       GP_PRESSED };
+       GP_PRESSED, GP_MED_REPEAT };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -523,6 +524,17 @@ static volatile bool g_kb_external = false;
 // The three fullscreen shortcuts the flyout offers.
 #define NRADIAL 3
 static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
+
+// The same flyout also serves media, with icons rather than names: seek back,
+// volume down, play/pause, volume up, seek forward. Play/pause sits in the
+// middle, so opening the flyout and letting go without touching the stick
+// does the obvious thing.
+#define NMEDIA 5
+#define MED_PLAY 2
+static const WORD kMediaFlyVk[NMEDIA] = {
+    VK_LEFT, VK_VOLUME_DOWN, VK_MEDIA_PLAY_PAUSE, VK_VOLUME_UP, VK_RIGHT};
+// Everything except play/pause is worth repeating while it is held.
+static bool media_repeats(int i) { return i != MED_PLAY; }
 
 
 // --- Per-app rules ----------------------------------------------------------
@@ -1454,6 +1466,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
     bool radial_up = false;                // radial picker is on screen
     int  rad_idx = 1;                      // flyout selection, tracked locally
     int  rad_deflect = -1;                 // -1 centred, 0 left, 2 right
+    bool med_up = false;                   // the media flyout is on screen
+    int  med_idx = 0, med_deflect = -1;
+    ULONGLONG med_hold_t0 = 0, med_last = 0;
+    int  med_reps = 0;
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Volume and seek repeat state, one set each, in F_VOLUP order.
@@ -1697,7 +1713,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             double rx = st.lx / 1000.0, ry = st.ly / 1000.0;
             double m = sqrt(rx * rx + ry * ry);
             if (m > 1.0) { rx /= m; ry /= m; m = 1.0; }
-            if (radial_up) m = 0.0;   // stick is steering the wheel
+            if (radial_up || med_up) m = 0.0;   // stick is steering a flyout
             if (m > cfg.deadzone) {
                 double t = (m - cfg.deadzone) / (1.0 - cfg.deadzone);
                 double speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
@@ -1828,6 +1844,57 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     radial_up = true;
                     rad_idx = 1;            // always opens on the middle option
                     rad_deflect = -1;
+                }
+
+                // Media works the same way, with one difference: holding the
+                // stick on volume or seek repeats it, since one step of
+                // volume is rarely what anyone wanted. Play/pause never
+                // repeats, and a quick flick-and-release still sends a single
+                // step of whatever it landed on.
+                if (is_down(F_MEDIAFLY) && !hold_fired[F_MEDIAFLY] &&
+                    bnow - hold_t0[F_MEDIAFLY] >= 300) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 1);
+                    hold_fired[F_MEDIAFLY] = true;
+                    med_up = true;
+                    med_idx = MED_PLAY;
+                    med_deflect = -1;
+                    med_hold_t0 = bnow;
+                    med_last = 0;
+                    med_reps = 0;
+                }
+                if (med_up && is_down(F_MEDIAFLY)) {
+                    double sx = st.lx / 1000.0;
+                    int dir = (sx < -0.33) ? 0 : (sx > 0.33) ? 2 : -1;
+                    if (dir != med_deflect) {
+                        if (dir == 0 && med_idx > 0) med_idx--;
+                        if (dir == 2 && med_idx < NMEDIA - 1) med_idx++;
+                        if (dir != -1) {
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, med_idx);
+                            med_hold_t0 = bnow;   // settling counts as arriving
+                            med_last = 0;
+                            med_reps = 0;
+                        }
+                        med_deflect = dir;
+                    }
+                    // Repeat once it has sat on a repeatable item a moment,
+                    // speeding up the longer it stays, as the D-pad does.
+                    if (media_repeats(med_idx) && bnow - med_hold_t0 >= 350) {
+                        int gap = 140 - med_reps * 8;
+                        if (gap < 40) gap = 40;
+                        if (!med_last || bnow - med_last >= (ULONGLONG)gap) {
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                         med_idx);
+                            med_last = bnow;
+                            med_reps++;
+                        }
+                    }
+                }
+                if (med_up && went_up(F_MEDIAFLY)) {
+                    // Already repeating means it has fired plenty; only a
+                    // release before that should send a single step.
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK,
+                                 med_reps ? 1 : 0);
+                    med_up = false;
                 }
                 if (radial_up && is_down(F_FULLSCREEN)) {
                     // Read as a step, not a live position: the stick springs
@@ -3694,7 +3761,12 @@ static void lx_nav(int dir) {
 #define FLY_W    310
 #define FLY_H     64
 #define FLY_PAD   12
-#define FLY_ITEMW ((FLY_W - FLY_PAD * 2) / NRADIAL)
+// Mode 0 is the fullscreen shortcuts, mode 1 the media controls; they differ
+// only in how many items there are and whether each is drawn as a word or an
+// icon, so one window does both.
+static int g_rad_mode = 0;
+static int rad_count() { return g_rad_mode ? NMEDIA : NRADIAL; }
+#define FLY_ITEMW (float)((FLY_W - FLY_PAD * 2) / rad_count())
 #define FLY_ANIM  140      // underline glide, ms
 #define FLY_IN    250      // slide-and-fade in, ms
 #define FLY_RISE  36       // how far it travels on the way in, DIPs
@@ -3713,8 +3785,59 @@ static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
 
 #define FLY_TIMER 3
 
+// sharp at any DPI, and nothing depends on a particular font being present.
+static void fill_tri(ID2D1RenderTarget* rt, D2D1_POINT_2F a, D2D1_POINT_2F b,
+                     D2D1_POINT_2F c, ID2D1Brush* br) {
+    if (!g_d2d_factory) return;
+    ID2D1PathGeometry* g = NULL;
+    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
+    ID2D1GeometrySink* sink = NULL;
+    if (SUCCEEDED(g->Open(&sink)) && sink) {
+        sink->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
+        D2D1_POINT_2F pts[2] = {b, c};
+        sink->AddLines(pts, 2);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink->Close();
+        sink->Release();
+        rt->FillGeometry(g, br);
+    }
+    g->Release();
+}
+
 static float fly_item_cx(int i) {
     return FLY_PAD + FLY_ITEMW * (i + 0.5f);
+}
+
+// The media icons. Small enough that drawing them here beats threading five
+// more cases through the settings page's icon set.
+static void draw_media_glyph(ID2D1RenderTarget* rt, float cx, float cy,
+                             int item, ID2D1Brush* br) {
+    if (item == MED_PLAY) {
+        // Play and pause together, the way a transport button shows both.
+        rt->FillRectangle(D2D1::RectF(cx - 8, cy - 7, cx - 5, cy + 7), br);
+        fill_tri(rt, D2D1::Point2F(cx - 1, cy - 7), D2D1::Point2F(cx - 1, cy + 7),
+                 D2D1::Point2F(cx + 8, cy), br);
+        return;
+    }
+    if (item == 0 || item == NMEDIA - 1) {
+        // Seek: a double arrow, pointing the way it moves.
+        float d = (item == 0) ? -1.0f : 1.0f;
+        fill_tri(rt, D2D1::Point2F(cx + d * 1, cy - 7),
+                 D2D1::Point2F(cx + d * 1, cy + 7),
+                 D2D1::Point2F(cx + d * 9, cy), br);
+        fill_tri(rt, D2D1::Point2F(cx - d * 8, cy - 7),
+                 D2D1::Point2F(cx - d * 8, cy + 7),
+                 D2D1::Point2F(cx, cy), br);
+        return;
+    }
+    // Volume: a speaker, with the sign for which way it goes.
+    float d = (item == 1) ? -1.0f : 1.0f;
+    rt->FillRectangle(D2D1::RectF(cx - 11, cy - 3, cx - 7, cy + 3), br);
+    fill_tri(rt, D2D1::Point2F(cx - 7, cy - 7), D2D1::Point2F(cx - 7, cy + 7),
+             D2D1::Point2F(cx - 2, cy), br);
+    rt->FillRectangle(D2D1::RectF(cx + 2, cy - 1, cx + 11, cy + 1), br);
+    if (d > 0) rt->FillRectangle(D2D1::RectF(cx + 5.5f, cy - 4.5f,
+                                             cx + 7.5f, cy + 4.5f), br);
 }
 
 static float ease_out(ULONGLONG t0, int ms) {
@@ -3757,12 +3880,16 @@ static void rad_render() {
     rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
                              g_br_rad_border, 1.0f);
 
-    if (g_tf_fly) {
+    if (g_rad_mode) {
+        for (int i = 0; i < NMEDIA; i++)
+            draw_media_glyph(rt, fly_item_cx(i), 27.0f, i,
+                             i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
+                                            : g_br_rad_dim);
+    } else if (g_tf_fly) {
         g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         for (int i = 0; i < NRADIAL; i++) {
-            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + (float)FLY_ITEMW * i, 14,
-                                         FLY_PAD + (float)FLY_ITEMW * (i + 1),
-                                         40);
+            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + FLY_ITEMW * i, 14,
+                                         FLY_PAD + FLY_ITEMW * (i + 1), 40);
             rt->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
                         g_tf_fly, ir,
                         i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
@@ -3825,7 +3952,13 @@ static void rad_show(bool on) {
             L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
             dip_to_px(FLY_W), dip_to_px(FLY_H), g_hwnd, NULL,
             GetModuleHandleW(NULL), NULL);
-        if (g_rad) enable_acrylic(g_rad);
+        if (g_rad) {
+            enable_acrylic(g_rad);
+            // Without this the blur behind keeps the window's square corners
+            // and shows past the rounded card drawn on top of it.
+            DWORD pref = 2;  // DWMWCP_ROUND
+            DwmSetWindowAttribute(g_rad, 33, &pref, sizeof(pref));
+        }
     }
     if (!g_rad) return;
     g_rad_prev_sel = g_rad_sel;
@@ -3841,7 +3974,7 @@ static void rad_show(bool on) {
 
 // Start the underline gliding to a newly chosen option.
 static void rad_select(int i) {
-    if (i == g_rad_sel || i < 0 || i >= NRADIAL) return;
+    if (i == g_rad_sel || i < 0 || i >= rad_count()) return;
     g_rad_prev_sel = g_rad_sel;
     g_rad_sel = i;
     g_rad_move_t0 = GetTickCount64();
@@ -3965,7 +4098,11 @@ static void st_show(bool on) {
             L"ControllerMouseStatus", L"", WS_POPUP, 0, 0,
             dip_to_px(ST_W), dip_to_px(ST_H), g_hwnd, NULL,
             GetModuleHandleW(NULL), NULL);
-        if (g_st) enable_acrylic(g_st);
+        if (g_st) {
+            enable_acrylic(g_st);
+            DWORD pref = 2;  // DWMWCP_ROUND
+            DwmSetWindowAttribute(g_st, 33, &pref, sizeof(pref));
+        }
     }
     if (!g_st) return;
     g_st_on = on;
@@ -4245,16 +4382,17 @@ static const wchar_t* kFeatName[F_COUNT] = {
     L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
     L"Fullscreen", L"App launcher", L"Turn mapping on / off",
     L"Forward", L"Back",
-    L"Volume up", L"Volume down", L"Seek forward", L"Seek back"};
+    L"Volume up", L"Volume down", L"Seek forward", L"Seek back",
+    L"Media controls"};
 // Which of them are holds, so the list says so rather than leaving it to be
 // discovered.
 static const wchar_t* kFeatHint[F_COUNT] = {
     L"", L"", L"tap / hold", L"tap", L"hold", L"", L"", L"", L"",
-    L"repeats", L"repeats", L"repeats", L"repeats"};
+    L"repeats", L"repeats", L"repeats", L"repeats", L"hold"};
 static const int kFeatIcon[F_COUNT] = {
     IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
     IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK,
-    IC_VOLUME, IC_VOLUME, IC_SCRUB, IC_SCRUB};
+    IC_VOLUME, IC_VOLUME, IC_SCRUB, IC_SCRUB, IC_PLAY};
 
 // Which slot holds this button's shortcut, or -1.
 static int sc_slot_for(const Config& c, int btn) {
@@ -4412,24 +4550,6 @@ static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 
 
 // --- Feature icons ----------------------------------------------------------
 // Drawn rather than shipped as bitmaps or taken from an icon font: they stay
-// sharp at any DPI, and nothing depends on a particular font being present.
-static void fill_tri(ID2D1RenderTarget* rt, D2D1_POINT_2F a, D2D1_POINT_2F b,
-                     D2D1_POINT_2F c, ID2D1Brush* br) {
-    if (!g_d2d_factory) return;
-    ID2D1PathGeometry* g = NULL;
-    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
-    ID2D1GeometrySink* sink = NULL;
-    if (SUCCEEDED(g->Open(&sink)) && sink) {
-        sink->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
-        D2D1_POINT_2F pts[2] = {b, c};
-        sink->AddLines(pts, 2);
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        sink->Release();
-        rt->FillGeometry(g, br);
-    }
-    g->Release();
-}
 
 static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
                               int kind, ID2D1Brush* on, ID2D1Brush* off) {
@@ -5646,23 +5766,36 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_kb_external = true;
             break;
         case GP_RAD_SHOW:
-            g_rad_sel = 1;   // always opens on the middle option
+            // lp says which flyout: 0 the fullscreen shortcuts, 1 media.
+            g_rad_mode = (int)lp;
+            g_rad_sel = g_rad_mode ? MED_PLAY : 1;   // the middle option
+            g_rad_prev_sel = g_rad_sel;
             rad_show(true);
             break;
         case GP_RAD_SEL:
             rad_select((int)lp);
             break;
         case GP_RAD_PICK: {
+            int mode = g_rad_mode, sel = g_rad_sel;
             rad_show(false);
-            send_fullscreen(g_rad_sel);
+            if (mode) {
+                // lp is set when the item has already been repeating, which
+                // means it has fired plenty and shouldn't fire once more.
+                if (!lp && sel >= 0 && sel < NMEDIA) tap_key(kMediaFlyVk[sel]);
+                break;
+            }
+            send_fullscreen(sel);
             // Remember it, so the flyout opens on the last one used.
             EnterCriticalSection(&g_cs);
-            g_cfg.fullscreen_key = g_rad_sel;
+            g_cfg.fullscreen_key = sel;
             Config fc = g_cfg;
             LeaveCriticalSection(&g_cs);
             save_config(fc);
             break;
         }
+        case GP_MED_REPEAT:
+            if ((int)lp >= 0 && (int)lp < NMEDIA) tap_key(kMediaFlyVk[(int)lp]);
+            break;
         case GP_KB_SEARCH:
             g_kb_external = false;
             // Hold: open straight into search, or switch an already-open

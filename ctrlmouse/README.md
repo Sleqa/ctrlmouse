@@ -43,6 +43,7 @@ Each app can:
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
 | Square / X | Play / pause — **hold** for the fullscreen flyout |
+| Create *(hold)* | Media flyout: seek, volume, play / pause |
 | R1 / L1 | Forward / back, as the mouse side buttons |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
@@ -137,7 +138,7 @@ builds are moved there on first run.
 | `scroll_sensitivity` | Scroll speed at full deflection | `1.0` |
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
-| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` / `bind_volume_up` / `bind_volume_down` / `bind_seek_fwd` / `bind_seek_back` | Controller button index per action, or -1 for none; set from Button layout. 0-13 are the pad's buttons, 16-19 the D-pad directions | `1, 2, 3, 0, 0, 9, 13, 5, 4, 16, 18, 17, 19` |
+| `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` / `bind_volume_up` / `bind_volume_down` / `bind_seek_fwd` / `bind_seek_back` / `bind_media` | Controller button index per action, or -1 for none; set from Button layout. 0-13 are the pad's buttons, 16-19 the D-pad directions | `1, 2, 3, 0, 0, 9, 13, 5, 4, 16, 18, 17, 19, 8` |
 | `scN_btn` / `scN_mods` / `scN_vk` | Keyboard shortcut on a button: which button, its `MOD_*` bits, and its virtual-key code. Only slots in use are written | *(none)* |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
