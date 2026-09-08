@@ -45,9 +45,9 @@ Each app can:
 | Circle / B | Right click |
 | Square / X | Play / pause — **hold** for the fullscreen flyout |
 | Create | Open / close the media flyout |
-| Left / right *(media flyout)* | Move between seek, volume and play / pause |
+| Left / right *(media flyout)* | Move between previous, volume, play / pause and next |
 | Up / down *(media flyout)* | Move between the controls and the seek bar |
-| Cross *(media flyout, controls)* | Use the highlighted control; hold to repeat volume and seek |
+| Cross *(media flyout, controls)* | Use the highlighted control; hold to repeat volume |
 | Left / right *(media flyout, seek bar)* | Seek; hold to keep going |
 | R1 / L1 | Forward / back, as the mouse side buttons |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |

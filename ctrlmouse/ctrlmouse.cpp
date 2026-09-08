@@ -513,7 +513,7 @@ enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
        GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
-       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE, GP_RAD_ROW };
+       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE, GP_RAD_ROW, GP_MED_SEEK };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -528,16 +528,18 @@ static volatile bool g_kb_external = false;
 #define NRADIAL 3
 static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
 
-// The same flyout also serves media, with icons rather than names: seek back,
-// volume down, play/pause, volume up, seek forward. Play/pause sits in the
-// middle, so opening the flyout and letting go without touching the stick
-// does the obvious thing.
+// The same flyout also serves media, with icons rather than names: previous
+// track, volume down, play/pause, volume up, next track, over a seek bar.
+// Play/pause sits in the middle, so opening the flyout and letting go without
+// touching the stick does the obvious thing.
 #define NMEDIA 5
 #define MED_PLAY 2
 static const WORD kMediaFlyVk[NMEDIA] = {
-    VK_LEFT, VK_VOLUME_DOWN, VK_MEDIA_PLAY_PAUSE, VK_VOLUME_UP, VK_RIGHT};
-// Everything except play/pause is worth repeating while it is held.
-static bool media_repeats(int i) { return i != MED_PLAY; }
+    VK_MEDIA_PREV_TRACK, VK_VOLUME_DOWN, VK_MEDIA_PLAY_PAUSE,
+    VK_VOLUME_UP, VK_MEDIA_NEXT_TRACK};
+// Only volume is worth repeating: play/pause and track skips all mean
+// something different the second time.
+static bool media_repeats(int i) { return i == 1 || i == NMEDIA - 2; }
 
 
 // --- Per-app rules ----------------------------------------------------------
@@ -1984,14 +1986,14 @@ static DWORD WINAPI worker_thread(LPVOID) {
                             med_last = bnow;
                             med_reps = 0;
                             if (hdir)
-                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
-                                             hdir < 0 ? 0 : NMEDIA - 1);
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_SEEK,
+                                             hdir);
                         } else if (hdir && bnow - med_hold_t0 >= 350) {
                             int gap = 140 - med_reps * 8;
                             if (gap < 40) gap = 40;
                             if (bnow - med_last >= (ULONGLONG)gap) {
-                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
-                                             hdir < 0 ? 0 : NMEDIA - 1);
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_SEEK,
+                                             hdir);
                                 med_last = bnow;
                                 med_reps++;
                             }
@@ -3874,13 +3876,19 @@ static ULONGLONG g_med_stamp = 0;          // tick when pos was sampled
 
 static DWORD WINAPI med_poll_proc(LPVOID) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    double last_reported = -1.0;      // the app's own number, last time round
+    winrt::Windows::Media::Control::
+        GlobalSystemMediaTransportControlsSessionManager mgr{nullptr};
     while (g_med_poll) {
         bool have = false, playing = false;
         double pos = 0.0, dur = 0.0;
         try {
             using namespace winrt::Windows::Media::Control;
-            auto mgr = GlobalSystemMediaTransportControlsSessionManager::
-                           RequestAsync().get();
+            // Requested once: the manager tracks whichever session is
+            // current, so asking again every poll only costs time.
+            if (!mgr)
+                mgr = GlobalSystemMediaTransportControlsSessionManager::
+                          RequestAsync().get();
             auto s = mgr.GetCurrentSession();
             if (s) {
                 auto tl = s.GetTimelineProperties();
@@ -3897,14 +3905,29 @@ static DWORD WINAPI med_poll_proc(LPVOID) {
             }
         } catch (...) {
             have = false;            // no session, or the app went away
+            mgr = nullptr;           // ask for a fresh one next time round
         }
+        // Whether to take this reading as the new baseline. Plenty of
+        // apps - browsers especially - only push a timeline update when
+        // something happens to it, so their reported position sits still
+        // while the track plays on. Re-baselining on every poll pinned the
+        // clock to that stale value: it would creep for 400ms, get reset,
+        // and creep again, which reads as frozen. So the baseline only moves
+        // when the app's own number moves, and between those the clock runs
+        // from here. An app that does keep its position current moves it
+        // every poll, and is followed exactly.
         EnterCriticalSection(&g_med_cs);
+        bool fresh = (have != g_med_have) || (playing != g_med_playing) ||
+                     (pos != last_reported) || (dur != g_med_dur);
+        if (fresh) {
+            g_med_pos = pos;
+            g_med_stamp = GetTickCount64();
+        }
         g_med_have = have;
-        g_med_pos = pos;
         g_med_dur = dur;
         g_med_playing = playing;
-        g_med_stamp = GetTickCount64();
         LeaveCriticalSection(&g_med_cs);
+        last_reported = pos;
         for (int i = 0; i < 8 && g_med_poll; i++) Sleep(50);
     }
     winrt::uninit_apartment();
@@ -3952,7 +3975,7 @@ static void med_time_str(double secs, wchar_t* out, size_t n) {
 // between the options and letting go sends the one under it.
 #define FLY_W    310
 #define FLY_H     64            // the controls row on its own
-#define FLY_SEEK  36            // the seek row under it, media mode only
+#define FLY_SEEK  52            // the seek row under it, media mode only
 #define FLY_PAD   12
 // Mode 0 is the fullscreen shortcuts, mode 1 the media controls; they differ
 // only in how many items there are and whether each is drawn as a word or an
@@ -3963,10 +3986,11 @@ static int rad_count() { return g_rad_mode ? NMEDIA : NRADIAL; }
 static int fly_h() { return g_rad_mode ? FLY_H + FLY_SEEK : FLY_H; }
 
 // The bar, and the timestamp sitting at the end of it.
-#define SEEK_TXT 78
+// The bar takes the full width and the time sits under it, rather than the
+// two sharing a line and colliding once the track runs past an hour.
 static D2D1_RECT_F seek_track() {
-    return D2D1::RectF((float)FLY_PAD, FLY_H + 15.0f,
-                       (float)(FLY_W - FLY_PAD - SEEK_TXT), FLY_H + 21.0f);
+    return D2D1::RectF((float)FLY_PAD, FLY_H + 11.0f,
+                       (float)(FLY_W - FLY_PAD), FLY_H + 17.0f);
 }
 #define FLY_ITEMW (float)((FLY_W - FLY_PAD * 2) / rad_count())
 #define FLY_ANIM  140      // underline glide, ms
@@ -4022,14 +4046,17 @@ static void draw_media_glyph(ID2D1RenderTarget* rt, float cx, float cy,
         return;
     }
     if (item == 0 || item == NMEDIA - 1) {
-        // Seek: a double arrow, pointing the way it moves.
+        // Track skip: the double arrow with the bar it stops against, which
+        // is what tells it apart from seeking.
         float d = (item == 0) ? -1.0f : 1.0f;
-        fill_tri(rt, D2D1::Point2F(cx + d * 1, cy - 7),
-                 D2D1::Point2F(cx + d * 1, cy + 7),
-                 D2D1::Point2F(cx + d * 9, cy), br);
-        fill_tri(rt, D2D1::Point2F(cx - d * 8, cy - 7),
-                 D2D1::Point2F(cx - d * 8, cy + 7),
-                 D2D1::Point2F(cx, cy), br);
+        fill_tri(rt, D2D1::Point2F(cx + d * 2, cy - 7),
+                 D2D1::Point2F(cx + d * 2, cy + 7),
+                 D2D1::Point2F(cx - d * 5, cy), br);
+        fill_tri(rt, D2D1::Point2F(cx + d * 9, cy - 7),
+                 D2D1::Point2F(cx + d * 9, cy + 7),
+                 D2D1::Point2F(cx + d * 2, cy), br);
+        rt->FillRectangle(D2D1::RectF(cx - d * 9.5f, cy - 7,
+                                      cx - d * 7.0f, cy + 7), br);
         return;
     }
     // Volume: a speaker, with the sign for which way it goes.
@@ -4128,9 +4155,9 @@ static void rad_render() {
             } else {
                 wcscpy(ts, L"--:--");
             }
-            D2D1_RECT_F txt = D2D1::RectF((float)(FLY_W - FLY_PAD - SEEK_TXT),
-                                          tr.top - 9, (float)(FLY_W - FLY_PAD),
-                                          tr.bottom + 9);
+            D2D1_RECT_F txt = D2D1::RectF((float)FLY_PAD, tr.bottom + 6,
+                                          (float)(FLY_W - FLY_PAD),
+                                          tr.bottom + 26);
             g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
             rt->DrawText(ts, (UINT32)wcslen(ts), g_tf_fly, txt,
                          g_rad_row == 1 ? (ID2D1Brush*)g_br_rad_text
@@ -6063,6 +6090,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case GP_MED_REPEAT:
             if ((int)lp >= 0 && (int)lp < NMEDIA) tap_key(kMediaFlyVk[(int)lp]);
+            break;
+        case GP_MED_SEEK:
+            // The arrow keys, which is what every player treats as a scrub.
+            tap_key((int)lp < 0 ? VK_LEFT : VK_RIGHT);
             break;
         case GP_KB_SEARCH:
             g_kb_external = false;
