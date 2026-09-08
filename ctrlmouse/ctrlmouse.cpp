@@ -524,6 +524,144 @@ static volatile bool g_kb_external = false;
 #define NRADIAL 3
 static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
 
+
+// --- Per-app rules ----------------------------------------------------------
+// Two things keyed off whichever app is in front, sharing one list because
+// they share the hard part - saying which app you mean.
+//
+//  * Don't pause here. The game check is a heuristic: anything covering its
+//    whole monitor looks like a game, which catches fullscreen video just as
+//    readily. Listing an app says it never counts, however it fills the
+//    screen.
+//  * Its own button layout, in effect only while that app is focused. The
+//    base layout applies everywhere else.
+//
+// Matched on the executable's file name rather than its full path, so it
+// still works when the same program lives somewhere else on another machine -
+// and so an app added by picking one of its open windows keeps working after
+// that window closes.
+#define NAPPS 24
+struct AppRule {
+    std::wstring exe;           // file name, e.g. "chrome.exe"
+    std::wstring label;         // what to show, e.g. "Chrome"
+    bool no_pause;
+    bool profile;
+    int  bind[F_COUNT];
+};
+static AppRule g_apps[NAPPS];
+static int     g_app_count = 0;         // guarded by g_cs, like the config
+
+static const wchar_t* base_name(const wchar_t* p) {
+    const wchar_t* s = wcsrchr(p, L'\\');
+    return s ? s + 1 : p;
+}
+
+// The executable of whatever holds the foreground, file name only.
+static void foreground_exe(wchar_t* out, size_t n) {
+    out[0] = 0;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD len = MAX_PATH;
+    if (QueryFullProcessImageNameW(ph, 0, img, &len)) {
+        wcsncpy(out, base_name(img), n - 1);
+        out[n - 1] = 0;
+    }
+    CloseHandle(ph);
+}
+
+// Index of the rule for this executable, or -1. Caller holds g_cs.
+static int app_rule_index(const wchar_t* exe) {
+    if (!exe || !exe[0]) return -1;
+    for (int i = 0; i < g_app_count; i++)
+        if (_wcsicmp(g_apps[i].exe.c_str(), exe) == 0) return i;
+    return -1;
+}
+
+static std::wstring rules_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"apps-rules.txt";
+}
+
+// One rule per line: name, flags, then the layout. Tab separated, because a
+// file name can contain almost anything else.
+static void rules_load() {
+    g_app_count = 0;
+    FILE* f = _wfopen(rules_path().c_str(), L"rb, ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[1024];
+    while (g_app_count < NAPPS && fgetws(line, 1024, f)) {
+        size_t n = wcslen(line);
+        while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r')) line[--n] = 0;
+        if (!n) continue;
+        wchar_t* ctx = NULL;
+        wchar_t* exe = wcstok(line, L"\t", &ctx);
+        wchar_t* label = wcstok(NULL, L"\t", &ctx);
+        wchar_t* flags = wcstok(NULL, L"\t", &ctx);
+        wchar_t* binds = wcstok(NULL, L"\t", &ctx);
+        if (!exe || !*exe) continue;
+        AppRule& r = g_apps[g_app_count];
+        r.exe = exe;
+        r.label = (label && *label) ? label : exe;
+        int fl = flags ? _wtoi(flags) : 0;
+        r.no_pause = (fl & 1) != 0;
+        r.profile = (fl & 2) != 0;
+        for (int i = 0; i < F_COUNT; i++) r.bind[i] = DEFAULTS.bind[i];
+        if (binds) {
+            wchar_t* bctx = NULL;
+            wchar_t* t = wcstok(binds, L",", &bctx);
+            for (int i = 0; i < F_COUNT && t; i++) {
+                int v = _wtoi(t);
+                if (v >= -1 && v < 32) r.bind[i] = v;
+                t = wcstok(NULL, L",", &bctx);
+            }
+        }
+        g_app_count++;
+    }
+    fclose(f);
+}
+
+static void rules_save() {
+    FILE* f = _wfopen(rules_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_app_count; i++) {
+        const AppRule& r = g_apps[i];
+        fwprintf(f, L"%s\t%s\t%d\t", r.exe.c_str(), r.label.c_str(),
+                 (r.no_pause ? 1 : 0) | (r.profile ? 2 : 0));
+        for (int b = 0; b < F_COUNT; b++)
+            fwprintf(f, L"%d%s", r.bind[b], b + 1 < F_COUNT ? L"," : L"\n");
+    }
+    fclose(f);
+}
+
+// Add by executable path, or do nothing if it is already listed. Returns the
+// index either way, or -1 if the list is full.
+static int rules_add(const wchar_t* path, const wchar_t* label) {
+    const wchar_t* exe = base_name(path);
+    int at = app_rule_index(exe);
+    if (at >= 0) return at;
+    if (g_app_count >= NAPPS) return -1;
+    AppRule& r = g_apps[g_app_count];
+    r.exe = exe;
+    r.label = (label && *label) ? label : exe;
+    r.no_pause = true;          // the reason to add one, most of the time
+    r.profile = false;
+    for (int i = 0; i < F_COUNT; i++) r.bind[i] = DEFAULTS.bind[i];
+    return g_app_count++;
+}
+
+static void rules_remove(int i) {
+    if (i < 0 || i >= g_app_count) return;
+    for (int j = i; j + 1 < g_app_count; j++) g_apps[j] = g_apps[j + 1];
+    g_app_count--;
+}
+
 // --- Game detection / toggle-bind state (shared with the worker) -----------
 static volatile bool g_game_active = false;  // fullscreen game detected
 static volatile bool g_override    = false;  // user forced mapping on in-game
@@ -533,6 +671,18 @@ static volatile bool g_override    = false;  // user forced mapping on in-game
 // reports exclusive D3D fullscreen), plus a "foreground window covers its whole
 // monitor" heuristic to catch borderless-fullscreen games.
 static bool is_game_running() {
+    // Listed apps never count. Checked first, so fullscreen video in a
+    // browser stays fullscreen video however the shell reports it.
+    {
+        wchar_t exe[128];
+        foreground_exe(exe, 128);
+        EnterCriticalSection(&g_cs);
+        int r = app_rule_index(exe);
+        bool skip = (r >= 0 && g_apps[r].no_pause);
+        LeaveCriticalSection(&g_cs);
+        if (skip) return false;
+    }
+
     QUERY_USER_NOTIFICATION_STATE q;
     if (SUCCEEDED(SHQueryUserNotificationState(&q)) &&
         (q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE))
@@ -1307,6 +1457,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
     ULONGLONG batt_last = 0;               // last battery property read
     unsigned hid_gen_seen = 0;             // handle generation our edges refer to
     // Volume and seek repeat state, one set each, in F_VOLUP order.
+    ULONGLONG fgchk_last = 0;              // when the foreground was last read
+    bool      fg_profile = false;          // the focused app has its own layout
+    int       fg_bind[F_COUNT] = {};
     ULONGLONG media_t0[4] = {}, media_last[4] = {};
     int       media_reps[4] = {};          // repeats so far, drives acceleration
 
@@ -1475,6 +1628,24 @@ static DWORD WINAPI worker_thread(LPVOID) {
             int b = battery_from_devnode();
             if (b >= 0) { g_pad_batt = b; g_pad_charging = false; }
         }
+
+        // Which app is in front, and so whose layout applies. Same
+        // cadence as the game check below, for the same reason.
+        if (bnow - fgchk_last >= 400) {
+            fgchk_last = bnow;
+            wchar_t exe[128];
+            foreground_exe(exe, 128);
+            EnterCriticalSection(&g_cs);
+            int r = app_rule_index(exe);
+            if (r >= 0 && g_apps[r].profile) {
+                memcpy(fg_bind, g_apps[r].bind, sizeof(fg_bind));
+                fg_profile = true;
+            } else {
+                fg_profile = false;
+            }
+            LeaveCriticalSection(&g_cs);
+        }
+        if (fg_profile) memcpy(cfg.bind, fg_bind, sizeof(cfg.bind));
 
         // Game check: at most two cheap API calls every 2 seconds.
         if (cfg.game_pause) {
@@ -4001,10 +4172,18 @@ static RECT search_key_rect() {
 #define SEC3_Y   (SEARCH_Y + CARD_H + 20)
 #define MAP_Y    (SEC3_Y + 28)
 
+#define APPS_Y (MAP_Y + CARD_H + CARD_GAP)
+
 static RECT map_card() { return card_rect(MAP_Y); }
 static RECT map_btn_rect() {
     int rx = content_x() + content_w();
     RECT r = {rx - 116, MAP_Y + 18, rx - 14, MAP_Y + 44};
+    return r;
+}
+static RECT apps_card() { return card_rect(APPS_Y); }
+static RECT apps_btn_rect() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 116, APPS_Y + 18, rx - 14, APPS_Y + 44};
     return r;
 }
 static RECT sec3_header() {
@@ -4021,9 +4200,12 @@ enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
        IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD,
        IC_KEYS };
 
-static int g_page = 0;          // 0 settings, 1 button layout
+static int g_page = 0;          // 0 settings, 1 button layout, 2 apps
 static volatile int g_bind_btn = -1;   // button last pressed, -1 none yet
 static bool g_sc_capture = false;      // recording a keyboard shortcut
+// Which layout the button page is editing: -1 the base one, otherwise the
+// index of the app whose profile it is.
+static int g_bind_target = -1;
 
 static RECT back_btn_rect() {
     int rx = content_x() + content_w();
@@ -4082,9 +4264,124 @@ static int sc_slot_for(const Config& c, int btn) {
     return -1;
 }
 
+// --- Apps page --------------------------------------------------------------
+// Page 2: the per-app rules. Each row is one app, with the two things a rule
+// can say about it and a way to drop it.
+#define APP_HINT_Y   58
+#define APP_BTN_Y    86
+#define APP_ROW_Y0   (APP_BTN_Y + 40)
+#define APP_ROW_STEP 62
+
+static RECT app_add_file_btn() {
+    RECT r = {content_x(), APP_BTN_Y, content_x() + 150, APP_BTN_Y + 28};
+    return r;
+}
+static RECT app_add_win_btn() {
+    RECT r = {content_x() + 158, APP_BTN_Y, content_x() + 328, APP_BTN_Y + 28};
+    return r;
+}
+static RECT app_row(int i) {
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {content_x(), y, content_x() + content_w(), y + APP_ROW_STEP - 8};
+    return r;
+}
+// Three controls on the right of each row: the two switches and remove.
+static RECT app_row_pause(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 292, y + 24, rx - 246, y + 46};
+    return r;
+}
+static RECT app_row_prof(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 168, y + 24, rx - 122, y + 46};
+    return r;
+}
+static RECT app_row_edit(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 104, y + 14, rx - 46, y + 40};
+    return r;
+}
+static RECT app_row_del(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 38, y + 14, rx - 8, y + 40};
+    return r;
+}
+
+// Picking one of the windows that happen to be open right now. The rule that
+// comes out of it is keyed on the executable, so it outlives the window.
+#define NOPENWIN 40
+struct OpenWin { std::wstring exe; std::wstring title; };
+static OpenWin g_openwin[NOPENWIN];
+static int     g_openwin_count = 0;
+static bool    g_win_picker = false;      // the picker is up
+
+static BOOL CALLBACK collect_openwin_cb(HWND h, LPARAM) {
+    if (g_openwin_count >= NOPENWIN) return FALSE;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    if (!GetWindowTextLengthW(h)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return TRUE;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return TRUE;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD n = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(ph, 0, img, &n) != 0;
+    CloseHandle(ph);
+    if (!ok) return TRUE;
+    const wchar_t* exe = base_name(img);
+    for (int i = 0; i < g_openwin_count; i++)      // one row per program
+        if (_wcsicmp(g_openwin[i].exe.c_str(), exe) == 0) return TRUE;
+    wchar_t title[128] = L"";
+    GetWindowTextW(h, title, 128);
+    g_openwin[g_openwin_count].exe = exe;
+    g_openwin[g_openwin_count].title = title;
+    g_openwin_count++;
+    return TRUE;
+}
+
+static void collect_open_windows() {
+    g_openwin_count = 0;
+    EnumWindows(collect_openwin_cb, 0);
+}
+
+#define WP_W   380
+#define WP_ROW 34
+#define WP_TOP 38
+static int wp_height() {
+    int n = g_openwin_count > 10 ? 10 : g_openwin_count;
+    return WP_TOP + n * WP_ROW + 10;
+}
+static RECT wp_rect() {
+    int x = content_x() + (content_w() - WP_W) / 2;
+    RECT r = {x, APP_BTN_Y + 36, x + WP_W, APP_BTN_Y + 36 + wp_height()};
+    return r;
+}
+static RECT wp_row(int i) {
+    RECT p = wp_rect();
+    RECT r = {p.left + 6, p.top + WP_TOP + i * WP_ROW, p.right - 6,
+              p.top + WP_TOP + i * WP_ROW + WP_ROW - 2};
+    return r;
+}
+
 static int win_height() {
-    if (g_page == 1) return BIND_SC_Y + CARD_H + 46;
-    return MAP_Y + CARD_H + 54;
+    if (g_page == 1)
+        return (g_bind_target < 0 ? BIND_SC_Y + CARD_H : BIND_SEC2_Y) + 46;
+    if (g_page == 2) {
+        int rows = g_app_count > 0 ? g_app_count : 1;
+        int h = APP_ROW_Y0 + rows * APP_ROW_STEP + 40;
+        if (g_win_picker) {
+            int p = wp_rect().bottom + 24;
+            if (p > h) h = p;
+        }
+        return h;
+    }
+    return APPS_Y + CARD_H + 54;
 }
 
 static const wchar_t* kFooterText =
@@ -4416,10 +4713,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_page == 1) {
             RECT bb = back_btn_rect();
             if (PtInRect(&bb, pt)) {
-                g_page = 0;
+                // Back to the apps list when that is where it was opened
+                // from, so editing one app's layout doesn't lose the list.
+                g_page = (g_bind_target >= 0) ? 2 : 0;
+                g_bind_target = -1;
                 g_listen = false;         // the mapping comes back
                 g_sc_capture = false;
                 g_scroll = 0;
+                clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
@@ -4432,15 +4733,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT rr = bind_row(f);
                 if (!PtInRect(&rr, pt)) continue;
                 EnterCriticalSection(&g_cs);
-                g_cfg.bind[f] = (g_cfg.bind[f] == btn) ? -1 : btn;
+                int* tgt = (g_bind_target >= 0 && g_bind_target < g_app_count)
+                               ? g_apps[g_bind_target].bind : g_cfg.bind;
+                tgt[f] = (tgt[f] == btn) ? -1 : btn;
+                bool app = (tgt != g_cfg.bind);
                 Config nc = g_cfg;
                 LeaveCriticalSection(&g_cs);
-                save_config(nc);
+                if (app) rules_save(); else save_config(nc);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
             RECT sb = bind_sc_btn();
-            if (PtInRect(&sb, pt)) {
+            if (g_bind_target < 0 && PtInRect(&sb, pt)) {
                 g_sc_capture = true;
                 SetFocus(hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -4448,7 +4752,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             RECT cb = bind_sc_clear();
             int slot = sc_slot_for(c, btn);
-            if (slot >= 0 && PtInRect(&cb, pt)) {
+            if (g_bind_target < 0 && slot >= 0 && PtInRect(&cb, pt)) {
                 EnterCriticalSection(&g_cs);
                 g_cfg.sc_btn[slot] = -1;
                 g_cfg.sc_mods[slot] = 0;
@@ -4458,6 +4762,103 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 save_config(nc);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
+            }
+            return 0;
+        }
+        if (g_page == 2) {
+            RECT bb = back_btn_rect();
+            if (PtInRect(&bb, pt)) {
+                g_page = 0;
+                g_win_picker = false;
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            // The picker owns every click while it is up.
+            if (g_win_picker) {
+                int shown = g_openwin_count > 10 ? 10 : g_openwin_count;
+                for (int i = 0; i < shown; i++) {
+                    RECT wr2 = wp_row(i);
+                    if (!PtInRect(&wr2, pt)) continue;
+                    EnterCriticalSection(&g_cs);
+                    rules_add(g_openwin[i].exe.c_str(),
+                              g_openwin[i].title.c_str());
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    g_win_picker = false;
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                RECT pr = wp_rect();
+                if (!PtInRect(&pr, pt)) g_win_picker = false;   // click away
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT af = app_add_file_btn();
+            if (PtInRect(&af, pt)) {
+                wchar_t file[MAX_PATH] = L"";
+                OPENFILENAMEW ofn = {sizeof(ofn)};
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = L"Programs\0*.exe\0All files\0*.*\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Choose a program";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+                if (GetOpenFileNameW(&ofn)) {
+                    EnterCriticalSection(&g_cs);
+                    rules_add(file, NULL);
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    clamp_scroll();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT aw = app_add_win_btn();
+            if (PtInRect(&aw, pt)) {
+                collect_open_windows();
+                g_win_picker = true;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            EnterCriticalSection(&g_cs);
+            int napp = g_app_count;
+            LeaveCriticalSection(&g_cs);
+            for (int i = 0; i < napp; i++) {
+                RECT pb = app_row_pause(i), pf = app_row_prof(i);
+                RECT eb = app_row_edit(i), db = app_row_del(i);
+                bool hit = true;
+                EnterCriticalSection(&g_cs);
+                if (PtInRect(&pb, pt))      g_apps[i].no_pause = !g_apps[i].no_pause;
+                else if (PtInRect(&pf, pt)) g_apps[i].profile = !g_apps[i].profile;
+                else if (PtInRect(&db, pt)) rules_remove(i);
+                else hit = false;
+                if (hit) rules_save();
+                LeaveCriticalSection(&g_cs);
+                if (hit) {
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                if (PtInRect(&eb, pt)) {
+                    // Editing an app's layout is the same page, aimed at it.
+                    EnterCriticalSection(&g_cs);
+                    g_apps[i].profile = true;
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    g_bind_target = i;
+                    g_page = 1;
+                    g_bind_btn = -1;
+                    g_sc_capture = false;
+                    g_listen = true;
+                    g_scroll = 0;
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
             }
             return 0;
         }
@@ -4491,9 +4892,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT mb = map_btn_rect();
             if (PtInRect(&mb, pt)) {
                 g_page = 1;
+                g_bind_target = -1;   // the base layout
                 g_bind_btn = -1;
                 g_sc_capture = false;
                 g_listen = true;      // report presses, run nothing
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT ab = apps_btn_rect();
+            if (PtInRect(&ab, pt)) {
+                g_page = 2;
+                g_win_picker = false;
                 g_scroll = 0;
                 clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -4563,6 +4974,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             if (g_tf_title && g_br_main_text) {
                 const wchar_t* t = (g_page == 1) ? L"Button layout"
+                                 : (g_page == 2) ? L"Per-app rules"
                                                  : L"ctrlmouse";
                 g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_title,
                                     to_f(title_rect()), g_br_main_text);
@@ -4592,9 +5004,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
                 if (g_tf_label) {
-                    const wchar_t* h =
-                        L"Press a button on the controller. Everything below "
-                        L"then applies to that button.";
+                    wchar_t h[256];
+                    if (g_bind_target >= 0) {
+                        EnterCriticalSection(&g_cs);
+                        std::wstring who = (g_bind_target < g_app_count)
+                                               ? g_apps[g_bind_target].label
+                                               : L"";
+                        LeaveCriticalSection(&g_cs);
+                        swprintf(h, 256,
+                                 L"Editing %s only. Press a button on the "
+                                 L"controller to change what it does there.",
+                                 who.c_str());
+                    } else {
+                        wcscpy(h, L"Press a button on the controller. "
+                                  L"Everything below then applies to that "
+                                  L"button.");
+                    }
                     RECT hr2 = {content_x(), BIND_HINT_Y,
                                 content_x() + content_w(), BIND_HINT_Y + 20};
                     g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
@@ -4635,16 +5060,28 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                content_x() + content_w(), BIND_SEC1_Y + 20};
                     g_rt_main->DrawText(L"ACTIONS", 7, g_tf_label, to_f(s1),
                                         g_br_main_dim);
-                    RECT s2 = {content_x(), BIND_SEC2_Y,
-                               content_x() + content_w(), BIND_SEC2_Y + 20};
-                    g_rt_main->DrawText(L"KEYBOARD SHORTCUT", 17, g_tf_label,
-                                        to_f(s2), g_br_main_dim);
+                    if (g_bind_target < 0) {
+                        RECT s2 = {content_x(), BIND_SEC2_Y,
+                                   content_x() + content_w(), BIND_SEC2_Y + 20};
+                        g_rt_main->DrawText(L"KEYBOARD SHORTCUT", 17,
+                                            g_tf_label, to_f(s2),
+                                            g_br_main_dim);
+                    }
                 }
 
                 // The actions, with the ones already on this button lit.
+                int tgtbind[F_COUNT];
+                memcpy(tgtbind, c.bind, sizeof(tgtbind));
+                if (g_bind_target >= 0) {
+                    EnterCriticalSection(&g_cs);
+                    if (g_bind_target < g_app_count)
+                        memcpy(tgtbind, g_apps[g_bind_target].bind,
+                               sizeof(tgtbind));
+                    LeaveCriticalSection(&g_cs);
+                }
                 for (int f = 0; f < F_COUNT; f++) {
                     RECT rr = bind_row(f);
-                    bool on = (btn >= 0 && c.bind[f] == btn);
+                    bool on = (btn >= 0 && tgtbind[f] == btn);
                     if (on)
                         draw_control(g_rt_main, to_f(rr), 5.0f, g_br_main_sel,
                                      NULL);
@@ -4665,9 +5102,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         g_tf_label, to_f(nr), tb);
                     // Where it already is, when that is somewhere else.
                     wchar_t at[48] = L"";
-                    if (!on && c.bind[f] >= 0) {
+                    if (!on && tgtbind[f] >= 0) {
                         wchar_t bn2[32];
-                        button_name(c.bind[f], bn2, 32);
+                        button_name(tgtbind[f], bn2, 32);
                         swprintf(at, 48, L"%s", bn2);
                     } else if (!on) {
                         wcscpy(at, L"unbound");
@@ -4686,7 +5123,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
 
-                // The shortcut this button sends, if any.
+                // The shortcut this button sends, if any. Shortcuts are
+                // global rather than per-app, so the section only appears
+                // when the base layout is the one being edited.
+                if (g_bind_target < 0) {
                 draw_control(g_rt_main, to_f(bind_sc_card()), CARD_R,
                              g_br_main_card, g_br_main_border);
                 int slot = sc_slot_for(c, btn);
@@ -4738,6 +5178,153 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                 }
+                }
+            } else if (g_page == 2) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (g_tf_label) {
+                    const wchar_t* h =
+                        L"Apps listed here can be kept out of the game pause, "
+                        L"and can have their own button layout.";
+                    RECT hr2 = {content_x(), APP_HINT_Y,
+                                content_x() + content_w(), APP_HINT_Y + 20};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
+                }
+
+                RECT af = app_add_file_btn(), aw = app_add_win_btn();
+                draw_control(g_rt_main, to_f(af), 6.0f, g_br_main_key, NULL);
+                draw_control(g_rt_main, to_f(aw), 6.0f,
+                             g_win_picker ? g_br_main_armed : g_br_main_key,
+                             NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Choose a program...", 19, g_tf_body,
+                                        to_f(af), g_br_main_text);
+                    g_rt_main->DrawText(L"Pick an open window...", 22,
+                                        g_tf_body, to_f(aw), g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+
+                EnterCriticalSection(&g_cs);
+                int napp = g_app_count;
+                LeaveCriticalSection(&g_cs);
+
+                if (!napp && g_tf_label) {
+                    RECT er = {content_x(), APP_ROW_Y0 + 16,
+                               content_x() + content_w(), APP_ROW_Y0 + 36};
+                    g_rt_main->DrawText(L"Nothing listed yet.", 19, g_tf_label,
+                                        to_f(er), g_br_main_dim);
+                }
+
+                for (int i = 0; i < napp; i++) {
+                    EnterCriticalSection(&g_cs);
+                    AppRule r = g_apps[i];
+                    LeaveCriticalSection(&g_cs);
+                    RECT rr = app_row(i);
+                    draw_control(g_rt_main, to_f(rr), CARD_R, g_br_main_card,
+                                 g_br_main_border);
+                    draw_feature_icon(g_rt_main, (float)(rr.left + 22),
+                                      (float)((rr.top + rr.bottom) / 2),
+                                      IC_LAUNCHER, g_br_main_sel,
+                                      g_br_main_dim);
+                    if (g_tf_label) {
+                        RECT nr = {rr.left + CARD_ICON, rr.top + 11,
+                                   rr.right - 300, rr.top + 29};
+                        g_rt_main->DrawText(r.label.c_str(),
+                                            (UINT32)r.label.size(), g_tf_label,
+                                            to_f(nr), g_br_main_text);
+                        RECT dr = {rr.left + CARD_ICON, rr.top + 30,
+                                   rr.right - 300, rr.top + 48};
+                        g_rt_main->DrawText(r.exe.c_str(),
+                                            (UINT32)r.exe.size(), g_tf_label,
+                                            to_f(dr), g_br_main_dim);
+                    }
+                    // The two switches, each with its own word above it.
+                    const wchar_t* cap[2] = {L"Never pause", L"Own layout"};
+                    RECT sw[2] = {app_row_pause(i), app_row_prof(i)};
+                    bool on[2] = {r.no_pause, r.profile};
+                    for (int k = 0; k < 2; k++) {
+                        if (g_tf_label) {
+                            RECT cr2 = {sw[k].left - 2, sw[k].top - 20,
+                                        sw[k].left + 120, sw[k].top - 4};
+                            g_rt_main->DrawText(cap[k],
+                                                (UINT32)wcslen(cap[k]),
+                                                g_tf_label, to_f(cr2),
+                                                g_br_main_dim);
+                        }
+                        float hgt = (float)(sw[k].bottom - sw[k].top);
+                        g_rt_main->FillRoundedRectangle(
+                            D2D1::RoundedRect(to_f(sw[k]), hgt / 2, hgt / 2),
+                            on[k] ? (ID2D1Brush*)g_br_main_sel
+                                  : g_br_main_toggle_off);
+                        float kx = on[k] ? sw[k].right - hgt / 2
+                                         : sw[k].left + hgt / 2;
+                        g_rt_main->FillEllipse(
+                            D2D1::Ellipse(D2D1::Point2F(kx,
+                                (float)(sw[k].top + sw[k].bottom) / 2),
+                                hgt / 2 - 4, hgt / 2 - 4),
+                            on[k] ? (ID2D1Brush*)g_br_main_onacc
+                                  : g_br_main_white);
+                    }
+                    RECT eb = app_row_edit(i), db = app_row_del(i);
+                    draw_control(g_rt_main, to_f(eb), 6.0f, g_br_main_key, NULL);
+                    draw_control(g_rt_main, to_f(db), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Buttons", 7, g_tf_body, to_f(eb),
+                                            r.profile ? (ID2D1Brush*)g_br_main_text
+                                                      : g_br_main_dim);
+                        g_rt_main->DrawText(L"\x2715", 1, g_tf_body, to_f(db),
+                                            g_br_main_dim);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // The open-window picker, over the page while it is up.
+                if (g_win_picker) {
+                    RECT pr = wp_rect();
+                    draw_control(g_rt_main, to_f(pr), 8.0f, g_br_main_panel,
+                                 g_br_main_border);
+                    if (g_tf_label) {
+                        RECT th = {pr.left + 12, pr.top + 10, pr.right - 12,
+                                   pr.top + 30};
+                        g_rt_main->DrawText(L"Open windows", 12, g_tf_label,
+                                            to_f(th), g_br_main_dim);
+                    }
+                    int shown = g_openwin_count > 10 ? 10 : g_openwin_count;
+                    for (int i = 0; i < shown; i++) {
+                        RECT wr2 = wp_row(i);
+                        if (!g_tf_label) continue;
+                        RECT nr = {wr2.left + 10, wr2.top, wr2.right - 110,
+                                   wr2.bottom};
+                        g_rt_main->DrawText(g_openwin[i].title.c_str(),
+                                            (UINT32)g_openwin[i].title.size(),
+                                            g_tf_label, to_f(nr),
+                                            g_br_main_text);
+                        RECT er2 = {wr2.right - 106, wr2.top, wr2.right - 10,
+                                    wr2.bottom};
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        g_rt_main->DrawText(g_openwin[i].exe.c_str(),
+                                            (UINT32)g_openwin[i].exe.size(),
+                                            g_tf_label, to_f(er2),
+                                            g_br_main_dim);
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                    if (!shown && g_tf_label) {
+                        RECT nr = {pr.left + 12, pr.top + WP_TOP,
+                                   pr.right - 12, pr.top + WP_TOP + 20};
+                        g_rt_main->DrawText(L"No windows found.", 17,
+                                            g_tf_label, to_f(nr),
+                                            g_br_main_dim);
+                    }
+                }
             } else {
                 // Cards first, so every label and control lands on one.
                 for (int i = 0; i < NTRACKS; i++)
@@ -4749,6 +5336,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 draw_control(g_rt_main, to_f(search_card()), CARD_R,
                              g_br_main_card, g_br_main_border);
                 draw_control(g_rt_main, to_f(map_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
+                draw_control(g_rt_main, to_f(apps_card()), CARD_R,
                              g_br_main_card, g_br_main_border);
                 {
                     // A small glyph on the left of each card, as WinUI does.
@@ -4851,6 +5440,35 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_tf_body) {
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                         g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(mb),
+                                            g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+                {
+                    int y = APPS_Y;
+                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
+                                      (float)y + CARD_H / 2, IC_FULLSCREEN,
+                                      g_br_main_sel, g_br_main_dim);
+                    if (g_tf_label) {
+                        RECT nr = {content_x() + CARD_ICON, y + 11,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 29};
+                        g_rt_main->DrawText(L"Per-app rules", 13, g_tf_label,
+                                            to_f(nr), g_br_main_text);
+                        RECT dr = {content_x() + CARD_ICON, y + 30,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 48};
+                        const wchar_t* d =
+                            L"Keep an app out of the game pause, or give it "
+                            L"its own button layout.";
+                        g_rt_main->DrawText(d, (UINT32)wcslen(d), g_tf_label,
+                                            to_f(dr), g_br_main_dim);
+                    }
+                    RECT ab = apps_btn_rect();
+                    draw_control(g_rt_main, to_f(ab), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(ab),
                                             g_br_main_text);
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
@@ -5181,8 +5799,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Leave the layout page on the way out: it stops the mapping while
         // it listens, and a hidden window has no way to say so or to undo it.
         g_page = 0;
+        g_bind_target = -1;
         g_listen = false;
         g_sc_capture = false;
+        g_win_picker = false;
         hide_to_tray(hwnd);  // close button -> tray, keep running
         return 0;
     case WM_DESTROY:
@@ -5279,6 +5899,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     migrate_old_data();
     InitializeCriticalSection(&g_cs);
     g_cfg = load_config();
+    rules_load();
     init_theme();
     d2d_init_process();
 

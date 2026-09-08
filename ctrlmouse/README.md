@@ -21,6 +21,21 @@ action - a single key like `F`, or a combination like `Ctrl+Shift+Tab`.
 The mapping pauses while that page is open, so pressing a button to bind it
 cannot also fire whatever is already on it.
 
+### Per-app rules
+
+**Per-app rules** in the settings window lists apps that get special
+treatment, added either by browsing for the program or by picking one of the
+windows open right now. Rules are keyed on the executable's file name, so one
+added from an open window keeps working after that window closes.
+
+Each app can:
+
+* **Never pause** — stay out of the game pause. The game check is a heuristic
+  (anything covering its whole monitor looks like a game), which otherwise
+  catches fullscreen video just as readily as an actual game.
+* **Own layout** — use its own button layout while it is focused. The base
+  layout applies everywhere else. Keyboard shortcuts stay global.
+
 | Controller | Action |
 |---|---|
 | Left stick | Move the mouse cursor |
@@ -112,7 +127,9 @@ a version resource. Win32 + DirectInput + GDI only — no third-party libraries.
 
 Settings are saved automatically to `config.json` in
 `%APPDATA%\ctrlmouse`, alongside `apps.txt` (the launcher list, one path per
-line). Settings written by older builds are moved there on first run.
+line) and `apps-rules.txt` (the per-app rules: executable, display name,
+flags, and that app's layout, tab separated). Settings written by older
+builds are moved there on first run.
 
 | Key | Meaning | Default |
 |---|---|---|
