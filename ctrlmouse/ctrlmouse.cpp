@@ -1700,13 +1700,27 @@ static DWORD WINAPI worker_thread(LPVOID) {
             //    discards anything under half a pixel, so below a certain
             //    deflection the cursor simply would not move no matter how
             //    gentle the curve. The remainder is carried to the next poll.
+            //  * A floor under that accumulation. Carrying the remainder
+            //    means any speed above zero eventually emits a pixel, so a
+            //    stick resting a hair outside its dead zone crawls - about a
+            //    pixel every three seconds, which is invisible as motion but
+            //    perfectly visible to anything watching for it. That is what
+            //    kept a video's controls awake: they would time out and a
+            //    stray pixel would wake them immediately, forever. Anything
+            //    slower than a pixel a second is drift, not aiming - it would
+            //    take a quarter of an hour to cross a screen - so it is
+            //    dropped rather than banked.
             double rx = st.lx / 1000.0, ry = st.ly / 1000.0;
             double m = sqrt(rx * rx + ry * ry);
             if (m > 1.0) { rx /= m; ry /= m; m = 1.0; }
             if (radial_up || med_up) m = 0.0;   // stick is steering a flyout
+            double speed = 0.0;
             if (m > cfg.deadzone) {
                 double t = (m - cfg.deadzone) / (1.0 - cfg.deadzone);
-                double speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
+                speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
+            }
+            // ~120 polls a second, so this is roughly a pixel per second.
+            if (speed > 0.008) {
                 move_ax += (rx / m) * speed;
                 move_ay += (ry / m) * speed;   // Y is screen-oriented
                 LONG dx = (LONG)move_ax, dy = (LONG)move_ay;
@@ -1719,8 +1733,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 move_ax = move_ay = 0.0;
             }
 
-            // Scrolling, smoothed three ways. The wheel used to move only in
-            // whole notches, which at 120Hz meant long gaps followed by a jump.
+            // Scrolling, smoothed three ways, with the same floor under it
+            // and for the same reason. The wheel used to move only in whole
+            // notches, which at 120Hz meant long gaps followed by a jump.
             //  * a low-pass filter on the stick, so the wheel eases in and out
             //    of motion instead of snapping to it and twitching on noise;
             //  * the same response curve as the cursor, so a small push scrolls
@@ -1729,7 +1744,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
             //    poll rather than saved up into discrete steps.
             double target = norm(st.ry, cfg.deadzone);   // stick up -> scroll down
             scroll_vel += (target - scroll_vel) * 0.22;
-            if (fabs(scroll_vel) > 0.0008) {
+            if (fabs(scroll_vel) > 0.012) {
                 double mag = pow(fabs(scroll_vel), cfg.mouse_curve);
                 double dir = scroll_vel < 0 ? -1.0 : 1.0;
                 scroll_accum += dir * mag * cfg.scroll_sensitivity;
