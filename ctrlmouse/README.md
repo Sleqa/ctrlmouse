@@ -9,13 +9,17 @@ XInput pads.
 ## Controls
 
 Every action below is rebindable: open **Button layout** in the settings
-window, click a button on the controller, and pick what it should do. More
-than one action can share a button when one is a tap and the other a hold.
-The D-pad is bindable too - its four directions are actions like any other,
-and just start out on volume and seek.
+window and press the button you want to change - the page names it, and
+everything on it then applies to that button. More than one action can share
+a button when one is a tap and the other a hold. The D-pad is bindable too:
+its four directions are actions like any other, and just start out on volume
+and seek.
 
-L2 and R2 are drawn in rather than part of the artwork: it is a front-on view,
-so the triggers face away and are not in the picture.
+A button can also send a keyboard shortcut instead of, or as well as, an
+action - a single key like `F`, or a combination like `Ctrl+Shift+Tab`.
+
+The mapping pauses while that page is open, so pressing a button to bind it
+cannot also fire whatever is already on it.
 
 | Controller | Action |
 |---|---|
@@ -38,7 +42,7 @@ so the triggers face away and are not in the picture.
 | Cross *(close prompt)* | Close the app |
 | D-pad down / Circle *(close prompt)* | Back out |
 | D-pad *(keyboard open)* | Move between keys (hold to repeat) |
-| Cross *(keyboard open)* | Type the highlighted key |
+| Cross *(keyboard open)* | Type the highlighted key. Enter also closes the keyboard |
 | Circle *(keyboard open)* | Backspace |
 | Touchpad click *(customizable)* | Toggle the mapping on / off, with a flyout saying which |
 
@@ -117,6 +121,7 @@ line). Settings written by older builds are moved there on first run.
 | `deadzone` | Stick travel ignored near centre (0–0.5) | `0.15` |
 | `enabled` | Master on/off | `true` |
 | `bind_lclick` / `bind_rclick` / `bind_keyboard` / `bind_playpause` / `bind_fullscreen` / `bind_launcher` / `bind_toggle` / `bind_forward` / `bind_back` / `bind_volume_up` / `bind_volume_down` / `bind_seek_fwd` / `bind_seek_back` | Controller button index per action, or -1 for none; set from Button layout. 0-13 are the pad's buttons, 16-19 the D-pad directions | `1, 2, 3, 0, 0, 9, 13, 5, 4, 16, 18, 17, 19` |
+| `scN_btn` / `scN_mods` / `scN_vk` | Keyboard shortcut on a button: which button, its `MOD_*` bits, and its virtual-key code. Only slots in use are written | *(none)* |
 | `game_pause` | Auto-pause in fullscreen games | `true` |
 | `mouse_curve` | Cursor response curve; 1 = linear, higher = finer near centre (1-3) | `2.0` |
 | `fullscreen_key` | Last shortcut picked in the fullscreen flyout: 0 = F11, 1 = Alt+Enter, 2 = F | `0` |
@@ -126,8 +131,3 @@ line). Settings written by older builds are moved there on first run.
 ## License
 
 [MIT](LICENSE)
-
-`dualsense.png`, the controller artwork on the button-layout page, is not
-mine: it was supplied for this project and its background removed. Confirm
-its licence permits redistribution before publishing a release, since it ships
-inside the binary.

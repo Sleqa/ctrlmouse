@@ -90,6 +90,11 @@ static const char* kBindKeyA[F_COUNT] = {
 #define BTN_DPAD_DOWN  18
 #define BTN_DPAD_LEFT  19
 
+// A button can also send a keyboard shortcut instead of, or as well as, one
+// of the actions above. Slots rather than an entry per button, so the config
+// only carries the ones actually set.
+#define NSC 12
+
 struct Config {
     double mouse_sensitivity;   // pixels per poll at full stick deflection
     double scroll_sensitivity;  // scroll steps per poll at full deflection
@@ -102,6 +107,9 @@ struct Config {
     unsigned search_mods;       // MOD_* bits for the third-party hotkey
     unsigned search_vk;         // and its key
     int    bind[F_COUNT];       // controller button per action
+    int    sc_btn[NSC];         // button that sends a shortcut, -1 if unused
+    unsigned sc_mods[NSC];      // MOD_* bits for it
+    unsigned sc_vk[NSC];        // and its key
 };
 
 // Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
@@ -112,7 +120,10 @@ static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
                                 0, MOD_ALT, VK_SPACE,
                                 {1, 2, 3, 0, 0, 9, 13, 5, 4,
                                  BTN_DPAD_UP, BTN_DPAD_DOWN,
-                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT}};
+                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT},
+                                {-1, -1, -1, -1, -1, -1,
+                                 -1, -1, -1, -1, -1, -1},
+                                {0}, {0}};
 static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
 static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
 
@@ -248,6 +259,12 @@ static void save_config(const Config& c) {
     // directly, so nesting would buy nothing and cost a real parser.
     for (int i = 0; i < F_COUNT; i++)
         fprintf(f, ",\n  \"%s\": %d", kBindKeyA[i], c.bind[i]);
+    for (int i = 0; i < NSC; i++) {
+        if (c.sc_btn[i] < 0) continue;
+        fprintf(f, ",\n  \"sc%d_btn\": %d,\n  \"sc%d_mods\": %u,"
+                   "\n  \"sc%d_vk\": %u",
+                i, c.sc_btn[i], i, c.sc_mods[i], i, c.sc_vk[i]);
+    }
     fprintf(f, "\n}\n");
     fclose(f);
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -310,6 +327,19 @@ static Config load_config() {
         double v;
         if (parse_double(s, kBindKeyA[i], v) && v >= -1 && v < 32)
             c.bind[i] = (int)v;
+    }
+    for (int i = 0; i < NSC; i++) {
+        char kb[24], km[24], kv[24];
+        snprintf(kb, sizeof(kb), "sc%d_btn", i);
+        snprintf(km, sizeof(km), "sc%d_mods", i);
+        snprintf(kv, sizeof(kv), "sc%d_vk", i);
+        double b, m, k;
+        if (parse_double(s, kb, b) && b >= 0 && b < 32 &&
+            parse_double(s, kv, k) && k > 0 && k < 256) {
+            c.sc_btn[i] = (int)b;
+            c.sc_vk[i] = (unsigned)k;
+            c.sc_mods[i] = parse_double(s, km, m) ? (unsigned)m : 0u;
+        }
     }
     double fk;
     if (parse_double(s, "fullscreen_key", fk)) {
@@ -478,11 +508,15 @@ static void edge_click_release_all(bool& a_down, bool& b_down) {
 enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
-       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH };
+       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
+       GP_PRESSED };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
 static volatile bool g_rad_visible = false;  // radial fullscreen picker
+// Set while the button-layout page is open: the worker reports presses
+// and runs nothing, so binding a button cannot also trigger it.
+static volatile bool g_listen = false;
 // Keyboard open purely to type into someone else's search box, so its result
 // list is navigated rather than ours. Read by the worker, hence up here.
 static volatile bool g_kb_external = false;
@@ -1409,6 +1443,21 @@ static DWORD WINAPI worker_thread(LPVOID) {
         for (int f = 0; f < F_COUNT; f++)
             if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
 
+        if (g_listen) {
+            // Report the first button of any fresh press and do nothing else,
+            // so the press being bound doesn't also fire what is on it.
+            unsigned fresh = mask & ~prev_mask;
+            if (fresh) {
+                int idx = 0;
+                while (!(fresh & (1u << idx))) idx++;
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_PRESSED, idx);
+            }
+            edge_click_release_all(a_down, b_down);
+            btn_mask_prev = mask;
+            Sleep(8);
+            continue;
+        }
+
         // Works even while the mapping is off, so it can turn it back on.
         // Debounced: toggling rebuilds the device stack and a touchpad click
         // can bounce, either of which can present a second edge within a few
@@ -1641,6 +1690,15 @@ static DWORD WINAPI worker_thread(LPVOID) {
                         tap_key(VK_MEDIA_PLAY_PAUSE);
                 } else if (went_down(F_PLAYPAUSE)) {
                     tap_key(VK_MEDIA_PLAY_PAUSE);
+                }
+
+                // Whatever shortcut this button carries, if any. Sent on
+                // the press edge, like the taps above.
+                for (int i = 0; i < NSC; i++) {
+                    int sb = cfg.sc_btn[i];
+                    if (sb < 0 || sb >= 32 || !cfg.sc_vk[i]) continue;
+                    if (((mask >> sb) & 1) && !((prev_mask >> sb) & 1))
+                        send_hotkey(cfg.sc_mods[i], cfg.sc_vk[i]);
                 }
 
                 // Volume and seek. Ordinary actions now rather than the
@@ -2065,8 +2123,6 @@ static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
 static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
 static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
 static ID2D1SolidColorBrush*  g_br_main_panel = NULL;   // opaque flyout surface
-static ID2D1SolidColorBrush*  g_br_main_trig = NULL;    // L2/R2, matched to the art
-static ID2D1Bitmap*           g_pad_bmp = NULL;       // controller artwork
 static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
 
 static LayeredSurface g_surf_kb;
@@ -2190,11 +2246,9 @@ static void d2d_release_main() {
                                    &g_br_main_dim, &g_br_main_white,
                                    &g_br_main_status, &g_br_main_glow,
                                    &g_br_main_onacc, &g_br_main_card,
-                                   &g_br_main_panel, &g_br_main_trig,
-                                   &g_br_main_border};
-    for (int i = 0; i < 14; i++)
+                                   &g_br_main_panel, &g_br_main_border};
+    for (int i = 0; i < 13; i++)
         if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
-    if (g_pad_bmp) { g_pad_bmp->Release(); g_pad_bmp = NULL; }
     if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
 }
 
@@ -2388,7 +2442,6 @@ static bool d2d_create_main(HWND hwnd) {
     // CardBackgroundFillColorDefault sits just above the page behind it -
     // as a translucent layer over Mica, as a solid colour without it.
     g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_panel);
-    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(9, 16, 26)), &g_br_main_trig);
     if (g_mica_main.active)
         g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
                                          &g_br_main_card);
@@ -2487,6 +2540,12 @@ static void kb_select() {
     } else {
         kb_send_vk(k.vk, g_kb_shift);
         g_kb_shift = false;
+        if (k.vk == VK_RETURN) {
+            // Whatever was being typed has been submitted, so the keyboard
+            // has nothing left to do and gets out of the way.
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
+            return;
+        }
     }
     g_kb_pulse_t0 = GetTickCount64();          // flash the pressed key
     if (g_kb) SetTimer(g_kb, KB_TIMER, 15, NULL);
@@ -3951,25 +4010,18 @@ static RECT sec3_header() {
     return r;
 }
 
-// --- Controller page --------------------------------------------------------
-// Page 1 of the settings window: a picture of the pad, where clicking a button
-// opens a list of actions to put on it.
+// --- Button layout page -----------------------------------------------------
+// Page 1 of the settings window. Rather than a picture of one particular pad -
+// which only ever matched the controller it was drawn from - it listens: press
+// a button and it says which one, then everything below applies to that
+// button. Works with whatever is plugged in, however many buttons it has.
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
-       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD };
+       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD,
+       IC_KEYS };
 
-static int g_page = 0;          // 0 settings, 1 controller
-static int g_pad_popup = -1;    // button the action list is open for, -1 none
-static int g_pad_hover = -1;    // button under the cursor
-
-// The artwork is 515x369 and the trigger strip adds 26 above it; the page
-// draws it at PADV_W wide and scales to suit, so every coordinate below stays
-// in the artwork's own pixels.
-#define PADV_W  430             // drawn width, DIPs
-#define PADV_Y  92              // where it starts down the page
-#define PADV_H  ((PADV_W * (369 + 26)) / 515)
-
-static int padv_x() { return content_x() + (content_w() - PADV_W) / 2; }
-static float padv_scale() { return (float)PADV_W / 515.0f; }
+static int g_page = 0;          // 0 settings, 1 button layout
+static volatile int g_bind_btn = -1;   // button last pressed, -1 none yet
+static bool g_sc_capture = false;      // recording a keyboard shortcut
 
 static RECT back_btn_rect() {
     int rx = content_x() + content_w();
@@ -3977,80 +4029,31 @@ static RECT back_btn_rect() {
     return r;
 }
 
-// Every button on the pad, in the drawing's coordinates. Round ones are a
-// centre and a radius; the rest are a centre and a half-size.
-struct PadBtn {
-    int   btn;                  // index into Config::bind, or -1 for the D-pad
-    float x, y, w, h;           // w is the radius when round
-    bool  round;
-    const wchar_t* label;
-};
-#define NPADBTN 18
-static const PadBtn kPadBtn[NPADBTN] = {
-    { 6, 121,  12, 22, 10, false, L"L2"},
-    { 7, 393,  12, 22, 10, false, L"R2"},
-    { 4, 121,  40, 16,  9, false, L"L1"},
-    { 5, 393,  40, 16,  9, false, L"R1"},
-    {BTN_DPAD_UP,    101, 100, 15, 16, false, L"D-pad Up"},
-    {BTN_DPAD_DOWN,  101, 156, 15, 16, false, L"D-pad Down"},
-    {BTN_DPAD_LEFT,   74, 127, 16, 15, false, L"D-pad Left"},
-    {BTN_DPAD_RIGHT, 129, 127, 16, 15, false, L"D-pad Right"},
-    { 3, 415,  91, 20,  0, true,  L"Triangle"},
-    { 0, 375, 128, 20,  0, true,  L"Square"},
-    { 2, 452, 128, 20,  0, true,  L"Circle"},
-    { 1, 415, 161, 20,  0, true,  L"Cross"},
-    { 8, 141,  71,  8, 12, false, L"Create"},
-    {13, 257, 100, 88, 50, false, L"Touchpad"},
-    { 9, 378,  70,  8, 12, false, L"Options"},
-    {10, 181, 194, 32,  0, true,  L"L3"},
-    {11, 340, 194, 32,  0, true,  L"R3"},
-    {12, 260, 223, 10,  0, true,  L"PS"},
-};
+#define BIND_HINT_Y   58
+#define BIND_CARD_Y   86                        // "you pressed ..."
+#define BIND_SEC1_Y   (BIND_CARD_Y + CARD_H + 20)
+#define BIND_ROW_Y0   (BIND_SEC1_Y + 26)
+#define BIND_ROW_STEP 32
+#define BIND_SEC2_Y   (BIND_ROW_Y0 + F_COUNT * BIND_ROW_STEP + 16)
+#define BIND_SC_Y     (BIND_SEC2_Y + 26)
 
-// Which pad button is at this point, or -1. Coordinates are page coordinates.
-static int padv_hit(POINT pt) {
-    float sc = padv_scale();
-    float x = (pt.x - padv_x()) / sc, y = (pt.y - PADV_Y) / sc;
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        if (b.btn < 0) continue;
-        if (b.round) {
-            float dx = x - b.x, dy = y - b.y;
-            if (dx * dx + dy * dy <= b.w * b.w) return b.btn;
-        } else {
-            if (x >= b.x - b.w && x <= b.x + b.w &&
-                y >= b.y - b.h && y <= b.y + b.h) return b.btn;
-        }
-    }
-    return -1;
-}
+static RECT bind_card()    { return card_rect(BIND_CARD_Y); }
+static RECT bind_sc_card() { return card_rect(BIND_SC_Y); }
 
-// The action list, anchored under the button it belongs to.
-#define POP_W   232
-#define POP_ROW 30
-#define POP_TOP 32
-static int pop_height() { return POP_TOP + F_COUNT * POP_ROW + 8; }
-
-static RECT pop_rect() {
-    int y = PADV_Y;
-    int right = padv_x() + PADV_W + 8;
-    int left  = padv_x() - 8 - POP_W;
-    int x;
-    if (right + POP_W <= content_x() + content_w()) x = right;
-    else if (left >= content_x())                   x = left;
-    else {
-        // Narrow window: no room either side, so it lands over the pad.
-        x = content_x() + (content_w() - POP_W) / 2;
-        y = PADV_Y + 20;
-    }
-    RECT r = {x, y, x + POP_W, y + pop_height()};
+static RECT bind_row(int i) {
+    int y = BIND_ROW_Y0 + i * BIND_ROW_STEP;
+    RECT r = {content_x(), y, content_x() + content_w(), y + BIND_ROW_STEP - 4};
     return r;
 }
-
-static RECT pop_row_rect(int f) {
-    RECT p = pop_rect();
-    RECT r = {p.left + 6, p.top + POP_TOP + f * POP_ROW, p.right - 6,
-              p.top + POP_TOP + f * POP_ROW + POP_ROW - 2};
+static RECT bind_sc_btn() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 116, BIND_SC_Y + 18, rx - 14, BIND_SC_Y + 44};
+    return r;
+}
+// Clearing the shortcut sits beside setting one, and only when there is one.
+static RECT bind_sc_clear() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 158, BIND_SC_Y + 18, rx - 124, BIND_SC_Y + 44};
     return r;
 }
 
@@ -4069,12 +4072,16 @@ static const int kFeatIcon[F_COUNT] = {
     IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK,
     IC_VOLUME, IC_VOLUME, IC_SCRUB, IC_SCRUB};
 
+// Which slot holds this button's shortcut, or -1.
+static int sc_slot_for(const Config& c, int btn) {
+    if (btn < 0) return -1;
+    for (int i = 0; i < NSC; i++)
+        if (c.sc_btn[i] == btn) return i;
+    return -1;
+}
+
 static int win_height() {
-    if (g_page == 1) {
-        int h = PADV_Y + PADV_H + 56;
-        int p = PADV_Y + pop_height() + 44;   // room for the list beside it
-        return h > p ? h : p;
-    }
+    if (g_page == 1) return BIND_SC_Y + CARD_H + 46;
     return MAP_Y + CARD_H + 54;
 }
 
@@ -4202,6 +4209,16 @@ static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
         break;
     }
     case IC_BACK:
+    case IC_KEYS: {
+        // A keycap with a smaller one behind it, for a key combination.
+        rt->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - 9, cy - 8, cx + 3, cy + 4),
+                              2.5f, 2.5f), off, 1.3f);
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - 3, cy - 3, cx + 9, cy + 9),
+                              2.5f, 2.5f), on);
+        break;
+    }
     case IC_FORWARD: {
         // An arrow: head plus a short shaft, mirrored for forward.
         float d = (kind == IC_BACK) ? -1.0f : 1.0f;
@@ -4229,112 +4246,6 @@ static void draw_face_icon(ID2D1RenderTarget* rt, float cx, float cy, int which,
         if (i == which) rt->FillEllipse(e, on);
         else            rt->DrawEllipse(e, off, 1.2f);
     }
-}
-
-// The controller. Artwork embedded as a resource and decoded with WIC, with
-// the hit regions measured off it - see kPadBtn, whose coordinates are in the
-// artwork's own pixels.
-//
-// L2 and R2 are drawn rather than part of the picture: it's a front-on view,
-// so the triggers face away from the camera and simply aren't in it. They go
-// in the strip above, in the same colour the bumpers are drawn in.
-#define PADIMG_W 515            // the artwork's own size
-#define PADIMG_H 369
-#define PAD_TRIG  26            // strip above it, where the triggers go
-
-// Decode the artwork out of our own resources. Device-dependent, so it lives
-// and dies with the render target.
-static ID2D1Bitmap* load_pad_bitmap(ID2D1RenderTarget* rt) {
-    if (!rt || !g_wic) return NULL;
-    HMODULE self = GetModuleHandleW(NULL);
-    HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(200), RT_RCDATA);
-    if (!res) return NULL;
-    HGLOBAL h = LoadResource(self, res);
-    void* data = h ? LockResource(h) : NULL;
-    DWORD size = SizeofResource(self, res);
-    if (!data || !size) return NULL;
-
-    IWICStream* stream = NULL;
-    IWICBitmapDecoder* dec = NULL;
-    IWICBitmapFrameDecode* frame = NULL;
-    IWICFormatConverter* fc = NULL;
-    ID2D1Bitmap* out = NULL;
-    if (SUCCEEDED(g_wic->CreateStream(&stream)) &&
-        SUCCEEDED(stream->InitializeFromMemory((BYTE*)data, size)) &&
-        SUCCEEDED(g_wic->CreateDecoderFromStream(stream, NULL,
-                      WICDecodeMetadataCacheOnLoad, &dec)) &&
-        SUCCEEDED(dec->GetFrame(0, &frame)) &&
-        SUCCEEDED(g_wic->CreateFormatConverter(&fc)) &&
-        SUCCEEDED(fc->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
-                                 WICBitmapDitherTypeNone, NULL, 0.0,
-                                 WICBitmapPaletteTypeMedianCut)))
-        rt->CreateBitmapFromWicBitmap(fc, NULL, &out);
-    if (fc) fc->Release();
-    if (frame) frame->Release();
-    if (dec) dec->Release();
-    if (stream) stream->Release();
-    return out;
-}
-
-// Coordinates are the artwork's pixels; sc scales them into DIPs.
-static void draw_pad(ID2D1RenderTarget* rt, float ox, float oy, float sc,
-                     const Config& c, ID2D1Brush* accent, ID2D1Brush* line,
-                     ID2D1Brush* trig, ID2D1Brush* onacc) {
-    if (!g_pad_bmp) g_pad_bmp = load_pad_bitmap(rt);
-
-    D2D1_MATRIX_3X2_F base;
-    rt->GetTransform(&base);
-    rt->SetTransform(D2D1::Matrix3x2F::Scale(sc, sc) *
-                     D2D1::Matrix3x2F::Translation(ox, oy) * base);
-
-    // The triggers first, so the artwork's bumpers overlap them the way the
-    // real ones do.
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        if (b.btn != 6 && b.btn != 7) continue;
-        D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
-            D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h), 7, 7);
-        rt->FillRoundedRectangle(r, trig);
-    }
-
-    if (g_pad_bmp)
-        rt->DrawBitmap(g_pad_bmp,
-                       D2D1::RectF(0, PAD_TRIG, PADIMG_W, PAD_TRIG + PADIMG_H),
-                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-
-    // Anything already carrying an action gets a ring; whatever is under the
-    // cursor gets a wash as well, so it's obvious the picture is clickable.
-    for (int i = 0; i < NPADBTN; i++) {
-        const PadBtn& b = kPadBtn[i];
-        if (b.btn < 0) continue;
-        bool bound = false;
-        for (int f = 0; f < F_COUNT; f++)
-            if (c.bind[f] == b.btn) bound = true;
-        bool hot = (b.btn == g_pad_hover || b.btn == g_pad_popup);
-        if (!bound && !hot) continue;
-
-        if (b.round) {
-            D2D1_ELLIPSE e = D2D1::Ellipse(D2D1::Point2F(b.x, b.y), b.w, b.w);
-            if (hot) {
-                accent->SetOpacity(0.35f);
-                rt->FillEllipse(e, accent);
-                accent->SetOpacity(1.0f);
-            }
-            rt->DrawEllipse(e, accent, hot ? 2.5f : 2.0f);
-        } else {
-            float rad = (b.btn == 13) ? 10.0f : 5.0f;
-            D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
-                D2D1::RectF(b.x - b.w, b.y - b.h, b.x + b.w, b.y + b.h),
-                rad, rad);
-            if (hot) {
-                accent->SetOpacity(0.35f);
-                rt->FillRoundedRectangle(r, accent);
-                accent->SetOpacity(1.0f);
-            }
-            rt->DrawRoundedRectangle(r, accent, hot ? 2.5f : 2.0f);
-        }
-    }
-    rt->SetTransform(base);
 }
 
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
@@ -4460,7 +4371,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Recording a launcher hotkey. Alt combinations arrive as SYSKEYDOWN,
         // hence both messages; bare modifiers are ignored so the combination
         // can be built up before the real key lands.
-        if (!g_hotkey_capture) break;
+        if (!g_hotkey_capture && !g_sc_capture) break;
         UINT vk = (UINT)wp;
         if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
             vk == VK_LWIN || vk == VK_RWIN)
@@ -4471,11 +4382,29 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (GetKeyState(VK_SHIFT) < 0)   mods |= MOD_SHIFT;
         if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
         EnterCriticalSection(&g_cs);
-        if (vk != VK_ESCAPE) { g_cfg.search_mods = mods; g_cfg.search_vk = vk; }
+        if (vk == VK_ESCAPE) {
+            // Escape backs out of recording without setting anything.
+        } else if (g_sc_capture) {
+            int btn = g_bind_btn;
+            int slot = -1;
+            for (int i = 0; i < NSC && btn >= 0; i++)
+                if (g_cfg.sc_btn[i] == btn) slot = i;
+            for (int i = 0; i < NSC && slot < 0; i++)
+                if (g_cfg.sc_btn[i] < 0) slot = i;
+            if (slot >= 0 && btn >= 0) {
+                g_cfg.sc_btn[slot] = btn;
+                g_cfg.sc_mods[slot] = mods;
+                g_cfg.sc_vk[slot] = vk;
+            }
+        } else {
+            g_cfg.search_mods = mods;
+            g_cfg.search_vk = vk;
+        }
         Config nc = g_cfg;
         LeaveCriticalSection(&g_cs);
         save_config(nc);
         g_hotkey_capture = false;
+        g_sc_capture = false;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
@@ -4486,33 +4415,48 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT bb = back_btn_rect();
             if (PtInRect(&bb, pt)) {
                 g_page = 0;
-                g_pad_popup = -1;
+                g_listen = false;         // the mapping comes back
+                g_sc_capture = false;
                 g_scroll = 0;
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
-            // A row in the open action list assigns - or, if it's already on
-            // this button, clears - that action. The list stays up, since
-            // more than one action can share a button (a tap and a hold).
-            if (g_pad_popup >= 0) {
-                for (int f = 0; f < F_COUNT; f++) {
-                    RECT rr = pop_row_rect(f);
-                    if (!PtInRect(&rr, pt)) continue;
-                    EnterCriticalSection(&g_cs);
-                    g_cfg.bind[f] = (g_cfg.bind[f] == g_pad_popup)
-                                        ? -1 : g_pad_popup;
-                    Config nc = g_cfg;
-                    LeaveCriticalSection(&g_cs);
-                    save_config(nc);
-                    InvalidateRect(hwnd, NULL, FALSE);
-                    return 0;
-                }
-                RECT pr = pop_rect();
-                if (PtInRect(&pr, pt)) return 0;   // swallow, don't dismiss
+            int btn = g_bind_btn;
+            if (btn < 0) return 0;        // nothing to act on until one lands
+            // A row assigns - or, if the action is already on this button,
+            // clears it. More than one action can share a button, since one
+            // may be a tap and another a hold.
+            for (int f = 0; f < F_COUNT; f++) {
+                RECT rr = bind_row(f);
+                if (!PtInRect(&rr, pt)) continue;
+                EnterCriticalSection(&g_cs);
+                g_cfg.bind[f] = (g_cfg.bind[f] == btn) ? -1 : btn;
+                Config nc = g_cfg;
+                LeaveCriticalSection(&g_cs);
+                save_config(nc);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
             }
-            int b = padv_hit(pt);
-            g_pad_popup = (b >= 0 && b == g_pad_popup) ? -1 : b;
-            InvalidateRect(hwnd, NULL, FALSE);
+            RECT sb = bind_sc_btn();
+            if (PtInRect(&sb, pt)) {
+                g_sc_capture = true;
+                SetFocus(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT cb = bind_sc_clear();
+            int slot = sc_slot_for(c, btn);
+            if (slot >= 0 && PtInRect(&cb, pt)) {
+                EnterCriticalSection(&g_cs);
+                g_cfg.sc_btn[slot] = -1;
+                g_cfg.sc_mods[slot] = 0;
+                g_cfg.sc_vk[slot] = 0;
+                Config nc = g_cfg;
+                LeaveCriticalSection(&g_cs);
+                save_config(nc);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             return 0;
         }
         int idx = hit_test_track(pt);
@@ -4545,7 +4489,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT mb = map_btn_rect();
             if (PtInRect(&mb, pt)) {
                 g_page = 1;
-                g_pad_popup = -1;
+                g_bind_btn = -1;
+                g_sc_capture = false;
+                g_listen = true;      // report presses, run nothing
                 g_scroll = 0;
                 clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -4584,26 +4530,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_drag_track >= 0) {
             POINT pt = lparam_to_dip(lp);
             apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
-        } else if (g_page == 1) {
-            // Light the button under the cursor, so it's obvious the pad is
-            // something you click rather than a picture.
-            POINT pt = lparam_to_dip(lp);
-            int b = padv_hit(pt);
-            if (b != g_pad_hover) {
-                g_pad_hover = b;
-                InvalidateRect(hwnd, NULL, FALSE);
-                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
-                TrackMouseEvent(&tme);
-            }
         }
         return 0;
     }
-    case WM_MOUSELEAVE:
-        if (g_pad_hover >= 0) {
-            g_pad_hover = -1;
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        return 0;
     case WM_LBUTTONUP: {
         if (g_drag_track >= 0) {
             g_drag_track = -1;
@@ -4662,75 +4591,149 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (g_tf_label) {
                     const wchar_t* h =
-                        L"Click a button to choose what it does. More than "
-                        L"one action can share a button.";
-                    RECT hr2 = {content_x(), 56, content_x() + content_w(), 76};
+                        L"Press a button on the controller. Everything below "
+                        L"then applies to that button.";
+                    RECT hr2 = {content_x(), BIND_HINT_Y,
+                                content_x() + content_w(), BIND_HINT_Y + 20};
                     g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
                                         to_f(hr2), g_br_main_dim);
                 }
-                draw_pad(g_rt_main, (float)padv_x(), (float)PADV_Y,
-                         padv_scale(), c, g_br_main_sel, g_br_main_border,
-                         g_br_main_trig, g_br_main_onacc);
 
-                // Names whatever is under the cursor, below the artwork
-                // rather than over it.
-                if (g_tf_label) {
-                    int b = (g_pad_hover >= 0) ? g_pad_hover : g_pad_popup;
-                    const wchar_t* nm = L"";
-                    for (int i = 0; i < NPADBTN && b >= 0; i++)
-                        if (kPadBtn[i].btn == b) nm = kPadBtn[i].label;
-                    RECT cr = {content_x(), PADV_Y + PADV_H + 6,
-                               content_x() + content_w(), PADV_Y + PADV_H + 26};
-                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    g_rt_main->DrawText(nm, (UINT32)wcslen(nm), g_tf_label,
-                                        to_f(cr), g_br_main_text);
-                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                // What was pressed. Accent-filled once there is one, so it
+                // reads as live rather than as another empty field.
+                int btn = g_bind_btn;
+                draw_control(g_rt_main, to_f(bind_card()), CARD_R,
+                             btn >= 0 ? (ID2D1Brush*)g_br_main_sel
+                                      : g_br_main_card,
+                             btn >= 0 ? NULL : (ID2D1Brush*)g_br_main_border);
+                if (g_tf_header) {
+                    wchar_t bn[48];
+                    if (btn >= 0) button_name(btn, bn, 48);
+                    else          wcscpy(bn, L"Waiting for a button...");
+                    RECT nr = {content_x() + 20, BIND_CARD_Y + 12,
+                               content_x() + content_w() - 20,
+                               BIND_CARD_Y + 38};
+                    g_rt_main->DrawText(bn, (UINT32)wcslen(bn), g_tf_header,
+                                        to_f(nr),
+                                        btn >= 0 ? (ID2D1Brush*)g_br_main_onacc
+                                                 : g_br_main_dim);
+                }
+                if (g_tf_label && btn >= 0) {
+                    wchar_t sub[64];
+                    swprintf(sub, 64, L"Button %d", btn);
+                    RECT sr = {content_x() + 20, BIND_CARD_Y + 34,
+                               content_x() + content_w() - 20,
+                               BIND_CARD_Y + 52};
+                    g_rt_main->DrawText(sub, (UINT32)wcslen(sub), g_tf_label,
+                                        to_f(sr), g_br_main_onacc);
                 }
 
-                // The action list for whichever button was clicked.
-                if (g_pad_popup >= 0) {
-                    RECT pr = pop_rect();
-                    draw_control(g_rt_main, to_f(pr), 8.0f, g_br_main_panel,
-                                 g_br_main_border);
-                    if (g_tf_label) {
-                        wchar_t bn[32];
-                        button_name(g_pad_popup, bn, 32);
-                        RECT th = {pr.left + 12, pr.top + 8, pr.right - 12,
-                                   pr.top + 26};
-                        g_rt_main->DrawText(bn, (UINT32)wcslen(bn), g_tf_label,
-                                            to_f(th), g_br_main_dim);
+                if (g_tf_label) {
+                    RECT s1 = {content_x(), BIND_SEC1_Y,
+                               content_x() + content_w(), BIND_SEC1_Y + 20};
+                    g_rt_main->DrawText(L"ACTIONS", 7, g_tf_label, to_f(s1),
+                                        g_br_main_dim);
+                    RECT s2 = {content_x(), BIND_SEC2_Y,
+                               content_x() + content_w(), BIND_SEC2_Y + 20};
+                    g_rt_main->DrawText(L"KEYBOARD SHORTCUT", 17, g_tf_label,
+                                        to_f(s2), g_br_main_dim);
+                }
+
+                // The actions, with the ones already on this button lit.
+                for (int f = 0; f < F_COUNT; f++) {
+                    RECT rr = bind_row(f);
+                    bool on = (btn >= 0 && c.bind[f] == btn);
+                    if (on)
+                        draw_control(g_rt_main, to_f(rr), 5.0f, g_br_main_sel,
+                                     NULL);
+                    draw_feature_icon(g_rt_main, (float)(rr.left + 18),
+                                      (float)((rr.top + rr.bottom) / 2),
+                                      kFeatIcon[f],
+                                      on ? (ID2D1Brush*)g_br_main_onacc
+                                         : g_br_main_sel,
+                                      on ? (ID2D1Brush*)g_br_main_onacc
+                                         : g_br_main_dim);
+                    if (!g_tf_label) continue;
+                    ID2D1Brush* tb = on ? (ID2D1Brush*)g_br_main_onacc
+                                        : (btn >= 0 ? (ID2D1Brush*)g_br_main_text
+                                                    : g_br_main_dim);
+                    RECT nr = {rr.left + 40, rr.top, rr.right - 150, rr.bottom};
+                    g_rt_main->DrawText(kFeatName[f],
+                                        (UINT32)wcslen(kFeatName[f]),
+                                        g_tf_label, to_f(nr), tb);
+                    // Where it already is, when that is somewhere else.
+                    wchar_t at[48] = L"";
+                    if (!on && c.bind[f] >= 0) {
+                        wchar_t bn2[32];
+                        button_name(c.bind[f], bn2, 32);
+                        swprintf(at, 48, L"%s", bn2);
+                    } else if (!on) {
+                        wcscpy(at, L"unbound");
+                    } else if (kFeatHint[f][0]) {
+                        swprintf(at, 48, L"%s", kFeatHint[f]);
                     }
-                    for (int f = 0; f < F_COUNT; f++) {
-                        RECT rr = pop_row_rect(f);
-                        bool on = (c.bind[f] == g_pad_popup);
-                        if (on)
-                            draw_control(g_rt_main, to_f(rr), 5.0f,
-                                         g_br_main_sel, NULL);
-                        draw_feature_icon(g_rt_main, (float)(rr.left + 16),
-                                          (float)((rr.top + rr.bottom) / 2),
-                                          kFeatIcon[f],
-                                          on ? (ID2D1Brush*)g_br_main_onacc
-                                             : g_br_main_sel,
-                                          on ? (ID2D1Brush*)g_br_main_onacc
-                                             : g_br_main_dim);
-                        if (!g_tf_label) continue;
-                        RECT nr = {rr.left + 34, rr.top, rr.right - 56,
+                    if (at[0]) {
+                        RECT ar = {rr.right - 148, rr.top, rr.right - 12,
                                    rr.bottom};
-                        g_rt_main->DrawText(kFeatName[f],
-                                            (UINT32)wcslen(kFeatName[f]),
-                                            g_tf_label, to_f(nr),
-                                            on ? (ID2D1Brush*)g_br_main_onacc
-                                               : g_br_main_text);
-                        if (!kFeatHint[f][0]) continue;
-                        RECT hr3 = {rr.right - 54, rr.top, rr.right - 10,
-                                    rr.bottom};
                         g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        g_rt_main->DrawText(kFeatHint[f],
-                                            (UINT32)wcslen(kFeatHint[f]),
-                                            g_tf_label, to_f(hr3),
+                        g_rt_main->DrawText(at, (UINT32)wcslen(at), g_tf_label,
+                                            to_f(ar),
                                             on ? (ID2D1Brush*)g_br_main_onacc
                                                : g_br_main_dim);
                         g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // The shortcut this button sends, if any.
+                draw_control(g_rt_main, to_f(bind_sc_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
+                int slot = sc_slot_for(c, btn);
+                draw_feature_icon(g_rt_main, (float)(content_x() + 22),
+                                  (float)BIND_SC_Y + CARD_H / 2, IC_KEYS,
+                                  g_br_main_sel, g_br_main_dim);
+                if (g_tf_label) {
+                    wchar_t kn[64];
+                    if (g_sc_capture)   wcscpy(kn, L"Press the keys...");
+                    else if (slot >= 0) hotkey_name(c.sc_mods[slot],
+                                                    c.sc_vk[slot], kn, 64);
+                    else                wcscpy(kn, L"None");
+                    RECT nr = {content_x() + CARD_ICON, BIND_SC_Y + 11,
+                               content_x() + content_w() - 170,
+                               BIND_SC_Y + 29};
+                    g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_label,
+                                        to_f(nr),
+                                        (slot >= 0 || g_sc_capture)
+                                            ? (ID2D1Brush*)g_br_main_text
+                                            : g_br_main_dim);
+                    const wchar_t* d2 =
+                        L"Any combination, e.g. F or Ctrl+Shift+Tab.";
+                    RECT dr = {content_x() + CARD_ICON, BIND_SC_Y + 30,
+                               content_x() + content_w() - 170,
+                               BIND_SC_Y + 48};
+                    g_rt_main->DrawText(d2, (UINT32)wcslen(d2), g_tf_label,
+                                        to_f(dr), g_br_main_dim);
+                }
+                if (btn >= 0) {
+                    RECT sb = bind_sc_btn();
+                    draw_control(g_rt_main, to_f(sb), 6.0f,
+                                 g_sc_capture ? g_br_main_armed
+                                              : g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Record", 6, g_tf_body, to_f(sb),
+                                            g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                    if (slot >= 0) {
+                        RECT cb = bind_sc_clear();
+                        draw_control(g_rt_main, to_f(cb), 6.0f, g_br_main_key,
+                                     NULL);
+                        if (g_tf_body) {
+                            g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                            g_rt_main->DrawText(L"\x2715", 1, g_tf_body,
+                                                to_f(cb), g_br_main_dim);
+                            g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        }
                     }
                 }
             } else {
@@ -5104,6 +5107,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         }
+        case GP_PRESSED:
+            if (g_listen && g_bind_btn != (int)lp) {
+                g_bind_btn = (int)lp;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
         case GP_TOGGLE: {
             // Controller keybind: toggles whatever the user perceives. If the
             // mapping is effectively off (disabled OR game-paused), turn it on
@@ -5165,9 +5174,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CLOSE:
+        // Leave the layout page on the way out: it stops the mapping while
+        // it listens, and a hidden window has no way to say so or to undo it.
+        g_page = 0;
+        g_listen = false;
+        g_sc_capture = false;
         hide_to_tray(hwnd);  // close button -> tray, keep running
         return 0;
     case WM_DESTROY:
+        g_listen = false;
         KillTimer(hwnd, ID_TIMER);
         remove_tray_icon();
         d2d_release_main();

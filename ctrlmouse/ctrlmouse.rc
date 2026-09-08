@@ -2,11 +2,6 @@
 
 1 ICON "ctrlmouse.ico"
 
-// The controller artwork for the button-layout page, embedded so the exe
-// stays a single file. Decoded with WIC at runtime.
-#define IDR_PAD_PNG 200
-IDR_PAD_PNG RCDATA "dualsense.png"
-
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 1,0,0,0
  PRODUCTVERSION 1,0,0,0
