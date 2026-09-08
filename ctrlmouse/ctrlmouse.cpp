@@ -35,6 +35,8 @@
 #include <wincodec.h>
 #include <commoncontrols.h>
 #include <shlobj.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
 extern "C" {
 #include <hidsdi.h>
 }
@@ -60,6 +62,7 @@ extern "C" {
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -510,7 +513,7 @@ enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
        GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
-       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE };
+       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE, GP_RAD_ROW };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -1468,6 +1471,8 @@ static DWORD WINAPI worker_thread(LPVOID) {
     int  rad_deflect = -1;                 // -1 centred, 0 left, 2 right
     bool med_up = false;                   // the media flyout is on screen
     int  med_idx = 0, med_deflect = -1;
+    int  med_row = 0;                      // 0 controls, 1 the seek bar
+    int  med_vdeflect = 0, med_seek_dir = 0;
     ULONGLONG med_hold_t0 = 0, med_last = 0;
     int  med_reps = 0;
     ULONGLONG batt_last = 0;               // last battery property read
@@ -1597,6 +1602,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
         auto went_down = [&](int f) {
             int b = bit(f);
             return b >= 0 && ((mask >> b) & 1) && !((prev_mask >> b) & 1);
+        };
+        auto btn_is_down = [&](int b) {
+            return b >= 0 && b < 32 && ((mask >> b) & 1) != 0;
         };
         auto btn_went_down = [&](int b) {
             return b >= 0 && b < 32 && ((mask >> b) & 1) &&
@@ -1898,50 +1906,95 @@ static DWORD WINAPI worker_thread(LPVOID) {
                         PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 1);
                         med_up = true;
                         med_idx = MED_PLAY;
+                        med_row = 0;
                         med_deflect = -1;
+                        med_vdeflect = 0;
+                        med_seek_dir = 0;
                         med_hold_t0 = 0;
                         med_last = 0;
                         med_reps = 0;
                     }
                 }
                 if (med_up) {
-                    // Either stick or D-pad steps the highlight; the stick is
-                    // read as a step rather than a position for the same
-                    // reason the fullscreen one is.
-                    double sx = st.lx / 1000.0;
-                    int dir = (sx < -0.33) ? 0 : (sx > 0.33) ? 2 : -1;
-                    int step = 0;
-                    if (dir != med_deflect) {
-                        if (dir == 0) step = -1;
-                        if (dir == 2) step = 1;
-                        med_deflect = dir;
-                    }
-                    if (btn_went_down(BTN_DPAD_LEFT))  step = -1;
-                    if (btn_went_down(BTN_DPAD_RIGHT)) step = 1;
-                    if (step) {
-                        int want = med_idx + step;
-                        if (want >= 0 && want < NMEDIA && want != med_idx) {
-                            med_idx = want;
-                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, med_idx);
+                    // Up and down move between the controls and the seek
+                    // bar; either stick or D-pad, and the stick is read as a
+                    // step rather than a position for the same reason the
+                    // fullscreen one is.
+                    double sx = st.lx / 1000.0, sy = st.ly / 1000.0;
+                    int vdir = (sy < -0.5) ? -1 : (sy > 0.5) ? 1 : 0;
+                    int vstep = 0;
+                    if (vdir != med_vdeflect) { vstep = vdir; med_vdeflect = vdir; }
+                    if (btn_went_down(BTN_DPAD_UP))   vstep = -1;
+                    if (btn_went_down(BTN_DPAD_DOWN)) vstep = 1;
+                    if (vstep) {
+                        int want = med_row + (vstep > 0 ? 1 : -1);
+                        if (want >= 0 && want <= 1 && want != med_row) {
+                            med_row = want;
+                            med_seek_dir = 0;
+                            med_hold_t0 = 0;
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_ROW, med_row);
                         }
                     }
 
-                    // Cross fires it, and keeps firing what is worth
-                    // repeating.
-                    if (went_down(F_LCLICK)) {
-                        med_hold_t0 = bnow;
-                        med_last = bnow;
-                        med_reps = 0;
-                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT, med_idx);
-                    } else if (is_down(F_LCLICK) && media_repeats(med_idx) &&
-                               med_hold_t0 && bnow - med_hold_t0 >= 350) {
-                        int gap = 140 - med_reps * 8;
-                        if (gap < 40) gap = 40;
-                        if (bnow - med_last >= (ULONGLONG)gap) {
+                    int hdir = (sx < -0.33) ? -1 : (sx > 0.33) ? 1 : 0;
+                    if (btn_is_down(BTN_DPAD_LEFT))  hdir = -1;
+                    if (btn_is_down(BTN_DPAD_RIGHT)) hdir = 1;
+
+                    if (med_row == 0) {
+                        // The controls row steps between the icons.
+                        int step = 0;
+                        if (hdir != med_deflect) { step = hdir; med_deflect = hdir; }
+                        if (btn_went_down(BTN_DPAD_LEFT))  step = -1;
+                        if (btn_went_down(BTN_DPAD_RIGHT)) step = 1;
+                        if (step) {
+                            int want = med_idx + step;
+                            if (want >= 0 && want < NMEDIA && want != med_idx) {
+                                med_idx = want;
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL,
+                                             med_idx);
+                            }
+                        }
+                        // Cross fires it, and keeps firing what is worth
+                        // repeating.
+                        if (went_down(F_LCLICK)) {
+                            med_hold_t0 = bnow;
+                            med_last = bnow;
+                            med_reps = 0;
                             PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
                                          med_idx);
+                        } else if (is_down(F_LCLICK) && media_repeats(med_idx) &&
+                                   med_hold_t0 && bnow - med_hold_t0 >= 350) {
+                            int gap = 140 - med_reps * 8;
+                            if (gap < 40) gap = 40;
+                            if (bnow - med_last >= (ULONGLONG)gap) {
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                             med_idx);
+                                med_last = bnow;
+                                med_reps++;
+                            }
+                        }
+                    } else {
+                        // On the bar, left and right seek directly - no
+                        // second button, since there is only one thing the
+                        // row can do - and hold to keep going.
+                        med_deflect = hdir;
+                        if (hdir != med_seek_dir) {
+                            med_seek_dir = hdir;
+                            med_hold_t0 = bnow;
                             med_last = bnow;
-                            med_reps++;
+                            med_reps = 0;
+                            if (hdir)
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                             hdir < 0 ? 0 : NMEDIA - 1);
+                        } else if (hdir && bnow - med_hold_t0 >= 350) {
+                            int gap = 140 - med_reps * 8;
+                            if (gap < 40) gap = 40;
+                            if (bnow - med_last >= (ULONGLONG)gap) {
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                             hdir < 0 ? 0 : NMEDIA - 1);
+                                med_last = bnow;
+                                med_reps++;
+                            }
                         }
                     }
                 }
@@ -3802,19 +3855,119 @@ static void lx_nav(int dir) {
     if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
 }
 
+
+// --- Now playing ------------------------------------------------------------
+// The seek bar needs to know where the track actually is, which the system
+// media session knows and the arrow keys we send do not. That lives behind
+// WinRT, whose calls block, so they happen on a thread of their own rather
+// than on the UI thread - which is an STA, where blocking on an async is a
+// deadlock waiting to happen. The thread runs only while the media flyout is
+// up, and everything it learns is published through the lock below.
+static CRITICAL_SECTION g_med_cs;
+static HANDLE   g_med_thread = NULL;
+static volatile bool g_med_poll = false;   // the flyout wants updates
+static bool     g_med_have = false;        // there is a session at all
+static double   g_med_pos = 0.0;           // seconds, when last sampled
+static double   g_med_dur = 0.0;
+static bool     g_med_playing = false;
+static ULONGLONG g_med_stamp = 0;          // tick when pos was sampled
+
+static DWORD WINAPI med_poll_proc(LPVOID) {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    while (g_med_poll) {
+        bool have = false, playing = false;
+        double pos = 0.0, dur = 0.0;
+        try {
+            using namespace winrt::Windows::Media::Control;
+            auto mgr = GlobalSystemMediaTransportControlsSessionManager::
+                           RequestAsync().get();
+            auto s = mgr.GetCurrentSession();
+            if (s) {
+                auto tl = s.GetTimelineProperties();
+                auto pb = s.GetPlaybackInfo();
+                auto to_s = [](winrt::Windows::Foundation::TimeSpan t) {
+                    return (double)t.count() / 10000000.0;   // 100ns units
+                };
+                pos = to_s(tl.Position()) - to_s(tl.StartTime());
+                dur = to_s(tl.EndTime()) - to_s(tl.StartTime());
+                playing = pb.PlaybackStatus() ==
+                          GlobalSystemMediaTransportControlsSessionPlaybackStatus::
+                              Playing;
+                have = dur > 0.5;    // a live stream reports no length
+            }
+        } catch (...) {
+            have = false;            // no session, or the app went away
+        }
+        EnterCriticalSection(&g_med_cs);
+        g_med_have = have;
+        g_med_pos = pos;
+        g_med_dur = dur;
+        g_med_playing = playing;
+        g_med_stamp = GetTickCount64();
+        LeaveCriticalSection(&g_med_cs);
+        for (int i = 0; i < 8 && g_med_poll; i++) Sleep(50);
+    }
+    winrt::uninit_apartment();
+    return 0;
+}
+
+static void med_poll_start() {
+    if (g_med_poll) return;
+    g_med_poll = true;
+    if (g_med_thread) { CloseHandle(g_med_thread); g_med_thread = NULL; }
+    g_med_thread = CreateThread(NULL, 0, med_poll_proc, NULL, 0, NULL);
+}
+
+static void med_poll_stop() { g_med_poll = false; }
+
+// Where the track is now: the last sample, plus however long ago that was if
+// it is still playing, so the bar creeps rather than stepping every poll.
+static bool med_now(double& pos, double& dur, bool& playing) {
+    EnterCriticalSection(&g_med_cs);
+    bool have = g_med_have;
+    pos = g_med_pos;
+    dur = g_med_dur;
+    playing = g_med_playing;
+    ULONGLONG stamp = g_med_stamp;
+    LeaveCriticalSection(&g_med_cs);
+    if (have && playing && stamp)
+        pos += (double)(GetTickCount64() - stamp) / 1000.0;
+    if (pos < 0) pos = 0;
+    if (have && pos > dur) pos = dur;
+    return have;
+}
+
+static void med_time_str(double secs, wchar_t* out, size_t n) {
+    if (secs < 0) secs = 0;
+    int t = (int)(secs + 0.5);
+    int h = t / 3600, m = (t / 60) % 60, s = t % 60;
+    if (h) swprintf(out, n, L"%d:%02d:%02d", h, m, s);
+    else   swprintf(out, n, L"%d:%02d", m, s);
+}
+
 // --- Fullscreen flyout ------------------------------------------------------
 // Shaped like one of Windows' own flyouts - a small rounded card near the
 // bottom of the screen - rather than a menu that takes over the middle. It is
 // only up while the button is held: the left stick slides the underline
 // between the options and letting go sends the one under it.
 #define FLY_W    310
-#define FLY_H     64
+#define FLY_H     64            // the controls row on its own
+#define FLY_SEEK  36            // the seek row under it, media mode only
 #define FLY_PAD   12
 // Mode 0 is the fullscreen shortcuts, mode 1 the media controls; they differ
 // only in how many items there are and whether each is drawn as a word or an
 // icon, so one window does both.
 static int g_rad_mode = 0;
+static int g_rad_row = 0;       // 0 the controls, 1 the seek bar
 static int rad_count() { return g_rad_mode ? NMEDIA : NRADIAL; }
+static int fly_h() { return g_rad_mode ? FLY_H + FLY_SEEK : FLY_H; }
+
+// The bar, and the timestamp sitting at the end of it.
+#define SEEK_TXT 78
+static D2D1_RECT_F seek_track() {
+    return D2D1::RectF((float)FLY_PAD, FLY_H + 15.0f,
+                       (float)(FLY_W - FLY_PAD - SEEK_TXT), FLY_H + 21.0f);
+}
 #define FLY_ITEMW (float)((FLY_W - FLY_PAD * 2) / rad_count())
 #define FLY_ANIM  140      // underline glide, ms
 #define FLY_IN    250      // slide-and-fade in, ms
@@ -3906,7 +4059,7 @@ static void d2d_release_rad() {
 
 static void rad_render() {
     if (!g_rad) return;
-    int w = dip_to_px(FLY_W), h = dip_to_px(FLY_H);
+    int w = dip_to_px(FLY_W), h = dip_to_px(fly_h());
     bool first = !g_surf_rad.rt;
     if (!layered_begin(g_surf_rad, w, h)) return;
     if (first) {
@@ -3924,7 +4077,8 @@ static void rad_render() {
     ID2D1RenderTarget* rt = g_surf_rad.rt;
     rt->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
 
-    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f, FLY_H - 0.5f);
+    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f,
+                                   fly_h() - 0.5f);
     rt->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f), g_br_rad_card);
     rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
                              g_br_rad_border, 1.0f);
@@ -3932,8 +4086,57 @@ static void rad_render() {
     if (g_rad_mode) {
         for (int i = 0; i < NMEDIA; i++)
             draw_media_glyph(rt, fly_item_cx(i), 27.0f, i,
-                             i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
-                                            : g_br_rad_dim);
+                             (i == g_rad_sel && g_rad_row == 0)
+                                 ? (ID2D1Brush*)g_br_rad_text
+                                 : g_br_rad_dim);
+
+        // The seek bar, and the time at the end of it. Position comes from
+        // the system's own media session - the arrow keys we send to seek
+        // have no idea where the track is.
+        double pos = 0, dur = 0;
+        bool playing = false;
+        bool have = med_now(pos, dur, playing);
+        D2D1_RECT_F tr = seek_track();
+        float mid = (tr.top + tr.bottom) / 2;
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(tr.left, mid - 2, tr.right, mid + 2),
+                              2.0f, 2.0f), g_br_rad_dim);
+        if (have && dur > 0) {
+            float frac = (float)(pos / dur);
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            float x = tr.left + (tr.right - tr.left) * frac;
+            if (x > tr.left + 1)
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(tr.left, mid - 2, x, mid + 2),
+                                      2.0f, 2.0f), g_br_rad_sel);
+            // The handle only appears once the row has focus, which is also
+            // the only time it can be moved.
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, mid),
+                                          g_rad_row == 1 ? 6.0f : 4.0f,
+                                          g_rad_row == 1 ? 6.0f : 4.0f),
+                            g_rad_row == 1 ? (ID2D1Brush*)g_br_rad_text
+                                           : g_br_rad_sel);
+        }
+        if (g_tf_fly) {
+            wchar_t ts[48];
+            if (have) {
+                wchar_t a[24], b[24];
+                med_time_str(pos, a, 24);
+                med_time_str(dur, b, 24);
+                swprintf(ts, 48, L"%s / %s", a, b);
+            } else {
+                wcscpy(ts, L"--:--");
+            }
+            D2D1_RECT_F txt = D2D1::RectF((float)(FLY_W - FLY_PAD - SEEK_TXT),
+                                          tr.top - 9, (float)(FLY_W - FLY_PAD),
+                                          tr.bottom + 9);
+            g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            rt->DrawText(ts, (UINT32)wcslen(ts), g_tf_fly, txt,
+                         g_rad_row == 1 ? (ID2D1Brush*)g_br_rad_text
+                                        : g_br_rad_dim);
+            g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
     } else if (g_tf_fly) {
         g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         for (int i = 0; i < NRADIAL; i++) {
@@ -3953,18 +4156,19 @@ static void rad_render() {
     float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
     float cx = from + (to - from) * t;
     float halfw = FLY_ITEMW * 0.30f;
-    rt->FillRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(cx - halfw, 46, cx + halfw, 49.5f),
-                          1.8f, 1.8f),
-        g_br_rad_sel);
+    if (g_rad_row == 0)
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - halfw, 46, cx + halfw, 49.5f),
+                              1.8f, 1.8f),
+            g_br_rad_sel);
 
     float in = ease_out(g_rad_in_t0, FLY_IN);
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
-                 wa.bottom - h - dip_to_px(72) +
-                     (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
-    layered_present(g_surf_rad, g_rad, &pos, (BYTE)(255 * in));
+    POINT pos2 = {wa.left + (wa.right - wa.left - w) / 2,
+                  wa.bottom - h - dip_to_px(72) +
+                      (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
+    layered_present(g_surf_rad, g_rad, &pos2, (BYTE)(255 * in));
 }
 
 static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3976,7 +4180,10 @@ static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         bool entering = g_rad_in_t0 && now - g_rad_in_t0 < FLY_IN;
         if (!moving) { g_rad_move_t0 = 0; g_rad_prev_sel = g_rad_sel; }
         if (!entering) g_rad_in_t0 = 0;
-        if (!moving && !entering) KillTimer(hwnd, FLY_TIMER);
+        // The media flyout keeps ticking regardless, so the seek bar moves
+        // with the track rather than only when something is pressed.
+        if (!moving && !entering && !(g_rad_mode && g_rad_visible))
+            KillTimer(hwnd, FLY_TIMER);
         return 0;
     }
     if (msg == WM_DESTROY) { d2d_release_rad(); return 0; }
@@ -3999,7 +4206,7 @@ static void rad_show(bool on) {
         g_rad = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
-            dip_to_px(FLY_W), dip_to_px(FLY_H), g_hwnd, NULL,
+            dip_to_px(FLY_W), dip_to_px(fly_h()), g_hwnd, NULL,
             GetModuleHandleW(NULL), NULL);
         if (g_rad) {
             enable_acrylic(g_rad);
@@ -5819,13 +6026,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_rad_mode = (int)lp;
             g_rad_sel = g_rad_mode ? MED_PLAY : 1;   // the middle option
             g_rad_prev_sel = g_rad_sel;
+            g_rad_row = 0;
+            if (g_rad_mode) med_poll_start();
             rad_show(true);
+            break;
+        case GP_RAD_ROW:
+            g_rad_row = (int)lp ? 1 : 0;
+            if (g_rad) InvalidateRect(g_rad, NULL, FALSE);
+            rad_render();
             break;
         case GP_RAD_SEL:
             rad_select((int)lp);
             break;
         case GP_RAD_PICK: {
             int mode = g_rad_mode, sel = g_rad_sel;
+            med_poll_stop();
             rad_show(false);
             if (mode) {
                 // lp is set when the item has already been repeating, which
@@ -5843,6 +6058,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case GP_RAD_HIDE:
+            med_poll_stop();
             rad_show(false);
             break;
         case GP_MED_REPEAT:
@@ -6083,6 +6299,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     migrate_old_data();
     InitializeCriticalSection(&g_cs);
+    InitializeCriticalSection(&g_med_cs);
     g_cfg = load_config();
     rules_load();
     init_theme();

@@ -25,4 +25,5 @@ target_link_libraries(ctrlmouse PRIVATE
     setupapi
     advapi32
     cfgmgr32
+    windowsapp
 )

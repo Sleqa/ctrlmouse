@@ -45,8 +45,10 @@ Each app can:
 | Circle / B | Right click |
 | Square / X | Play / pause — **hold** for the fullscreen flyout |
 | Create | Open / close the media flyout |
-| Left stick or D-pad *(media flyout)* | Move between seek, volume and play / pause |
-| Cross *(media flyout)* | Use the highlighted control; hold to repeat volume and seek |
+| Left / right *(media flyout)* | Move between seek, volume and play / pause |
+| Up / down *(media flyout)* | Move between the controls and the seek bar |
+| Cross *(media flyout, controls)* | Use the highlighted control; hold to repeat volume and seek |
+| Left / right *(media flyout, seek bar)* | Seek; hold to keep going |
 | R1 / L1 | Forward / back, as the mouse side buttons |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |
@@ -109,7 +111,9 @@ the way video players expect — so it applies to the focused window.
 
 ## Build from source
 
-Requires the MSVC Build Tools (any recent Visual Studio / Build Tools install).
+Requires the MSVC Build Tools (any recent Visual Studio / Build Tools install)
+and the Windows SDK, whose C++/WinRT headers the seek bar reads the media
+session through. Built as C++17.
 
 From a *x64 Native Tools Command Prompt for VS*:
 
