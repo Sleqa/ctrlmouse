@@ -3864,11 +3864,12 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // The window is resizable. Content stretches with it up to a comfortable
 // reading width and then centres, the way the app this borrows from does -
 // a settings list stretched across a very wide window is hard to scan.
-#define WIN_W     620             // starting width only
+#define WIN_W     980             // starting width: enough for the longest
+                                  // description without truncating it
 #define WIN_MIN_W 480
 #define WIN_MIN_H 420
 #define PAD       24
-#define MAXW      900             // widest the content ever gets
+#define MAXW      960             // widest the content ever gets
 
 static int g_cw = WIN_W;          // client size, DIPs
 static int g_ch = 700;
@@ -3978,15 +3979,16 @@ static RECT toggle_desc(int i) {
 #define NSEARCH 2
 static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
 static RECT search_card() { return card_rect(SEARCH_Y); }
+#define SEARCH_CTRL 300           // wider than CARD_CTRL: two segments and
+                                  // the hotkey have to share it
 static RECT search_seg(int i) {
-    int rx = content_x() + content_w();
-    RECT r = {rx - 240 + i * 62, SEARCH_Y + 18, rx - 240 + i * 62 + 58,
-              SEARCH_Y + 44};
+    int x = content_x() + content_w() - SEARCH_CTRL + i * 86;
+    RECT r = {x, SEARCH_Y + 18, x + 80, SEARCH_Y + 44};
     return r;
 }
 static RECT search_key_rect() {
     int rx = content_x() + content_w();
-    RECT r = {rx - 112, SEARCH_Y + 18, rx - 8, SEARCH_Y + 44};
+    RECT r = {rx - 118, SEARCH_Y + 18, rx - 8, SEARCH_Y + 44};
     return r;
 }
 
@@ -4792,12 +4794,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
                                             g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
 
-                    RECT sl = {PAD + CARD_ICON, SEARCH_Y + 11,
-                               content_x() + content_w() - 250, SEARCH_Y + 29};
+                    RECT sl = {content_x() + CARD_ICON, SEARCH_Y + 11,
+                               content_x() + content_w() - SEARCH_CTRL - 12,
+                               SEARCH_Y + 29};
                     g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
                                         g_br_main_text);
-                    RECT sd = {PAD + CARD_ICON, SEARCH_Y + 30,
-                               content_x() + content_w() - 250, SEARCH_Y + 48};
+                    RECT sd = {content_x() + CARD_ICON, SEARCH_Y + 30,
+                               content_x() + content_w() - SEARCH_CTRL - 12,
+                               SEARCH_Y + 48};
                     const wchar_t* sdt = (c.search_mode == 1)
                         ? L"Presses your hotkey to open the launcher you already use."
                         : L"Shows a simple list of your installed apps.";
@@ -5310,6 +5314,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
     DWORD style = WS_OVERLAPPEDWINDOW;   // resizable: content reflows
     AdjustWindowRect(&r, style, FALSE);
+    // Opening wide enough for the longest description is no good if that is
+    // wider than the screen, which it can be once DPI scaling is in play.
+    {
+        RECT wa;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        int maxw = (wa.right - wa.left) - dip_to_px(24);
+        int maxh = (wa.bottom - wa.top) - dip_to_px(24);
+        if (r.right - r.left > maxw) r.right = r.left + maxw;
+        if (r.bottom - r.top > maxh) r.bottom = r.top + maxh;
+    }
     // No redirection surface when Mica will be attempted: its content is
     // presented through DirectComposition instead, and leaving the normal
     // one in place is what showed through as a white window.
