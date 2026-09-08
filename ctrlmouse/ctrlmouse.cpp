@@ -2450,6 +2450,8 @@ static IDWriteTextFormat* g_tf_header = NULL;  // 15 semibold, status line
 static IDWriteTextFormat* g_tf_key = NULL;     // 18 semibold, keyboard keys
 static IDWriteTextFormat* g_tf_title = NULL;   // 24 semibold, page title
 static IDWriteTextFormat* g_tf_fly = NULL;     // 14 medium, flyout
+static IDWriteTextFormat* g_tf_ico = NULL;     // 17, the icon font
+static IDWriteTextFormat* g_tf_ico_lg = NULL;  // 21, same, for flyouts
 
 static ID2D1RenderTarget*     g_rt_main = NULL;  // Mica DC, or the Hwnd RT
 static ID2D1HwndRenderTarget* g_rt_main_hwnd = NULL;
@@ -2512,6 +2514,36 @@ static void d2d_init_process() {
     g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
         DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_tf_fly);
+    // Windows ships the icons this app needs, so it draws them as text
+    // rather than as hand-built geometry: they are properly designed, they
+    // match the rest of the system, and they stay sharp at any size.
+    // "Segoe Fluent Icons" is Windows 11's set; Windows 10 has the older
+    // "Segoe MDL2 Assets", which carries the same code points for
+    // everything used here.
+    const wchar_t* icon_face = L"Segoe Fluent Icons";
+    {
+        IDWriteFontCollection* fc = NULL;
+        UINT32 idx = 0;
+        BOOL found = FALSE;
+        if (SUCCEEDED(g_dwrite_factory->GetSystemFontCollection(&fc)) && fc) {
+            fc->FindFamilyName(icon_face, &idx, &found);
+            fc->Release();
+        }
+        if (!found) icon_face = L"Segoe MDL2 Assets";
+    }
+    g_dwrite_factory->CreateTextFormat(icon_face, NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"en-us", &g_tf_ico);
+    g_dwrite_factory->CreateTextFormat(icon_face, NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-us", &g_tf_ico_lg);
+    for (int i = 0; i < 2; i++) {
+        IDWriteTextFormat* f = i ? g_tf_ico_lg : g_tf_ico;
+        if (!f) continue;
+        f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
     // Long descriptions truncate cleanly rather than running under the control
     // on the right of the card.
     IDWriteTextFormat* trim[] = {g_tf_body, g_tf_label};
@@ -4011,62 +4043,27 @@ static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
 
 #define FLY_TIMER 3
 
-// sharp at any DPI, and nothing depends on a particular font being present.
-static void fill_tri(ID2D1RenderTarget* rt, D2D1_POINT_2F a, D2D1_POINT_2F b,
-                     D2D1_POINT_2F c, ID2D1Brush* br) {
-    if (!g_d2d_factory) return;
-    ID2D1PathGeometry* g = NULL;
-    if (FAILED(g_d2d_factory->CreatePathGeometry(&g)) || !g) return;
-    ID2D1GeometrySink* sink = NULL;
-    if (SUCCEEDED(g->Open(&sink)) && sink) {
-        sink->BeginFigure(a, D2D1_FIGURE_BEGIN_FILLED);
-        D2D1_POINT_2F pts[2] = {b, c};
-        sink->AddLines(pts, 2);
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        sink->Release();
-        rt->FillGeometry(g, br);
-    }
-    g->Release();
-}
 
 static float fly_item_cx(int i) {
     return FLY_PAD + FLY_ITEMW * (i + 0.5f);
 }
 
-// The media icons. Small enough that drawing them here beats threading five
-// more cases through the settings page's icon set.
+// The media icons, from the same system font the rest of the app uses. The
+// middle one shows what pressing it will do rather than what is happening:
+// pause while it plays, play while it is paused.
 static void draw_media_glyph(ID2D1RenderTarget* rt, float cx, float cy,
-                             int item, ID2D1Brush* br) {
-    if (item == MED_PLAY) {
-        // Play and pause together, the way a transport button shows both.
-        rt->FillRectangle(D2D1::RectF(cx - 8, cy - 7, cx - 5, cy + 7), br);
-        fill_tri(rt, D2D1::Point2F(cx - 1, cy - 7), D2D1::Point2F(cx - 1, cy + 7),
-                 D2D1::Point2F(cx + 8, cy), br);
-        return;
+                             int item, bool playing, ID2D1Brush* br) {
+    if (!g_tf_ico_lg) return;
+    const wchar_t* g;
+    switch (item) {
+    case 0:        g = L"\uE892"; break;              // previous track
+    case 1:        g = L"\uE993"; break;              // volume, quieter
+    case MED_PLAY: g = playing ? L"\uE769" : L"\uE768"; break;
+    case 3:        g = L"\uE995"; break;              // volume, louder
+    default:       g = L"\uE893"; break;              // next track
     }
-    if (item == 0 || item == NMEDIA - 1) {
-        // Track skip: the double arrow with the bar it stops against, which
-        // is what tells it apart from seeking.
-        float d = (item == 0) ? -1.0f : 1.0f;
-        fill_tri(rt, D2D1::Point2F(cx + d * 2, cy - 7),
-                 D2D1::Point2F(cx + d * 2, cy + 7),
-                 D2D1::Point2F(cx - d * 5, cy), br);
-        fill_tri(rt, D2D1::Point2F(cx + d * 9, cy - 7),
-                 D2D1::Point2F(cx + d * 9, cy + 7),
-                 D2D1::Point2F(cx + d * 2, cy), br);
-        rt->FillRectangle(D2D1::RectF(cx - d * 9.5f, cy - 7,
-                                      cx - d * 7.0f, cy + 7), br);
-        return;
-    }
-    // Volume: a speaker, with the sign for which way it goes.
-    float d = (item == 1) ? -1.0f : 1.0f;
-    rt->FillRectangle(D2D1::RectF(cx - 11, cy - 3, cx - 7, cy + 3), br);
-    fill_tri(rt, D2D1::Point2F(cx - 7, cy - 7), D2D1::Point2F(cx - 7, cy + 7),
-             D2D1::Point2F(cx - 2, cy), br);
-    rt->FillRectangle(D2D1::RectF(cx + 2, cy - 1, cx + 11, cy + 1), br);
-    if (d > 0) rt->FillRectangle(D2D1::RectF(cx + 5.5f, cy - 4.5f,
-                                             cx + 7.5f, cy + 4.5f), br);
+    rt->DrawText(g, (UINT32)wcslen(g), g_tf_ico_lg,
+                 D2D1::RectF(cx - 20, cy - 16, cx + 20, cy + 16), br);
 }
 
 static float ease_out(ULONGLONG t0, int ms) {
@@ -4111,18 +4108,19 @@ static void rad_render() {
                              g_br_rad_border, 1.0f);
 
     if (g_rad_mode) {
-        for (int i = 0; i < NMEDIA; i++)
-            draw_media_glyph(rt, fly_item_cx(i), 27.0f, i,
-                             (i == g_rad_sel && g_rad_row == 0)
-                                 ? (ID2D1Brush*)g_br_rad_text
-                                 : g_br_rad_dim);
-
-        // The seek bar, and the time at the end of it. Position comes from
-        // the system's own media session - the arrow keys we send to seek
-        // have no idea where the track is.
+        // The seek bar, and the time under it. Position comes from the
+        // system's own media session - the arrow keys we send to seek have
+        // no idea where the track is - and so does whether it is playing,
+        // which is what the middle button shows.
         double pos = 0, dur = 0;
         bool playing = false;
         bool have = med_now(pos, dur, playing);
+
+        for (int i = 0; i < NMEDIA; i++)
+            draw_media_glyph(rt, fly_item_cx(i), 27.0f, i, playing,
+                             (i == g_rad_sel && g_rad_row == 0)
+                                 ? (ID2D1Brush*)g_br_rad_text
+                                 : g_br_rad_dim);
         D2D1_RECT_F tr = seek_track();
         float mid = (tr.top + tr.bottom) / 2;
         rt->FillRoundedRectangle(
@@ -4618,7 +4616,8 @@ static RECT sec3_header() {
 // button. Works with whatever is plugged in, however many buttons it has.
 enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
        IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD,
-       IC_KEYS };
+       IC_KEYS, IC_CURSOR, IC_UPDOWN, IC_TUNE, IC_GEAR, IC_PAD, IC_SEARCH,
+       IC_BOLT };
 
 static int g_page = 0;          // 0 settings, 1 button layout, 2 apps
 static volatile int g_bind_btn = -1;   // button last pressed, -1 none yet
@@ -4834,120 +4833,39 @@ static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 
 // --- Feature icons ----------------------------------------------------------
 // Drawn rather than shipped as bitmaps or taken from an icon font: they stay
 
+// One glyph per thing the app can do, from the system icon font. Kept as a
+// table so the settings list, the button page and the flyout all name the
+// same picture for the same action.
+static const wchar_t* kIconGlyph[] = {
+    L"\uE962",   // IC_LCLICK    mouse
+    L"\uE962",   // IC_RCLICK    mouse
+    L"\uE765",   // IC_KEYBOARD  keyboard
+    L"\uE768",   // IC_PLAY      play
+    L"\uE740",   // IC_FULLSCREEN
+    L"\uECAA",   // IC_LAUNCHER  app grid
+    L"\uE7E8",   // IC_POWER
+    L"\uE995",   // IC_VOLUME    speaker
+    L"\uEB9D",   // IC_SCRUB     fast forward
+    L"\uE72B",   // IC_BACK
+    L"\uE72A",   // IC_FORWARD
+    L"\uE92E",   // IC_KEYS      keyboard, for a shortcut
+    L"\uE8B0",   // IC_CURSOR    pointer speed
+    L"\uE8CB",   // IC_UPDOWN    scroll speed
+    L"\uE9E9",   // IC_TUNE      dead zone
+    L"\uE713",   // IC_GEAR      fine control
+    L"\uE7FC",   // IC_PAD       the controller itself
+    L"\uE721",   // IC_SEARCH
+    L"\uE945",   // IC_BOLT      start with Windows
+};
+
 static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
-                              int kind, ID2D1Brush* on, ID2D1Brush* off) {
-    switch (kind) {
-    case IC_LCLICK:
-    case IC_RCLICK: {
-        // Mouse body with the pressed button filled.
-        D2D1_RECT_F body = D2D1::RectF(cx - 7, cy - 10, cx + 7, cy + 10);
-        rt->DrawRoundedRectangle(D2D1::RoundedRect(body, 7, 7), off, 1.3f);
-        float split = cy - 2;
-        D2D1_RECT_F half = (kind == IC_LCLICK)
-            ? D2D1::RectF(cx - 6, cy - 9, cx - 0.5f, split)
-            : D2D1::RectF(cx + 0.5f, cy - 9, cx + 6, split);
-        rt->FillRectangle(half, on);
-        rt->DrawLine(D2D1::Point2F(cx - 7, split), D2D1::Point2F(cx + 7, split),
-                     off, 1.2f);
-        break;
-    }
-    case IC_KEYBOARD: {
-        D2D1_RECT_F b = D2D1::RectF(cx - 11, cy - 7, cx + 11, cy + 7);
-        rt->DrawRoundedRectangle(D2D1::RoundedRect(b, 3, 3), off, 1.3f);
-        for (int r = 0; r < 2; r++)
-            for (int c = 0; c < 4; c++)
-                rt->FillRectangle(
-                    D2D1::RectF(cx - 8 + c * 5, cy - 4 + r * 5,
-                                cx - 5.5f + c * 5, cy - 1.5f + r * 5), on);
-        break;
-    }
-    case IC_PLAY: {
-        fill_tri(rt, D2D1::Point2F(cx - 9, cy - 7), D2D1::Point2F(cx - 9, cy + 7),
-                 D2D1::Point2F(cx - 1, cy), on);
-        rt->FillRectangle(D2D1::RectF(cx + 3, cy - 7, cx + 5, cy + 7), on);
-        rt->FillRectangle(D2D1::RectF(cx + 7, cy - 7, cx + 9, cy + 7), on);
-        break;
-    }
-    case IC_FULLSCREEN: {
-        // Four corner brackets.
-        const float o = 9, t = 1.6f, l = 5;
-        D2D1_RECT_F r[8] = {
-            {cx - o, cy - o, cx - o + l, cy - o + t},
-            {cx - o, cy - o, cx - o + t, cy - o + l},
-            {cx + o - l, cy - o, cx + o, cy - o + t},
-            {cx + o - t, cy - o, cx + o, cy - o + l},
-            {cx - o, cy + o - t, cx - o + l, cy + o},
-            {cx - o, cy + o - l, cx - o + t, cy + o},
-            {cx + o - l, cy + o - t, cx + o, cy + o},
-            {cx + o - t, cy + o - l, cx + o, cy + o}};
-        for (int i = 0; i < 8; i++) rt->FillRectangle(r[i], on);
-        break;
-    }
-    case IC_LAUNCHER: {
-        for (int i = 0; i < 4; i++) {
-            float x = cx - 9 + (i % 2) * 10, y = cy - 9 + (i / 2) * 10;
-            rt->FillRoundedRectangle(
-                D2D1::RoundedRect(D2D1::RectF(x, y, x + 8, y + 8), 2, 2), on);
-        }
-        break;
-    }
-    case IC_POWER: {
-        rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 1), 8, 8), off, 1.4f);
-        rt->FillRectangle(D2D1::RectF(cx - 1, cy - 10, cx + 1, cy - 1), on);
-        break;
-    }
-    case IC_VOLUME: {
-        rt->FillRectangle(D2D1::RectF(cx - 10, cy - 3, cx - 5, cy + 3), on);
-        fill_tri(rt, D2D1::Point2F(cx - 5, cy - 8), D2D1::Point2F(cx - 5, cy + 8),
-                 D2D1::Point2F(cx + 1, cy), on);
-        rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx + 1, cy), 6, 6), off, 1.3f);
-        break;
-    }
-    case IC_SCRUB: {
-        fill_tri(rt, D2D1::Point2F(cx - 2, cy - 7), D2D1::Point2F(cx - 2, cy + 7),
-                 D2D1::Point2F(cx - 10, cy), on);
-        fill_tri(rt, D2D1::Point2F(cx + 2, cy - 7), D2D1::Point2F(cx + 2, cy + 7),
-                 D2D1::Point2F(cx + 10, cy), on);
-        break;
-    }
-    case IC_BACK:
-    case IC_KEYS: {
-        // A keycap with a smaller one behind it, for a key combination.
-        rt->DrawRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(cx - 9, cy - 8, cx + 3, cy + 4),
-                              2.5f, 2.5f), off, 1.3f);
-        rt->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(cx - 3, cy - 3, cx + 9, cy + 9),
-                              2.5f, 2.5f), on);
-        break;
-    }
-    case IC_FORWARD: {
-        // An arrow: head plus a short shaft, mirrored for forward.
-        float d = (kind == IC_BACK) ? -1.0f : 1.0f;
-        fill_tri(rt, D2D1::Point2F(cx + d * 9, cy), D2D1::Point2F(cx + d * 1, cy - 7),
-                 D2D1::Point2F(cx + d * 1, cy + 7), on);
-        rt->FillRectangle(D2D1::RectF(cx - (d > 0 ? 9 : 1) * 1.0f, cy - 1.6f,
-                                      cx + (d > 0 ? 1 : 9) * 1.0f, cy + 1.6f), on);
-        break;
-    }
-    }
-}
-
-// --- Control legend icons ---------------------------------------------------
-// Drawn rather than shipped as bitmaps: they stay sharp at any DPI, and a
-// filled position on an otherwise plain diamond/cross reads the same whether
-// the pad calls that button Cross, A or B.
-
-// Four buttons in a diamond; `which` is 0=top,1=right,2=bottom,3=left.
-static void draw_face_icon(ID2D1RenderTarget* rt, float cx, float cy, int which,
-                           ID2D1Brush* on, ID2D1Brush* off) {
-    const float d = 7.0f, r = 3.4f;
-    D2D1_POINT_2F p[4] = {{cx, cy - d}, {cx + d, cy}, {cx, cy + d}, {cx - d, cy}};
-    for (int i = 0; i < 4; i++) {
-        D2D1_ELLIPSE e = D2D1::Ellipse(p[i], r, r);
-        if (i == which) rt->FillEllipse(e, on);
-        else            rt->DrawEllipse(e, off, 1.2f);
-    }
+                              int kind, ID2D1Brush* br) {
+    if (!g_tf_ico || kind < 0 ||
+        kind >= (int)(sizeof(kIconGlyph) / sizeof(kIconGlyph[0])))
+        return;
+    const wchar_t* g = kIconGlyph[kind];
+    rt->DrawText(g, (UINT32)wcslen(g), g_tf_ico,
+                 D2D1::RectF(cx - 16, cy - 14, cx + 16, cy + 14), br);
 }
 
 // Mouse messages arrive in physical pixels; the layout is in DIPs.
@@ -5492,9 +5410,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       (float)((rr.top + rr.bottom) / 2),
                                       kFeatIcon[f],
                                       on ? (ID2D1Brush*)g_br_main_onacc
-                                         : g_br_main_sel,
-                                      on ? (ID2D1Brush*)g_br_main_onacc
-                                         : g_br_main_dim);
+                                         : g_br_main_sel);
                     if (!g_tf_label) continue;
                     ID2D1Brush* tb = on ? (ID2D1Brush*)g_br_main_onacc
                                         : (btn >= 0 ? (ID2D1Brush*)g_br_main_text
@@ -5535,7 +5451,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int slot = sc_slot_for(c, btn);
                 draw_feature_icon(g_rt_main, (float)(content_x() + 22),
                                   (float)BIND_SC_Y + CARD_H / 2, IC_KEYS,
-                                  g_br_main_sel, g_br_main_dim);
+                                  g_br_main_sel);
                 if (g_tf_label) {
                     wchar_t kn[64];
                     if (g_sc_capture)   wcscpy(kn, L"Press the keys...");
@@ -5635,8 +5551,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  g_br_main_border);
                     draw_feature_icon(g_rt_main, (float)(rr.left + 22),
                                       (float)((rr.top + rr.bottom) / 2),
-                                      IC_LAUNCHER, g_br_main_sel,
-                                      g_br_main_dim);
+                                      IC_PAD, g_br_main_sel);
                     if (g_tf_label) {
                         RECT nr = {rr.left + CARD_ICON, rr.top + 11,
                                    rr.right - 300, rr.top + 29};
@@ -5744,26 +5659,26 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              g_br_main_card, g_br_main_border);
                 {
                     // A small glyph on the left of each card, as WinUI does.
-                    const int slideIcon[NTRACKS] = {IC_LCLICK, IC_SCRUB, IC_POWER,
-                                                    IC_FORWARD};
+                    const int slideIcon[NTRACKS] = {IC_CURSOR, IC_UPDOWN,
+                                                    IC_TUNE, IC_GEAR};
                     for (int i = 0; i < NTRACKS; i++) {
                         RECT c = slide_card(i);
                         draw_feature_icon(g_rt_main, (float)(c.left + 24),
                                           (float)((c.top + c.bottom) / 2),
-                                          slideIcon[i], g_br_main_dim, g_br_main_dim);
+                                          slideIcon[i], g_br_main_dim);
                     }
                     const int togIcon[NTOGGLES] = {IC_POWER, IC_FULLSCREEN,
-                                                   IC_LAUNCHER};
+                                                   IC_BOLT};
                     for (int i = 0; i < NTOGGLES; i++) {
                         RECT c = toggle_card(i);
                         draw_feature_icon(g_rt_main, (float)(c.left + 24),
                                           (float)((c.top + c.bottom) / 2),
-                                          togIcon[i], g_br_main_dim, g_br_main_dim);
+                                          togIcon[i], g_br_main_dim);
                     }
                     RECT sc = search_card();
                     draw_feature_icon(g_rt_main, (float)(sc.left + 24),
                                       (float)((sc.top + sc.bottom) / 2),
-                                      IC_KEYBOARD, g_br_main_dim, g_br_main_dim);
+                                      IC_SEARCH, g_br_main_dim);
                 }
 
                 // Section labels (were native STATIC controls; now DirectWrite so
@@ -5822,8 +5737,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 {
                     int y = MAP_Y;
                     draw_feature_icon(g_rt_main, (float)(content_x() + 22),
-                                      (float)y + CARD_H / 2, IC_LAUNCHER,
-                                      g_br_main_sel, g_br_main_dim);
+                                      (float)y + CARD_H / 2, IC_PAD,
+                                      g_br_main_sel);
                     if (g_tf_label) {
                         RECT nr = {content_x() + CARD_ICON, y + 11,
                                    content_x() + content_w() - CARD_CTRL - 12,
@@ -5850,8 +5765,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 {
                     int y = APPS_Y;
                     draw_feature_icon(g_rt_main, (float)(content_x() + 22),
-                                      (float)y + CARD_H / 2, IC_FULLSCREEN,
-                                      g_br_main_sel, g_br_main_dim);
+                                      (float)y + CARD_H / 2, IC_LAUNCHER,
+                                      g_br_main_sel);
                     if (g_tf_label) {
                         RECT nr = {content_x() + CARD_ICON, y + 11,
                                    content_x() + content_w() - CARD_CTRL - 12,
