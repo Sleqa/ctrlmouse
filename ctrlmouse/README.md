@@ -18,8 +18,9 @@ and seek.
 A button can also send a keyboard shortcut instead of, or as well as, an
 action - a single key like `F`, or a combination like `Ctrl+Shift+Tab`.
 
-The mapping pauses while that page is open, so pressing a button to bind it
-cannot also fire whatever is already on it.
+Buttons do nothing while that page is open, so pressing one to bind it cannot
+also fire whatever is already on it. The sticks keep working, since they are
+not what is being bound.
 
 ### Per-app rules
 
@@ -43,7 +44,9 @@ Each app can:
 | Cross / A | Left click (hold to drag) |
 | Circle / B | Right click |
 | Square / X | Play / pause — **hold** for the fullscreen flyout |
-| Create *(hold)* | Media flyout: seek, volume, play / pause |
+| Create | Open / close the media flyout |
+| Left stick or D-pad *(media flyout)* | Move between seek, volume and play / pause |
+| Cross *(media flyout)* | Use the highlighted control; hold to repeat volume and seek |
 | R1 / L1 | Forward / back, as the mouse side buttons |
 | D-pad up / down | Volume up / down (hold to keep changing, speeds up) |
 | D-pad left / right | Seek back / forward — hold to fast-forward or rewind |

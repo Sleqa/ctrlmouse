@@ -510,7 +510,7 @@ enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
        GP_TOGGLE,
        GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
        GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
-       GP_PRESSED, GP_MED_REPEAT };
+       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE };
 
 static volatile bool g_kb_visible = false;
 static volatile bool g_lx_visible = false;   // app launcher popup
@@ -1598,6 +1598,10 @@ static DWORD WINAPI worker_thread(LPVOID) {
             int b = bit(f);
             return b >= 0 && ((mask >> b) & 1) && !((prev_mask >> b) & 1);
         };
+        auto btn_went_down = [&](int b) {
+            return b >= 0 && b < 32 && ((mask >> b) & 1) &&
+                   !((prev_mask >> b) & 1);
+        };
         auto went_up = [&](int f) {
             int b = bit(f);
             return b >= 0 && !((mask >> b) & 1) && ((prev_mask >> b) & 1);
@@ -1611,21 +1615,6 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // up and fired play/pause on top of a fullscreen hold.
         for (int f = 0; f < F_COUNT; f++)
             if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
-
-        if (g_listen) {
-            // Report the first button of any fresh press and do nothing else,
-            // so the press being bound doesn't also fire what is on it.
-            unsigned fresh = mask & ~prev_mask;
-            if (fresh) {
-                int idx = 0;
-                while (!(fresh & (1u << idx))) idx++;
-                PostMessageW(g_hwnd, WM_GAMEPAD, GP_PRESSED, idx);
-            }
-            edge_click_release_all(a_down, b_down);
-            btn_mask_prev = mask;
-            Sleep(8);
-            continue;
-        }
 
         // Works even while the mapping is off, so it can turn it back on.
         // Debounced: toggling rebuilds the device stack and a touchpad click
@@ -1692,12 +1681,13 @@ static DWORD WINAPI worker_thread(LPVOID) {
         }
         game_prev = g_game_active;
 
-        bool mapping_on = cfg.enabled &&
-                          !(cfg.game_pause && g_game_active && !g_override);
-
-        if (mapping_on) {
-            // Stick to cursor movement. Three things matter here for fine
-            // control, and they have to work together:
+        // Stick to cursor and wheel. Pulled out of the main path because
+        // the button-layout page wants this and nothing else: the sticks
+        // aren't what is being bound, so there is no reason to strand the
+        // cursor while someone presses buttons at it.
+        auto run_pointer = [&]() {
+            // Three things matter here for fine control, and they have to
+            // work together:
             //
             //  * Radial deadzone and magnitude. Treating the axes separately
             //    lets a diagonal reach a magnitude of 1.41, so diagonals ran
@@ -1752,6 +1742,37 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 scroll_vel = 0.0;
                 scroll_accum = 0.0;
             }
+        };
+
+        bool mapping_on = cfg.enabled &&
+                          !(cfg.game_pause && g_game_active && !g_override);
+
+        if ((!mapping_on || g_listen) && med_up) {
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_HIDE, 0);
+            med_up = false;
+        }
+
+        if (g_listen) {
+            // The button-layout page is open. Report the first button of any
+            // fresh press and act on none of them, so the press being bound
+            // doesn't also fire whatever is already on it - but keep driving
+            // the cursor, since the page still has to be usable.
+            unsigned fresh = mask & ~prev_mask;
+            if (fresh) {
+                int idx = 0;
+                while (!(fresh & (1u << idx))) idx++;
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_PRESSED, idx);
+            }
+            if (cfg.enabled) run_pointer();
+            edge_click_release_all(a_down, b_down);
+            btn_mask_prev = mask;
+            Sleep(8);
+            continue;
+        }
+
+
+        if (mapping_on) {
+            run_pointer();
 
             if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
                 bnow - hold_t0[F_KEYBOARD] >= 500) {
@@ -1830,15 +1851,17 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     dpad_last = bnow;
                 }
             } else {
-                a = is_down(F_LCLICK);
-                b = is_down(F_RCLICK);
+                // The media flyout borrows Cross and the D-pad while it
+                // is up, so neither does its usual job.
+                a = is_down(F_LCLICK) && !med_up;
+                b = is_down(F_RCLICK) && !med_up;
                 dpad_prev = -1;
 
                 // Fullscreen is a hold: the flyout appears, the left stick
                 // slides the underline along it, and letting go sends the
                 // shortcut under it.
                 if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
-                    bnow - hold_t0[F_FULLSCREEN] >= 300) {
+                    !med_up && bnow - hold_t0[F_FULLSCREEN] >= 300) {
                     PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
                     hold_fired[F_FULLSCREEN] = true;
                     radial_up = true;
@@ -1846,55 +1869,66 @@ static DWORD WINAPI worker_thread(LPVOID) {
                     rad_deflect = -1;
                 }
 
-                // Media works the same way, with one difference: holding the
-                // stick on volume or seek repeats it, since one step of
-                // volume is rarely what anyone wanted. Play/pause never
-                // repeats, and a quick flick-and-release still sends a single
-                // step of whatever it landed on.
-                if (is_down(F_MEDIAFLY) && !hold_fired[F_MEDIAFLY] &&
-                    bnow - hold_t0[F_MEDIAFLY] >= 300) {
-                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 1);
-                    hold_fired[F_MEDIAFLY] = true;
-                    med_up = true;
-                    med_idx = MED_PLAY;
-                    med_deflect = -1;
-                    med_hold_t0 = bnow;
-                    med_last = 0;
-                    med_reps = 0;
+                // Media is a toggle rather than a hold: it stays up until
+                // the same button puts it away again, so the stick is free
+                // and both hands are. Cross is what fires the highlighted
+                // control - holding it repeats volume and seek, accelerating
+                // the way the D-pad already does, since one step of volume is
+                // rarely what anyone wanted. Play/pause never repeats.
+                if (went_down(F_MEDIAFLY) && !radial_up) {
+                    if (med_up) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_HIDE, 0);
+                        med_up = false;
+                    } else {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 1);
+                        med_up = true;
+                        med_idx = MED_PLAY;
+                        med_deflect = -1;
+                        med_hold_t0 = 0;
+                        med_last = 0;
+                        med_reps = 0;
+                    }
                 }
-                if (med_up && is_down(F_MEDIAFLY)) {
+                if (med_up) {
+                    // Either stick or D-pad steps the highlight; the stick is
+                    // read as a step rather than a position for the same
+                    // reason the fullscreen one is.
                     double sx = st.lx / 1000.0;
                     int dir = (sx < -0.33) ? 0 : (sx > 0.33) ? 2 : -1;
+                    int step = 0;
                     if (dir != med_deflect) {
-                        if (dir == 0 && med_idx > 0) med_idx--;
-                        if (dir == 2 && med_idx < NMEDIA - 1) med_idx++;
-                        if (dir != -1) {
-                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, med_idx);
-                            med_hold_t0 = bnow;   // settling counts as arriving
-                            med_last = 0;
-                            med_reps = 0;
-                        }
+                        if (dir == 0) step = -1;
+                        if (dir == 2) step = 1;
                         med_deflect = dir;
                     }
-                    // Repeat once it has sat on a repeatable item a moment,
-                    // speeding up the longer it stays, as the D-pad does.
-                    if (media_repeats(med_idx) && bnow - med_hold_t0 >= 350) {
+                    if (btn_went_down(BTN_DPAD_LEFT))  step = -1;
+                    if (btn_went_down(BTN_DPAD_RIGHT)) step = 1;
+                    if (step) {
+                        int want = med_idx + step;
+                        if (want >= 0 && want < NMEDIA && want != med_idx) {
+                            med_idx = want;
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, med_idx);
+                        }
+                    }
+
+                    // Cross fires it, and keeps firing what is worth
+                    // repeating.
+                    if (went_down(F_LCLICK)) {
+                        med_hold_t0 = bnow;
+                        med_last = bnow;
+                        med_reps = 0;
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT, med_idx);
+                    } else if (is_down(F_LCLICK) && media_repeats(med_idx) &&
+                               med_hold_t0 && bnow - med_hold_t0 >= 350) {
                         int gap = 140 - med_reps * 8;
                         if (gap < 40) gap = 40;
-                        if (!med_last || bnow - med_last >= (ULONGLONG)gap) {
+                        if (bnow - med_last >= (ULONGLONG)gap) {
                             PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
                                          med_idx);
                             med_last = bnow;
                             med_reps++;
                         }
                     }
-                }
-                if (med_up && went_up(F_MEDIAFLY)) {
-                    // Already repeating means it has fired plenty; only a
-                    // release before that should send a single step.
-                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK,
-                                 med_reps ? 1 : 0);
-                    med_up = false;
                 }
                 if (radial_up && is_down(F_FULLSCREEN)) {
                     // Read as a step, not a live position: the stick springs
@@ -1947,7 +1981,7 @@ static DWORD WINAPI worker_thread(LPVOID) {
                 // subtraction went negative and stalled the repeat.
                 static const WORD kMediaVk[4] = {
                     VK_VOLUME_UP, VK_VOLUME_DOWN, VK_RIGHT, VK_LEFT};
-                for (int m = 0; m < 4; m++) {
+                for (int m = 0; m < 4 && !med_up; m++) {
                     int f = F_VOLUP + m;
                     if (went_down(f)) {
                         media_t0[m] = media_last[m] = bnow;
@@ -5793,6 +5827,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             save_config(fc);
             break;
         }
+        case GP_RAD_HIDE:
+            rad_show(false);
+            break;
         case GP_MED_REPEAT:
             if ((int)lp >= 0 && (int)lp < NMEDIA) tap_key(kMediaFlyVk[(int)lp]);
             break;
