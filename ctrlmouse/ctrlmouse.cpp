@@ -1388,8 +1388,31 @@ static void hid_free_preparsed() {
 }
 
 // One axis, normalised to the -1000..1000 the rest of the app works in.
+// The range a field really spans.
+//
+// A report descriptor writes Logical Maximum as the smallest number of bytes
+// that will hold it, and the HID parser sign-extends what it finds. So a pad
+// declaring a maximum of 255 in one byte reports it back as -1, and 32767 in
+// two bytes as -1 likewise: the range reads as empty or inverted. Every axis
+// then scaled to exactly zero and never moved, which is what a dead stick
+// looks like. Where the declared range is unusable, the field's own width is
+// what it actually spans.
+static bool hid_range(const HidVal& a, LONG& lmin, LONG& lmax) {
+    lmin = a.lmin;
+    lmax = a.lmax;
+    if (lmax > lmin) return true;
+    if (a.bits > 0 && a.bits < 32) {
+        lmin = 0;
+        lmax = (LONG)((1ul << a.bits) - 1);
+        return true;
+    }
+    return false;
+}
+
 static int hid_read_axis(const HidVal& a, const BYTE* buf, DWORD len) {
     if (!a.present || !g_hid_pp) return 0;
+    LONG lmin, lmax;
+    if (!hid_range(a, lmin, lmax)) return 0;
     ULONG raw = 0;
     if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, a.usage, &raw,
                            g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
@@ -1397,12 +1420,12 @@ static int hid_read_axis(const HidVal& a, const BYTE* buf, DWORD len) {
     // A descriptor with a negative logical minimum is reporting a signed
     // value, which arrives here as the raw bits and has to be extended.
     LONG v = (LONG)raw;
-    if (a.lmin < 0 && a.bits > 0 && a.bits < 32 &&
+    if (lmin < 0 && a.bits > 0 && a.bits < 32 &&
         (raw & (1ul << (a.bits - 1))))
         v = (LONG)(raw | (~0ul << a.bits));
-    double span = (double)a.lmax - (double)a.lmin;
+    double span = (double)lmax - (double)lmin;
     if (span <= 0.0) return 0;
-    double n = ((double)v - (double)a.lmin) / span;      // 0..1
+    double n = ((double)v - (double)lmin) / span;      // 0..1
     int out = (int)((n * 2.0 - 1.0) * 1000.0);
     if (out >  1000) out =  1000;
     if (out < -1000) out = -1000;
@@ -1417,8 +1440,10 @@ static int hid_read_hat(const BYTE* buf, DWORD len) {
     if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, HID_USAGE_HAT, &raw,
                            g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
         return -1;
-    LONG v = (LONG)raw - g_hv_hat.lmin;
-    LONG n = g_hv_hat.lmax - g_hv_hat.lmin + 1;
+    LONG lmin, lmax;
+    if (!hid_range(g_hv_hat, lmin, lmax)) return -1;
+    LONG v = (LONG)raw - lmin;
+    LONG n = lmax - lmin + 1;
     if (v < 0 || v >= n) return -1;
     if (n <= 4) return (int)v;
     return (int)(((v + 1) / 2) % 4);      // 8-way, diagonals fold to a cardinal
@@ -5340,9 +5365,13 @@ static void pad_axis_summary(wchar_t* out, size_t n) {
     const wchar_t* role[6] = {L"lx", L"ly", L"trig", L"rx", L"ry", L"trig2"};
     for (int i = 0; i < 6; i++) {
         if (!v[i]->present) continue;
+        // The range actually used, which is what matters when a descriptor
+        // declares one that cannot be taken at face value.
+        LONG lo = 0, hi = 0;
+        hid_range(*v[i], lo, hi);
         wchar_t one[64];
         swprintf(one, 64, L"%s=%s(%ld..%ld) ", role[i], nm[v[i]->usage - 0x30],
-                 (long)v[i]->lmin, (long)v[i]->lmax);
+                 (long)lo, (long)hi);
         if (wcslen(buf) + wcslen(one) < 250) wcscat(buf, one);
     }
     swprintf(out, n, L"HID: %s%s", buf,
