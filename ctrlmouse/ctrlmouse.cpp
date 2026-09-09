@@ -1209,6 +1209,54 @@ static bool path_is_dualsense(const wchar_t* path) {
     return ok;
 }
 
+// Every HID collection a given device exposes, by instance ID, which is what
+// HidHide blacklists by. Hiding only the collection we read from would leave
+// the rest of them visible to whatever else is listening - which for a pad
+// with separate gamepad, motion and audio collections is most of it.
+//
+// Split out from hid_scan because that only ever looks for a DualSense: a pad
+// reached through DirectInput has to be found by the ids DirectInput reports
+// for it, or it never gets hidden at all.
+static void hid_collect_instances(USHORT vid, USHORT pid) {
+    g_pad_inst_count = 0;
+    if (!vid && !pid) return;
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return;
+    SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd) &&
+         g_pad_inst_count < MAX_INST; i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        SP_DEVINFO_DATA dev = {sizeof(dev)};
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, &dev)) {
+            HANDLE q = CreateFileW(det->DevicePath, 0,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+            if (q != INVALID_HANDLE_VALUE) {
+                HIDD_ATTRIBUTES a = {sizeof(a)};
+                bool match = HidD_GetAttributes(q, &a) && a.VendorID == vid &&
+                             a.ProductID == pid;
+                CloseHandle(q);
+                wchar_t inst[512];
+                if (match &&
+                    SetupDiGetDeviceInstanceIdW(set, &dev, inst, 512, NULL))
+                    g_pad_inst[g_pad_inst_count++] = inst;
+            }
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+}
+
 static bool hid_scan(bool exclusive) {
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
@@ -1424,6 +1472,8 @@ static void drop_device() {
         g_dev->Unacquire();
         g_dev->Release();
         g_dev = NULL;
+        // The collections listed belong to the device that just went away.
+        g_pad_inst_count = 0;
     }
 }
 
@@ -1455,6 +1505,20 @@ static bool try_open(const GUID& guid) {
     bool xin = ax.rx && ax.ry && !ax.rz;
     g_pad_rstick_rxry = xin;
     g_pad_layout = xin ? PADL_XINPUT : (ax.rz ? PADL_PS : PADL_GENERIC);
+
+    // Which HID device this actually is, so HidHide has something to hide.
+    // Without this only a DualSense was ever hideable, and every other pad
+    // reported "no controller was found to hide" while plainly connected.
+    DIPROPDWORD vp = {};
+    vp.diph.dwSize = sizeof(vp);
+    vp.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+    vp.diph.dwHow = DIPH_DEVICE;
+    vp.diph.dwObj = 0;
+    if (SUCCEEDED(g_dev->GetProperty(DIPROP_VIDPID, &vp.diph)))
+        hid_collect_instances(LOWORD(vp.dwData), HIWORD(vp.dwData));
+    else
+        g_pad_inst_count = 0;
+
     g_dev->Acquire();   // may fail transiently; the poll loop retries
     g_open_guid = guid;
     g_hid_gen++;
