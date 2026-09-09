@@ -1382,6 +1382,7 @@ struct HidVal {
 static PHIDP_PREPARSED_DATA g_hid_pp = NULL; // kept for the life of the handle
 static HidVal g_hv_lx, g_hv_ly, g_hv_rx, g_hv_ry, g_hv_lt, g_hv_rt, g_hv_hat;
 static bool   g_hv_trig_shared = false;   // one axis carries both triggers
+static USHORT g_hv_btn_max = 0;           // highest button the pad declares
 
 static void hid_free_preparsed() {
     if (g_hid_pp) { HidD_FreePreparsedData(g_hid_pp); g_hid_pp = NULL; }
@@ -1490,6 +1491,7 @@ static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
     g_hv_lx = g_hv_ly = g_hv_rx = g_hv_ry = HidVal{};
     g_hv_lt = g_hv_rt = g_hv_hat = HidVal{};
     g_hv_trig_shared = false;
+    g_hv_btn_max = 0;
     if (!caps.NumberInputValueCaps) return false;
 
     USHORT n = caps.NumberInputValueCaps;
@@ -1518,6 +1520,24 @@ static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
         }
     }
     free(vc);
+
+    g_hv_btn_max = 0;
+    if (caps.NumberInputButtonCaps) {
+        USHORT bn = caps.NumberInputButtonCaps;
+        HIDP_BUTTON_CAPS* bc =
+            (HIDP_BUTTON_CAPS*)calloc(bn, sizeof(HIDP_BUTTON_CAPS));
+        if (bc) {
+            if (HidP_GetButtonCaps(HidP_Input, bc, &bn, pp) ==
+                HIDP_STATUS_SUCCESS)
+                for (USHORT i = 0; i < bn; i++) {
+                    if (bc[i].UsagePage != HID_PAGE_BUTTON) continue;
+                    USHORT hi = bc[i].IsRange ? bc[i].Range.UsageMax
+                                              : bc[i].NotRange.Usage;
+                    if (hi > g_hv_btn_max) g_hv_btn_max = hi;
+                }
+            free(bc);
+        }
+    }
 
     HidVal X = found[0], Y = found[1], Z = found[2];
     HidVal RX = found[3], RY = found[4], RZ = found[5];
@@ -5374,8 +5394,9 @@ static void pad_axis_summary(wchar_t* out, size_t n) {
                  (long)lo, (long)hi);
         if (wcslen(buf) + wcslen(one) < 250) wcscat(buf, one);
     }
-    swprintf(out, n, L"HID: %s%s", buf,
-             g_hv_hat.present ? L"hat" : L"no hat");
+    swprintf(out, n, L"HID: %s%s, %u buttons declared", buf,
+             g_hv_hat.present ? L"hat" : L"no hat",
+             (unsigned)g_hv_btn_max);
 }
 
 // --- Controller setup page --------------------------------------------------
