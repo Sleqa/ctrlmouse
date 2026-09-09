@@ -5366,8 +5366,47 @@ static void pad_axis_summary(wchar_t* out, size_t n) {
 #define SET_ROW_STEP 36
 #define SET_ROWS_MAX 14
 
+// Both listening pages take the pad over: a press is reported and nothing it
+// is bound to runs. Reach one from the sofa and there is no way back - the
+// buttons that would leave the page do nothing either. So a press starts a
+// countdown. Anything the user does holds it off, three seconds of nothing
+// starts it again, and when it runs out the selection is dropped and the pad
+// goes back to working.
+#define LOCK_HOLD_MS 5000
+#define LOCK_IDLE_MS 3000
+static ULONGLONG g_lock_t0 = 0;       // countdown start, 0 = held off
+static ULONGLONG g_lock_input = 0;    // when the user last did something
+static bool      g_lock_armed = false;
+
 static bool    g_setup_editing = false;      // typing a name for g_bind_btn
 static wchar_t g_setup_text[40] = L"";
+
+static void lock_arm()   { g_lock_armed = true; g_lock_t0 = GetTickCount64();
+                           g_lock_input = 0; }
+static void lock_clear() { g_lock_armed = false; g_lock_t0 = 0;
+                           g_lock_input = 0; }
+// Typing, pointer movement, a click: someone is there, so stop counting.
+static void lock_input() {
+    if (!g_lock_armed) return;
+    g_lock_t0 = 0;
+    g_lock_input = GetTickCount64();
+}
+// Seconds still to run, 0 when it is not counting - the page shows this so
+// the release is not a surprise.
+static int lock_left() {
+    if (!g_lock_armed || !g_lock_t0) return 0;
+    ULONGLONG e = GetTickCount64() - g_lock_t0;
+    if (e >= LOCK_HOLD_MS) return 0;
+    return (int)((LOCK_HOLD_MS - e + 999) / 1000);
+}
+static void lock_release(HWND hwnd) {
+    lock_clear();
+    g_bind_btn = -1;
+    g_setup_editing = false;
+    g_setup_text[0] = 0;
+    g_listen = false;              // whatever is on the pad works again
+    InvalidateRect(hwnd, NULL, FALSE);
+}
 
 static RECT setup_card()  { return card_rect(SET_CARD_Y); }
 static RECT setup_done_btn() {
@@ -5641,6 +5680,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;   // WM_PAINT clears the whole client area itself
     case WM_CHAR:
+        lock_input();
         // The setup page is the only thing here that takes typed text.
         if (g_page == 3 && g_setup_editing) {
             wchar_t ch = (wchar_t)wp;
@@ -5657,6 +5697,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        lock_input();
         if (g_page == 3 && g_setup_editing &&
             (msg == WM_KEYDOWN) && (wp == VK_RETURN || wp == VK_ESCAPE)) {
             int btn = g_bind_btn;
@@ -5719,6 +5760,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN: {
         POINT pt = lparam_to_dip(lp);
+        lock_input();
         ui_animate(hwnd);
         POINT screen=pt; screen.y-=g_scroll;
         if (screen.x<rail_w()) {
@@ -5729,7 +5771,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!PtInRect(&nr,screen)) continue;
                 if (g_page==i && g_bind_target<0) return 0;
                 g_page=i; g_scroll=0; g_bind_target=-1; g_bind_btn=-1;
-                g_listen=(i==1 || i==3); g_sc_capture=false;
+                g_listen=(i==1 || i==3); g_sc_capture=false; lock_clear();
                 g_setup_editing=false; g_setup_text[0]=0;
                 clamp_scroll(); InvalidateRect(hwnd,NULL,FALSE); return 0;
             }
@@ -5744,9 +5786,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_page = (g_bind_target >= 0) ? 2 : 0;
                 g_bind_target = -1;
                 g_listen = false;         // the mapping comes back
+                lock_clear();
                 g_sc_capture = false;
                 g_scroll = 0;
                 clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            // After a release the page is still up but the pad is free.
+            // Clicking the card - which the pad can now do - takes it back.
+            RECT bc = bind_card();
+            if (!g_listen && PtInRect(&bc, pt)) {
+                g_listen = true;
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
@@ -5794,10 +5845,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_page == 3) {
             RECT bb = back_btn_rect();
             RECT db = setup_done_btn();
+            RECT sc = setup_card();
+            if (!g_listen && PtInRect(&sc, pt)) {
+                g_listen = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             if (PtInRect(&bb, pt) || PtInRect(&db, pt)) {
                 g_page = 0;
                 g_listen = false;
                 g_setup_editing = false;
+                lock_clear();
                 g_scroll = 0;
                 clamp_scroll();
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -5956,6 +6014,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
+        {
+            // Only real movement counts. Windows sends a move for anything
+            // that lands under a still pointer, and that is not a person.
+            POINT was = g_ui_pointer;
+            POINT now = lparam_to_dip(lp); now.y -= g_scroll;
+            if (now.x != was.x || now.y != was.y) lock_input();
+        }
         g_ui_pointer=lparam_to_dip(lp); g_ui_pointer.y-=g_scroll;
         TRACKMOUSEEVENT leave={sizeof(leave),TME_LEAVE,hwnd,0}; TrackMouseEvent(&leave);
         InvalidateRect(hwnd,NULL,FALSE);
@@ -6030,6 +6095,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         wcscpy(h, L"Press a button on the controller. "
                                   L"Everything below then applies to that "
                                   L"button.");
+                    }
+                    if (!g_listen)
+                        wcscpy(h, L"The controller is back to normal. Click "
+                                  L"the box below to bind another button.");
+                    int left = lock_left();
+                    if (left > 0) {
+                        wchar_t tail[64];
+                        swprintf(tail, 64, L"   Releasing the controller in "
+                                           L"%ds.", left);
+                        size_t room = (sizeof(h) / sizeof(h[0])) - wcslen(h) - 1;
+                        if (room > wcslen(tail)) wcscat(h, tail);
                     }
                     RECT hr2 = {content_x(), BIND_HINT_Y,
                                 content_x() + content_w(), BIND_HINT_Y + 20};
@@ -6198,12 +6274,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
                 if (g_tf_label) {
-                    const wchar_t* h = g_setup_editing
-                        ? L"Type what that button is called, then press Enter. "
-                          L"Escape forgets it."
-                        : L"Press a button on the controller, then type what "
-                          L"it is called. Every button it has, including any "
-                          L"on the back.";
+                    wchar_t h[300];
+                    if (!g_listen)
+                        wcscpy(h, L"The controller is back to normal. Click "
+                                  L"the box below to name another button.");
+                    else if (g_setup_editing)
+                        wcscpy(h, L"Type what that button is called, then "
+                                  L"press Enter. Escape forgets it.");
+                    else
+                        wcscpy(h, L"Press a button on the controller, then "
+                                  L"type what it is called. Every button it "
+                                  L"has, including any on the back.");
+                    int left = lock_left();
+                    if (left > 0) {
+                        wchar_t tail[64];
+                        swprintf(tail, 64, L"   Releasing the controller in "
+                                           L"%ds.", left);
+                        size_t room = (sizeof(h) / sizeof(h[0])) - wcslen(h) - 1;
+                        if (room > wcslen(tail)) wcscat(h, tail);
+                    }
                     RECT hr2 = {content_x(), SET_HINT_Y,
                                 content_x() + content_w(), SET_HINT_Y + 20};
                     g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
@@ -6496,6 +6585,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (--g_ui_frames<=0 || !IsWindowVisible(hwnd)) KillTimer(hwnd,90);
             InvalidateRect(hwnd,NULL,FALSE); return 0;
         }
+        if (g_lock_armed) {
+            ULONGLONG now = GetTickCount64();
+            if (!g_lock_t0) {
+                if (now - g_lock_input >= LOCK_IDLE_MS) g_lock_t0 = now;
+            } else if (now - g_lock_t0 >= LOCK_HOLD_MS) {
+                lock_release(hwnd);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         // The setup page shows live axis values, so it repaints on the tick
         // rather than only when something is clicked.
         if (g_page == 3) InvalidateRect(hwnd, NULL, FALSE);
@@ -6666,6 +6764,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_listen && g_bind_btn != (int)lp &&
                 !(g_page == 3 && g_setup_editing)) {
                 g_bind_btn = (int)lp;
+                lock_arm();
                 // On the setup page a press is the start of naming it, so
                 // typing can begin straight away without another click.
                 if (g_page == 3) {
@@ -6745,6 +6844,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_sc_capture = false;
         g_win_picker = false;
         g_setup_editing = false;
+        lock_clear();
         hide_to_tray(hwnd);  // close button -> tray, keep running
         return 0;
     case WM_DESTROY:

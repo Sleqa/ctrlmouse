@@ -30,6 +30,13 @@ Buttons do nothing while that page is open, so pressing one to bind it cannot
 also fire whatever is already on it. The sticks keep working, since they are
 not what is being bound.
 
+That would strand anyone without a keyboard to hand, so a press starts a
+five-second countdown. Typing, moving the pointer or clicking stops it, and
+three seconds of nothing starts it again. When it runs out the button is
+deselected and the controller goes back to working normally - the page stays
+up, and clicking the box at the top of it starts listening again. The same
+applies to **Name the buttons**.
+
 Any pad Windows recognises works. Pads are read over raw HID: a DualSense has
 a hand-written parser, since its reports differ between USB and Bluetooth, and
 everything else is decoded from its own HID report descriptor. DirectInput is
