@@ -114,6 +114,10 @@ static const char* kBindKeyA[F_COUNT] = {
 enum { PADL_PS = 0, PADL_XINPUT, PADL_GENERIC };
 static volatile int  g_pad_layout = PADL_PS;
 static volatile bool g_pad_rstick_rxry = false;
+// The last values read off the pad, for the live readout on the setup page.
+static volatile int g_dbg_lx = 0, g_dbg_ly = 0, g_dbg_rx = 0, g_dbg_ry = 0;
+static volatile int g_dbg_hat = -1;
+static volatile unsigned g_dbg_mask = 0;
 
 // A button can also send a keyboard shortcut instead of, or as well as, one
 // of the actions above. Slots rather than an entry per button, so the config
@@ -1377,6 +1381,7 @@ struct HidVal {
 
 static PHIDP_PREPARSED_DATA g_hid_pp = NULL; // kept for the life of the handle
 static HidVal g_hv_lx, g_hv_ly, g_hv_rx, g_hv_ry, g_hv_lt, g_hv_rt, g_hv_hat;
+static bool   g_hv_trig_shared = false;   // one axis carries both triggers
 
 static void hid_free_preparsed() {
     if (g_hid_pp) { HidD_FreePreparsedData(g_hid_pp); g_hid_pp = NULL; }
@@ -1441,10 +1446,16 @@ static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st) {
 
     // Triggers that live on their own axes rather than as buttons become
     // buttons here, the way the D-pad does, so they can be bound at all.
-    if (g_hv_lt.present && hid_read_axis(g_hv_lt, buf, len) > 200)
-        st.mask |= 1u << BTN_LTRIG;
-    if (g_hv_rt.present && hid_read_axis(g_hv_rt, buf, len) > 200)
-        st.mask |= 1u << BTN_RTRIG;
+    if (g_hv_trig_shared) {
+        int t = hid_read_axis(g_hv_lt, buf, len);
+        if (t < -400) st.mask |= 1u << BTN_LTRIG;
+        if (t >  400) st.mask |= 1u << BTN_RTRIG;
+    } else {
+        if (g_hv_lt.present && hid_read_axis(g_hv_lt, buf, len) > 200)
+            st.mask |= 1u << BTN_LTRIG;
+        if (g_hv_rt.present && hid_read_axis(g_hv_rt, buf, len) > 200)
+            st.mask |= 1u << BTN_RTRIG;
+    }
     return true;
 }
 
@@ -1453,6 +1464,7 @@ static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st) {
 static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
     g_hv_lx = g_hv_ly = g_hv_rx = g_hv_ry = HidVal{};
     g_hv_lt = g_hv_rt = g_hv_hat = HidVal{};
+    g_hv_trig_shared = false;
     if (!caps.NumberInputValueCaps) return false;
 
     USHORT n = caps.NumberInputValueCaps;
@@ -1463,13 +1475,21 @@ static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
     HidVal hatv = {};
     if (HidP_GetValueCaps(HidP_Input, vc, &n, pp) == HIDP_STATUS_SUCCESS) {
         for (USHORT i = 0; i < n; i++) {
-            if (vc[i].UsagePage != HID_PAGE_GENERIC || vc[i].IsRange) continue;
-            USAGE u = vc[i].NotRange.Usage;
-            HidVal v = {true, u, vc[i].LogicalMin, vc[i].LogicalMax,
-                        vc[i].BitSize};
-            if (u == HID_USAGE_HAT) { hat = true; hatv = v; }
-            else if (u >= HID_USAGE_X && u <= HID_USAGE_RZ)
-                found[u - HID_USAGE_X] = v;
+            if (vc[i].UsagePage != HID_PAGE_GENERIC) continue;
+            // A descriptor may name each axis, or declare a run of them as
+            // one range - X through Rz in a single entry. Skipping the range
+            // form loses every axis on the pads that use it.
+            USAGE lo = vc[i].IsRange ? vc[i].Range.UsageMin
+                                     : vc[i].NotRange.Usage;
+            USAGE hi = vc[i].IsRange ? vc[i].Range.UsageMax
+                                     : vc[i].NotRange.Usage;
+            for (USAGE u = lo; u <= hi; u++) {
+                HidVal v = {true, u, vc[i].LogicalMin, vc[i].LogicalMax,
+                            vc[i].BitSize};
+                if (u == HID_USAGE_HAT) { hat = true; hatv = v; }
+                else if (u >= HID_USAGE_X && u <= HID_USAGE_RZ)
+                    found[u - HID_USAGE_X] = v;
+            }
         }
     }
     free(vc);
@@ -1490,6 +1510,9 @@ static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
         g_hv_ry = RY;
         g_hv_lt = Z;
         g_hv_rt = RZ;
+        // XInput hands both triggers to one axis, one pushing it each way.
+        // Treating that as a single trigger left the other unreachable.
+        g_hv_trig_shared = Z.present && !RZ.present;
         // Rx and Ry with no Rz is the shape an XInput pad describes, and
         // its button order comes with it. Anything else gets numbered
         // buttons, which are never wrong even when the make is unknown.
@@ -2056,6 +2079,9 @@ static DWORD WINAPI worker_thread(LPVOID) {
         }
 
         g_connected = true;
+        g_dbg_lx = st.lx; g_dbg_ly = st.ly;
+        g_dbg_rx = st.rx; g_dbg_ry = st.ry;
+        g_dbg_hat = st.hat; g_dbg_mask = st.mask;
         unsigned mask = st.mask;
         if (st.hat >= 0) mask |= 1u << (BTN_DPAD_UP + st.hat);
 
@@ -5293,6 +5319,36 @@ static RECT wp_row(int i) {
     return r;
 }
 
+// A live readout of the pad, on the setup page. Which backend is talking to
+// it, which axes its descriptor declared, and what they currently read - the
+// difference between "the stick reports nothing" and "the stick is being read
+// from the wrong axis" is invisible without it.
+static void pad_axis_summary(wchar_t* out, size_t n) {
+    if (g_hid == INVALID_HANDLE_VALUE) {
+        swprintf(out, n, L"DirectInput - the descriptor is not read here");
+        return;
+    }
+    if (!g_hid_generic) {
+        swprintf(out, n, L"DualSense, fixed layout");
+        return;
+    }
+    wchar_t buf[256] = L"";
+    const wchar_t* nm[6] = {L"X", L"Y", L"Z", L"Rx", L"Ry", L"Rz"};
+    const HidVal* v[6] = {&g_hv_lx, &g_hv_ly, &g_hv_lt, &g_hv_rx, &g_hv_ry,
+                          &g_hv_rt};
+    // Printed as the roles they were given, since that is what is in doubt.
+    const wchar_t* role[6] = {L"lx", L"ly", L"trig", L"rx", L"ry", L"trig2"};
+    for (int i = 0; i < 6; i++) {
+        if (!v[i]->present) continue;
+        wchar_t one[64];
+        swprintf(one, 64, L"%s=%s(%ld..%ld) ", role[i], nm[v[i]->usage - 0x30],
+                 (long)v[i]->lmin, (long)v[i]->lmax);
+        if (wcslen(buf) + wcslen(one) < 250) wcscat(buf, one);
+    }
+    swprintf(out, n, L"HID: %s%s", buf,
+             g_hv_hat.present ? L"hat" : L"no hat");
+}
+
 // --- Controller setup page --------------------------------------------------
 // Page 3: naming a pad's buttons. Press one, type what it is, Enter. The pad
 // itself only says how many buttons it has, so this is the only way anything
@@ -6216,6 +6272,23 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_label,
                                         to_f(hd), g_br_main_dim);
                 }
+                if (g_tf_label) {
+                    wchar_t ax[300];
+                    pad_axis_summary(ax, 300);
+                    RECT ar = {content_x(), SET_LIST_Y - 52,
+                               content_x() + content_w(), SET_LIST_Y - 34};
+                    g_rt_main->DrawText(ax, (UINT32)wcslen(ax), g_tf_label,
+                                        to_f(ar), g_br_main_dim);
+                    wchar_t lv[160];
+                    swprintf(lv, 160,
+                             L"left %d,%d   right %d,%d   hat %d   buttons %08X",
+                             g_dbg_lx, g_dbg_ly, g_dbg_rx, g_dbg_ry,
+                             g_dbg_hat, g_dbg_mask);
+                    RECT lr = {content_x(), SET_LIST_Y - 34,
+                               content_x() + content_w(), SET_LIST_Y - 16};
+                    g_rt_main->DrawText(lv, (UINT32)wcslen(lv), g_tf_label,
+                                        to_f(lr), g_br_main_dim);
+                }
                 for (int i = 0; i < named; i++) {
                     RECT rr = setup_row(i);
                     EnterCriticalSection(&g_cs);
@@ -6697,6 +6770,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER: {
+        // The setup page shows live axis values, so it repaints on the tick
+        // rather than only when something is clicked.
+        if (g_page == 3) InvalidateRect(hwnd, NULL, FALSE);
         Config c = get_cfg();
         int st;
         const wchar_t* state;
