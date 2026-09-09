@@ -5036,84 +5036,60 @@ static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
 // The window is resizable. Content stretches with it up to a comfortable
 // reading width and then centres, the way the app this borrows from does -
 // a settings list stretched across a very wide window is hard to scan.
-#define WIN_W     980             // starting width: enough for the longest
+#define WIN_W     1180             // starting width: enough for the longest
                                   // description without truncating it
-#define WIN_MIN_W 480
-#define WIN_MIN_H 420
-#define PAD       24
-#define MAXW      960             // widest the content ever gets
+#define WIN_MIN_W 760
+#define WIN_MIN_H 560
+#define PAD       32
+#define MAXW      1040             // widest the content ever gets
 
 static int g_cw = WIN_W;          // client size, DIPs
 static int g_ch = 700;
 static int g_scroll = 0;          // vertical scroll offset, DIPs
 
+static int rail_w() { return g_cw < 1000 ? 76 : 216; }
 static int content_w() {
-    int w = g_cw - PAD * 2;
+    int w = g_cw - rail_w() - PAD * 2;
     if (w > MAXW) w = MAXW;
     if (w < 240) w = 240;
     return w;
 }
-static int content_x() { return (g_cw - content_w()) / 2; }
+static int content_x() { return rail_w() + (g_cw - rail_w() - content_w()) / 2; }
 #define CONTENT content_w()
 // WinUI SettingsCard proportions: a rounded panel per setting, icon on the
 // left, title over description, the control on the right.
-#define CARD_R    4.0f
-#define CARD_H    62
-#define CARD_GAP  4
-#define CARD_ICON 44              // icon column inside a card
+#define CARD_R    14.0f
+#define CARD_H    76
+#define CARD_GAP  10
+#define CARD_ICON 54              // icon column inside a card
 #define CARD_CTRL 200             // control column on the right
 
-static RECT status_rect() { RECT r = {content_x(), 52, content_x() + content_w() - 110, 78}; return r; }
- static RECT title_rect() { RECT r = {content_x(), 14, content_x() + content_w(), 46}; return r; }
-static RECT hide_rect() { RECT r = {content_x(), 78, content_x() + content_w() - 110, 98}; return r; }
-static RECT hid_btn_rect() { int rx = content_x() + content_w();
-                             RECT r = {rx - 96, 62, rx, 88}; return r; }
+static RECT status_rect() { RECT r = {content_x()+24, 124, content_x()+content_w()-180, 151}; return r; }
+static RECT title_rect() { RECT r = {content_x(), 22, content_x()+content_w()-96, 62}; return r; }
+static RECT hide_rect() { RECT r = {content_x()+24, 157, content_x()+content_w()-280, 180}; return r; }
+static RECT hid_btn_rect() { int rx = content_x()+content_w(); RECT r = {rx-266, 155, rx-174, 185}; return r; }
 
-// --- Pointer section --------------------------------------------------------
-#define SEC1_Y   112               // "POINTER" heading
-#define SLIDE_Y0 138              // first slider row
-#define SLIDE_STEP (CARD_H + CARD_GAP)
-static const wchar_t* kTrackLabel[NTRACKS] = {
-    L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
+#define SEC1_Y 232
+#define SLIDE_Y0 266
+#define SLIDE_STEP 144
+static const wchar_t* kTrackLabel[NTRACKS] = {L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
 static const wchar_t* kTrackDesc[NTRACKS] = {
-    L"How far the cursor travels when the stick is pushed all the way.",
-    L"How fast the right stick scrolls. Pushing up scrolls down.",
-    L"Stick movement near the centre that is ignored, so a resting stick sits still.",
-    L"Higher means small stick movements stay slow, so you can aim precisely "
-    L"without lowering the speed above."};
-
-static RECT card_rect(int y) {
-    RECT r = {content_x(), y, content_x() + content_w(), y + CARD_H};
-    return r;
+    L"Cursor speed at full stick travel.",
+    L"Right-stick scrolling. Up scrolls down.",
+    L"Ignore small movements around the centre.",
+    L"Higher values give more precision near centre."};
+static RECT card_rect(int y) { RECT r = {content_x(), y, content_x()+content_w(), y+CARD_H}; return r; }
+static RECT slide_card(int i) {
+    int w=(content_w()-16)/2, x=content_x()+(i%2)*(w+16), y=SLIDE_Y0+(i/2)*SLIDE_STEP;
+    RECT r={x,y,x+w,y+SLIDE_STEP-16}; return r;
 }
-static RECT slide_card(int i)  { return card_rect(SLIDE_Y0 + i * SLIDE_STEP); }
-static RECT slide_label(int i) {
-    int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {content_x() + CARD_ICON, y + 11,
-              content_x() + content_w() - CARD_CTRL - 12, y + 29};
-    return r;
-}
-static RECT slide_desc(int i) {
-    int y = SLIDE_Y0 + i * SLIDE_STEP;
-    RECT r = {content_x() + CARD_ICON, y + 30,
-              content_x() + content_w() - CARD_CTRL - 12, y + 48};
-    return r;
-}
-static RECT slide_track(int i) {
-    int y = SLIDE_Y0 + i * SLIDE_STEP;
-    int rx = content_x() + content_w();
-    RECT r = {rx - CARD_CTRL, y + 18, rx - 58, y + 44};
-    return r;
-}
-static RECT slide_value(int i) {
-    int y = SLIDE_Y0 + i * SLIDE_STEP;
-    int rx = content_x() + content_w();
-    RECT r = {rx - 50, y + 22, rx - 14, y + 40};
-    return r;
-}
+static RECT slide_label(int i) { RECT r=slide_card(i); r.left+=50; r.top+=18; r.right-=64; r.bottom=r.top+22; return r; }
+static RECT slide_desc(int i) { RECT r=slide_card(i); r.left+=20; r.top+=50; r.right-=16; r.bottom=r.top+20; return r; }
+static RECT slide_track(int i) { RECT r=slide_card(i); r.left+=24; r.right-=24; r.top+=85; r.bottom=r.top+26; return r; }
+static RECT slide_value(int i) { RECT r=slide_card(i); r.left=r.right-65; r.right-=20; r.top+=18; r.bottom=r.top+24; return r; }
 
 // --- Behaviour section ------------------------------------------------------
-#define SEC2_Y  (SLIDE_Y0 + NTRACKS * SLIDE_STEP + 8)
+#define SEC2_Y  (SLIDE_Y0 + 2 * SLIDE_STEP + 16)
 #define TOG_Y0  (SEC2_Y + 28)
 #define TOG_STEP (CARD_H + CARD_GAP)
 #define NTOGGLES 3
@@ -5150,52 +5126,17 @@ static RECT toggle_desc(int i) {
 #define SEARCH_Y (TOG_Y0 + NTOGGLES * TOG_STEP)
 #define NSEARCH 2
 static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
-static RECT search_card() { return card_rect(SEARCH_Y); }
+static RECT search_card() { RECT r=card_rect(SEARCH_Y); r.bottom+=40; return r; }
 #define SEARCH_CTRL 300           // wider than CARD_CTRL: two segments and
                                   // the hotkey have to share it
 static RECT search_seg(int i) {
     int x = content_x() + content_w() - SEARCH_CTRL + i * 86;
-    RECT r = {x, SEARCH_Y + 18, x + 80, SEARCH_Y + 44};
+    RECT r = {x, SEARCH_Y + 70, x + 80, SEARCH_Y + 102};
     return r;
 }
 static RECT search_key_rect() {
     int rx = content_x() + content_w();
-    RECT r = {rx - 118, SEARCH_Y + 18, rx - 8, SEARCH_Y + 44};
-    return r;
-}
-
-// --- Controls ---------------------------------------------------------------
-// One card, which opens the controller page. The old inline list of rows with
-// a "press a button" box each is gone: picking the button first and the action
-// second reads far better on a picture of the pad than a list of names ever
-// did, and it's the only way to see at a glance what a given button already
-// does.
-#define SEC3_Y   (SEARCH_Y + CARD_H + 20)
-#define MAP_Y    (SEC3_Y + 28)
-
-#define APPS_Y (MAP_Y + CARD_H + CARD_GAP)
-
-static RECT map_card() { return card_rect(MAP_Y); }
-static RECT map_btn_rect() {
-    int rx = content_x() + content_w();
-    RECT r = {rx - 116, MAP_Y + 18, rx - 14, MAP_Y + 44};
-    return r;
-}
-static RECT apps_card() { return card_rect(APPS_Y); }
-static RECT apps_btn_rect() {
-    int rx = content_x() + content_w();
-    RECT r = {rx - 116, APPS_Y + 18, rx - 14, APPS_Y + 44};
-    return r;
-}
-#define SETUP_Y (APPS_Y + CARD_H + CARD_GAP)
-static RECT setup_row_card() { return card_rect(SETUP_Y); }
-static RECT setup_btn_rect() {
-    int rx = content_x() + content_w();
-    RECT r = {rx - 116, SETUP_Y + 18, rx - 14, SETUP_Y + 44};
-    return r;
-}
-static RECT sec3_header() {
-    RECT r = {content_x(), SEC3_Y, content_x() + content_w(), SEC3_Y + 20};
+    RECT r = {rx - 118, SEARCH_Y + 70, rx - 18, SEARCH_Y + 102};
     return r;
 }
 
@@ -5218,24 +5159,25 @@ static int g_bind_target = -1;
 
 static RECT back_btn_rect() {
     int rx = content_x() + content_w();
-    RECT r = {rx - 84, 16, rx, 44};
+    RECT r = {rx - 84, 28, rx, 58};
     return r;
 }
 
-#define BIND_HINT_Y   58
-#define BIND_CARD_Y   86                        // "you pressed ..."
+#define BIND_HINT_Y   76
+#define BIND_CARD_Y   112                        // "you pressed ..."
 #define BIND_SEC1_Y   (BIND_CARD_Y + CARD_H + 20)
 #define BIND_ROW_Y0   (BIND_SEC1_Y + 26)
-#define BIND_ROW_STEP 32
-#define BIND_SEC2_Y   (BIND_ROW_Y0 + F_COUNT * BIND_ROW_STEP + 16)
+#define BIND_ROW_STEP 54
+#define BIND_SEC2_Y   (BIND_ROW_Y0 + ((F_COUNT+1)/2) * BIND_ROW_STEP + 16)
 #define BIND_SC_Y     (BIND_SEC2_Y + 26)
 
 static RECT bind_card()    { return card_rect(BIND_CARD_Y); }
 static RECT bind_sc_card() { return card_rect(BIND_SC_Y); }
 
 static RECT bind_row(int i) {
-    int y = BIND_ROW_Y0 + i * BIND_ROW_STEP;
-    RECT r = {content_x(), y, content_x() + content_w(), y + BIND_ROW_STEP - 4};
+    int y = BIND_ROW_Y0 + (i/2) * BIND_ROW_STEP;
+    int w=(content_w()-16)/2, x=content_x()+(i%2)*(w+16);
+    RECT r = {x, y, x+w, y+BIND_ROW_STEP-6};
     return r;
 }
 static RECT bind_sc_btn() {
@@ -5277,10 +5219,10 @@ static int sc_slot_for(const Config& c, int btn) {
 // --- Apps page --------------------------------------------------------------
 // Page 2: the per-app rules. Each row is one app, with the two things a rule
 // can say about it and a way to drop it.
-#define APP_HINT_Y   58
-#define APP_BTN_Y    86
+#define APP_HINT_Y   76
+#define APP_BTN_Y    116
 #define APP_ROW_Y0   (APP_BTN_Y + 40)
-#define APP_ROW_STEP 62
+#define APP_ROW_STEP 76
 
 static RECT app_add_file_btn() {
     RECT r = {content_x(), APP_BTN_Y, content_x() + 150, APP_BTN_Y + 28};
@@ -5418,10 +5360,10 @@ static void pad_axis_summary(wchar_t* out, size_t n) {
 // Page 3: naming a pad's buttons. Press one, type what it is, Enter. The pad
 // itself only says how many buttons it has, so this is the only way anything
 // beyond the face buttons gets a name worth showing.
-#define SET_HINT_Y   58
-#define SET_CARD_Y   86
-#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 40)
-#define SET_ROW_STEP 28
+#define SET_HINT_Y   76
+#define SET_CARD_Y   112
+#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 180)
+#define SET_ROW_STEP 36
 #define SET_ROWS_MAX 14
 
 static bool    g_setup_editing = false;      // typing a name for g_bind_btn
@@ -5468,7 +5410,7 @@ static int win_height() {
         }
         return h;
     }
-    return SETUP_Y + CARD_H + 54;
+    return SEARCH_Y + CARD_H + 100;
 }
 
 static const wchar_t* kFooterText =
@@ -5659,6 +5601,8 @@ static int hit_test_track(POINT pt) {
     return -1;
 }
 
+#include "ui_shell.h"
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -5775,6 +5719,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN: {
         POINT pt = lparam_to_dip(lp);
+        ui_animate(hwnd);
+        POINT screen=pt; screen.y-=g_scroll;
+        if (screen.x<rail_w()) {
+            // A modal picker or shortcut capture keeps its normal ownership.
+            if (g_win_picker || g_sc_capture || g_hotkey_capture || g_setup_editing) return 0;
+            for (int i=0;i<4;i++) {
+                RECT nr=ui_nav_rect(i);
+                if (!PtInRect(&nr,screen)) continue;
+                if (g_page==i && g_bind_target<0) return 0;
+                g_page=i; g_scroll=0; g_bind_target=-1; g_bind_btn=-1;
+                g_listen=(i==1 || i==3); g_sc_capture=false;
+                g_setup_editing=false; g_setup_text[0]=0;
+                clamp_scroll(); InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            return 0;
+        }
         Config c = get_cfg();
         if (g_page == 1) {
             RECT bb = back_btn_rect();
@@ -5968,41 +5928,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         {
-            RECT mb = map_btn_rect();
-            if (PtInRect(&mb, pt)) {
-                g_page = 1;
-                g_bind_target = -1;   // the base layout
-                g_bind_btn = -1;
-                g_sc_capture = false;
-                g_listen = true;      // report presses, run nothing
-                g_scroll = 0;
-                clamp_scroll();
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-            RECT nb = setup_btn_rect();
-            if (PtInRect(&nb, pt)) {
-                g_page = 3;
-                g_bind_btn = -1;
-                g_setup_editing = false;
-                g_setup_text[0] = 0;
-                g_listen = true;      // report presses, run nothing
-                g_scroll = 0;
-                clamp_scroll();
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-            RECT ab = apps_btn_rect();
-            if (PtInRect(&ab, pt)) {
-                g_page = 2;
-                g_win_picker = false;
-                g_scroll = 0;
-                clamp_scroll();
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-        }
-        {
             RECT hk = search_key_rect();
             if (c.search_mode == 1 && PtInRect(&hk, pt)) {
                 g_hotkey_capture = true;
@@ -6031,12 +5956,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
+        g_ui_pointer=lparam_to_dip(lp); g_ui_pointer.y-=g_scroll;
+        TRACKMOUSEEVENT leave={sizeof(leave),TME_LEAVE,hwnd,0}; TrackMouseEvent(&leave);
+        InvalidateRect(hwnd,NULL,FALSE);
         if (g_drag_track >= 0) {
             POINT pt = lparam_to_dip(lp);
             apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
         }
         return 0;
     }
+    case WM_MOUSELEAVE:
+        g_ui_pointer={-1000,-1000}; InvalidateRect(hwnd,NULL,FALSE); return 0;
+    case WM_CAPTURECHANGED:
+        g_drag_track=-1; InvalidateRect(hwnd,NULL,FALSE); return 0;
     case WM_LBUTTONUP: {
         if (g_drag_track >= 0) {
             g_drag_track = -1;
@@ -6061,29 +5993,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                 : d2d_clr(KB_CLR_BG));
             g_rt_main->SetTransform(
                 D2D1::Matrix3x2F::Translation(0.0f, -(float)g_scroll));
+            g_rt_main->PushAxisAlignedClip(D2D1::RectF((float)rail_w(),(float)g_scroll,(float)g_cw,(float)(g_scroll+g_ch)),D2D1_ANTIALIAS_MODE_ALIASED);
             Config c = get_cfg();
 
-            if (g_tf_title && g_br_main_text) {
+            if (g_page != 0 && g_tf_title && g_br_main_text) {
                 const wchar_t* t = (g_page == 1) ? L"Button layout"
                                  : (g_page == 2) ? L"Per-app rules"
                                  : (g_page == 3) ? L"Name the buttons"
                                                  : L"ctrlmouse";
                 g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_title,
                                     to_f(title_rect()), g_br_main_text);
-            }
-
-            // Status label (4-state color, same logic as before).
-            if (g_page == 0) {
-                COLORREF sc = RGB(240, 110, 110);
-                if (g_status_state == 1) sc = RGB(88, 210, 128);
-                else if (g_status_state == 2) sc = RGB(235, 180, 80);
-                else if (g_status_state == 3) sc = RGB(150, 150, 158);
-                if (g_br_main_status) g_br_main_status->SetColor(d2d_clr(sc));
-                if (g_tf_header && g_br_main_status)
-                    g_rt_main->DrawText(g_status_txt,
-                                        (UINT32)wcslen(g_status_txt),
-                                        g_tf_header, to_f(status_rect()),
-                                        g_br_main_status);
             }
 
             if (g_page == 1) {
@@ -6174,8 +6093,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 for (int f = 0; f < F_COUNT; f++) {
                     RECT rr = bind_row(f);
                     bool on = (btn >= 0 && tgtbind[f] == btn);
+                    ui_card(rr,btn>=0);
                     if (on)
-                        draw_control(g_rt_main, to_f(rr), 5.0f, g_br_main_sel,
+                        draw_control(g_rt_main, to_f(rr), 12.0f, g_br_main_sel,
                                      NULL);
                     draw_feature_icon(g_rt_main, (float)(rr.left + 18),
                                       (float)((rr.top + rr.bottom) / 2),
@@ -6186,7 +6106,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ID2D1Brush* tb = on ? (ID2D1Brush*)g_br_main_onacc
                                         : (btn >= 0 ? (ID2D1Brush*)g_br_main_text
                                                     : g_br_main_dim);
-                    RECT nr = {rr.left + 40, rr.top, rr.right - 150, rr.bottom};
+                    RECT nr = {rr.left + 40, rr.top+3, rr.right - 12, rr.top+25};
                     g_rt_main->DrawText(kFeatName[f],
                                         (UINT32)wcslen(kFeatName[f]),
                                         g_tf_label, to_f(nr), tb);
@@ -6202,9 +6122,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         swprintf(at, 48, L"%s", kFeatHint[f]);
                     }
                     if (at[0]) {
-                        RECT ar = {rr.right - 148, rr.top, rr.right - 12,
-                                   rr.bottom};
-                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        RECT ar = {rr.left+40, rr.top+25, rr.right-12, rr.bottom-3};
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                         g_rt_main->DrawText(at, (UINT32)wcslen(at), g_tf_label,
                                             to_f(ar),
                                             on ? (ID2D1Brush*)g_br_main_onacc
@@ -6347,10 +6266,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         to_f(hd), g_br_main_dim);
                 }
                 if (g_tf_label) {
+                    RECT diagnostics={content_x(),SET_CARD_Y+CARD_H+22,content_x()+content_w(),SET_CARD_Y+CARD_H+134};
+                    ui_card(diagnostics);
+                    ui_text(L"Live controller input",D2D1::RectF((float)content_x()+18,SET_CARD_Y+CARD_H+26,(float)content_x()+content_w()-18,SET_CARD_Y+CARD_H+49),g_tf_body,g_br_main_text);
                     wchar_t ax[300];
                     pad_axis_summary(ax, 300);
-                    RECT ar = {content_x(), SET_LIST_Y - 52,
-                               content_x() + content_w(), SET_LIST_Y - 34};
+                    RECT ar = {content_x()+18, SET_CARD_Y + CARD_H + 50,
+                               content_x() + content_w()-18, SET_CARD_Y + CARD_H + 74};
                     g_rt_main->DrawText(ax, (UINT32)wcslen(ax), g_tf_label,
                                         to_f(ar), g_br_main_dim);
                     wchar_t lv[160];
@@ -6358,8 +6280,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              L"left %d,%d   right %d,%d   hat %d   buttons %08X",
                              g_dbg_lx, g_dbg_ly, g_dbg_rx, g_dbg_ry,
                              g_dbg_hat, g_dbg_mask);
-                    RECT lr = {content_x(), SET_LIST_Y - 34,
-                               content_x() + content_w(), SET_LIST_Y - 16};
+                    RECT lr = {content_x()+18, SET_CARD_Y + CARD_H + 74,
+                               content_x() + content_w()-18, SET_CARD_Y + CARD_H + 98};
                     g_rt_main->DrawText(lv, (UINT32)wcslen(lv), g_tf_label,
                                         to_f(lr), g_br_main_dim);
                     wchar_t hh[200];
@@ -6371,8 +6293,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                               : L"NOT whitelisted (needs admin)",
                              g_pad_inst_count,
                              g_hh_hiding ? L"hiding now" : L"not hiding");
-                    RECT hr3 = {content_x(), SET_LIST_Y - 16,
-                                content_x() + content_w(), SET_LIST_Y + 2};
+                    RECT hr3 = {content_x()+18, SET_CARD_Y + CARD_H + 98,
+                                content_x() + content_w()-18, SET_CARD_Y + CARD_H + 122};
                     g_rt_main->DrawText(hh, (UINT32)wcslen(hh), g_tf_label,
                                         to_f(hr3), g_br_main_dim);
                 }
@@ -6432,10 +6354,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LeaveCriticalSection(&g_cs);
 
                 if (!napp && g_tf_label) {
-                    RECT er = {content_x(), APP_ROW_Y0 + 16,
-                               content_x() + content_w(), APP_ROW_Y0 + 36};
-                    g_rt_main->DrawText(L"Nothing listed yet.", 19, g_tf_label,
-                                        to_f(er), g_br_main_dim);
+                    RECT empty={content_x(),APP_ROW_Y0+20,content_x()+content_w(),APP_ROW_Y0+240};
+                    ui_card(empty);
+                    float cx=(empty.left+empty.right)*.5f;
+                    draw_control(g_rt_main,D2D1::RectF(cx-24,(float)(empty.top+35),cx+24,(float)(empty.top+83)),14,g_br_main_key,NULL);
+                    draw_feature_icon(g_rt_main,cx,(float)empty.top+59,IC_LAUNCHER,g_br_main_sel);
+                    g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    ui_text(L"Every app can feel right at home.",D2D1::RectF((float)empty.left,(float)(empty.top+99),(float)empty.right,(float)(empty.top+129)),g_tf_header,g_br_main_text);
+                    g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    ui_text(L"Add a program above to give it its own layout or pause rule.",D2D1::RectF((float)empty.left+18,(float)(empty.top+139),(float)empty.right-18,(float)(empty.top+165)),g_tf_label,g_br_main_dim);
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
 
                 for (int i = 0; i < napp; i++) {
@@ -6540,314 +6469,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
             } else {
-                // Cards first, so every label and control lands on one.
-                for (int i = 0; i < NTRACKS; i++)
-                    draw_control(g_rt_main, to_f(slide_card(i)), CARD_R,
-                                 g_br_main_card, g_br_main_border);
-                for (int i = 0; i < NTOGGLES; i++)
-                    draw_control(g_rt_main, to_f(toggle_card(i)), CARD_R,
-                                 g_br_main_card, g_br_main_border);
-                draw_control(g_rt_main, to_f(search_card()), CARD_R,
-                             g_br_main_card, g_br_main_border);
-                draw_control(g_rt_main, to_f(map_card()), CARD_R,
-                             g_br_main_card, g_br_main_border);
-                draw_control(g_rt_main, to_f(apps_card()), CARD_R,
-                             g_br_main_card, g_br_main_border);
-                draw_control(g_rt_main, to_f(setup_row_card()), CARD_R,
-                             g_br_main_card, g_br_main_border);
-                {
-                    // A small glyph on the left of each card, as WinUI does.
-                    const int slideIcon[NTRACKS] = {IC_CURSOR, IC_UPDOWN,
-                                                    IC_TUNE, IC_GEAR};
-                    for (int i = 0; i < NTRACKS; i++) {
-                        RECT c = slide_card(i);
-                        draw_feature_icon(g_rt_main, (float)(c.left + 24),
-                                          (float)((c.top + c.bottom) / 2),
-                                          slideIcon[i], g_br_main_dim);
-                    }
-                    const int togIcon[NTOGGLES] = {IC_POWER, IC_FULLSCREEN,
-                                                   IC_BOLT};
-                    for (int i = 0; i < NTOGGLES; i++) {
-                        RECT c = toggle_card(i);
-                        draw_feature_icon(g_rt_main, (float)(c.left + 24),
-                                          (float)((c.top + c.bottom) / 2),
-                                          togIcon[i], g_br_main_dim);
-                    }
-                    RECT sc = search_card();
-                    draw_feature_icon(g_rt_main, (float)(sc.left + 24),
-                                      (float)((sc.top + sc.bottom) / 2),
-                                      IC_SEARCH, g_br_main_dim);
-                }
-
-                // Section labels (were native STATIC controls; now DirectWrite so
-                // they stay sharp at any DPI).
-                if (g_tf_label) {
-                    const wchar_t* hs = hide_status_text();
-                    g_rt_main->DrawText(hs, (UINT32)wcslen(hs), g_tf_label,
-                                        to_f(hide_rect()), g_br_main_dim);
-                    for (int i = 0; i < NTRACKS; i++)
-                        g_rt_main->DrawText(kTrackLabel[i], (UINT32)wcslen(kTrackLabel[i]),
-                                            g_tf_label, to_f(slide_label(i)), g_br_main_dim);
-                    for (int i = 0; i < NTOGGLES; i++)
-                        g_rt_main->DrawText(kToggleText[i], (UINT32)wcslen(kToggleText[i]),
-                                            g_tf_label, to_f(toggle_label(i)), g_br_main_text);
-                    // Each setting says what it does, in a line under it.
-                    for (int i = 0; i < NTRACKS; i++)
-                        g_rt_main->DrawText(kTrackDesc[i], (UINT32)wcslen(kTrackDesc[i]),
-                                            g_tf_label, to_f(slide_desc(i)), g_br_main_dim);
-                    for (int i = 0; i < NTOGGLES; i++)
-                        g_rt_main->DrawText(kToggleDesc[i], (UINT32)wcslen(kToggleDesc[i]),
-                                            g_tf_label, to_f(toggle_desc(i)), g_br_main_dim);
-
-                    RECT sl = {content_x() + CARD_ICON, SEARCH_Y + 11,
-                               content_x() + content_w() - SEARCH_CTRL - 12,
-                               SEARCH_Y + 29};
-                    g_rt_main->DrawText(L"Search on hold", 14, g_tf_label, to_f(sl),
-                                        g_br_main_text);
-                    RECT sd = {content_x() + CARD_ICON, SEARCH_Y + 30,
-                               content_x() + content_w() - SEARCH_CTRL - 12,
-                               SEARCH_Y + 48};
-                    const wchar_t* sdt = (c.search_mode == 1)
-                        ? L"Presses your hotkey to open the launcher you already use."
-                        : L"Shows a simple list of your installed apps.";
-                    g_rt_main->DrawText(sdt, (UINT32)wcslen(sdt), g_tf_label,
-                                        to_f(sd), g_br_main_dim);
-
-                    // Section headings.
-                    RECT s1 = {content_x(), SEC1_Y,
-                               content_x() + content_w(), SEC1_Y + 20};
-                    g_rt_main->DrawText(L"POINTER", 7, g_tf_label, to_f(s1),
-                                        g_br_main_dim);
-                    RECT s2 = {content_x(), SEC2_Y,
-                               content_x() + content_w(), SEC2_Y + 20};
-                    g_rt_main->DrawText(L"BEHAVIOUR", 9, g_tf_label, to_f(s2),
-                                        g_br_main_dim);
-                    RECT s3 = sec3_header();
-                    g_rt_main->DrawText(L"CONTROLS", 8, g_tf_label, to_f(s3),
-                                        g_br_main_dim);
-
-                    RECT fr = footer_rect();
-                    g_rt_main->DrawText(kFooterText, (UINT32)wcslen(kFooterText),
-                                        g_tf_label, to_f(fr), g_br_main_dim);
-                }
-
-                // The card that opens the controller page.
-                {
-                    int y = MAP_Y;
-                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
-                                      (float)y + CARD_H / 2, IC_PAD,
-                                      g_br_main_sel);
-                    if (g_tf_label) {
-                        RECT nr = {content_x() + CARD_ICON, y + 11,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 29};
-                        g_rt_main->DrawText(L"Button layout", 13, g_tf_label,
-                                            to_f(nr), g_br_main_text);
-                        RECT dr = {content_x() + CARD_ICON, y + 30,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 48};
-                        const wchar_t* d =
-                            L"Choose what each button on the pad does.";
-                        g_rt_main->DrawText(d, (UINT32)wcslen(d), g_tf_label,
-                                            to_f(dr), g_br_main_dim);
-                    }
-                    RECT mb = map_btn_rect();
-                    draw_control(g_rt_main, to_f(mb), 6.0f, g_br_main_key, NULL);
-                    if (g_tf_body) {
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(mb),
-                                            g_br_main_text);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
-                {
-                    int y = APPS_Y;
-                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
-                                      (float)y + CARD_H / 2, IC_LAUNCHER,
-                                      g_br_main_sel);
-                    if (g_tf_label) {
-                        RECT nr = {content_x() + CARD_ICON, y + 11,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 29};
-                        g_rt_main->DrawText(L"Per-app rules", 13, g_tf_label,
-                                            to_f(nr), g_br_main_text);
-                        RECT dr = {content_x() + CARD_ICON, y + 30,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 48};
-                        const wchar_t* d =
-                            L"Keep an app out of the game pause, or give it "
-                            L"its own button layout.";
-                        g_rt_main->DrawText(d, (UINT32)wcslen(d), g_tf_label,
-                                            to_f(dr), g_br_main_dim);
-                    }
-                    RECT ab = apps_btn_rect();
-                    draw_control(g_rt_main, to_f(ab), 6.0f, g_br_main_key, NULL);
-                    if (g_tf_body) {
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(ab),
-                                            g_br_main_text);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
-                {
-                    int y = SETUP_Y;
-                    EnterCriticalSection(&g_cs);
-                    int pr = g_pad_prof;
-                    bool mapped = padprof_mapped(pr);
-                    LeaveCriticalSection(&g_cs);
-                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
-                                      (float)y + CARD_H / 2, IC_KEYS,
-                                      g_br_main_sel);
-                    if (g_tf_label) {
-                        RECT nr = {content_x() + CARD_ICON, y + 11,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 29};
-                        g_rt_main->DrawText(L"Name the buttons", 16, g_tf_label,
-                                            to_f(nr), g_br_main_text);
-                        // An unnamed pad is worth pointing at: nothing else
-                        // knows what its extra buttons are.
-                        wchar_t d2[160];
-                        if (mapped)
-                            swprintf(d2, 160,
-                                     L"%s is set up. Press a button to rename "
-                                     L"it.", g_pad_name);
-                        else
-                            swprintf(d2, 160,
-                                     L"%s has not been set up. Its buttons are "
-                                     L"only numbered until it is.", g_pad_name);
-                        RECT dr = {content_x() + CARD_ICON, y + 30,
-                                   content_x() + content_w() - CARD_CTRL - 12,
-                                   y + 48};
-                        g_rt_main->DrawText(d2, (UINT32)wcslen(d2), g_tf_label,
-                                            to_f(dr),
-                                            mapped ? (ID2D1Brush*)g_br_main_dim
-                                                   : g_br_main_status);
-                    }
-                    RECT nb = setup_btn_rect();
-                    draw_control(g_rt_main, to_f(nb), 6.0f, g_br_main_key, NULL);
-                    if (g_tf_body) {
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(mapped ? L"Edit" : L"Set up",
-                                            mapped ? 4 : 6, g_tf_body,
-                                            to_f(nb), g_br_main_text);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
-
-                // Trackbars: rounded channel            // Trackbars: rounded channel + accent fill + round thumb.
-                for (int i = 0; i < NTRACKS; i++) {
-                    RECT r = slide_track(i);
-                    float left = (float)r.left, right = (float)r.right;
-                    float cy = (float)((r.top + r.bottom) / 2);
-                    g_rt_main->FillRoundedRectangle(
-                        D2D1::RoundedRect(D2D1::RectF(left, cy - 2, right, cy + 3), 2.5f, 2.5f),
-                        g_br_main_key);
-                    int pos = track_current_pos(i);
-                    double frac = (double)(pos - kTrackLo[i]) / (double)(kTrackHi[i] - kTrackLo[i]);
-                    float tx = left + (float)(frac * (right - left));
-                    if (tx > left + 4)
-                        g_rt_main->FillRoundedRectangle(
-                            D2D1::RoundedRect(D2D1::RectF(left, cy - 2, tx, cy + 3), 2.5f, 2.5f),
-                            g_br_main_sel);
-                    // Glow under the thumb while dragging - feedback the old flat
-                    // GDI Ellipse couldn't give.
-                    D2D1_ELLIPSE thumb = D2D1::Ellipse(D2D1::Point2F(tx, cy), 8.0f, 8.0f);
-                    if (g_drag_track == i && g_br_main_glow) {
-                        for (int k = 3; k >= 1; k--) {
-                            g_br_main_glow->SetOpacity(0.22f / k);
-                            g_rt_main->FillEllipse(
-                                D2D1::Ellipse(thumb.point, 8.0f + 3.5f * k, 8.0f + 3.5f * k),
-                                g_br_main_glow);
-                        }
-                        g_br_main_glow->SetOpacity(1.0f);
-                    }
-                    g_rt_main->FillEllipse(thumb, g_br_main_sel);
-                    // Small white centre so the thumb reads against the fill.
-                    g_rt_main->FillEllipse(D2D1::Ellipse(thumb.point, 3.0f, 3.0f),
-                                           g_br_main_white);
-                }
-
-                // Value readouts, right-aligned like the old SS_RIGHT statics.
-                if (g_tf_body) {
-                    const wchar_t* vals[NTRACKS] = {g_mouse_val_txt, g_scroll_val_txt,
-                                                    g_dz_val_txt, g_curve_val_txt};
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    for (int i = 0; i < NTRACKS; i++)
-                        g_rt_main->DrawText(vals[i], (UINT32)wcslen(vals[i]),
-                                            g_tf_body, to_f(slide_value(i)), g_br_main_text);
-                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
-
-                // Toggle switches: pill track + sliding white knob.
-                bool toggle_on[NTOGGLES] = {c.enabled, c.game_pause,
-                                            startup_enabled()};
-                for (int i = 0; i < NTOGGLES; i++) {
-                    RECT r = toggle_rect(i);
-                    float h = (float)(r.bottom - r.top);
-                    g_rt_main->FillRoundedRectangle(
-                        D2D1::RoundedRect(D2D1::RectF((float)r.left, (float)r.top,
-                                                      (float)r.right, (float)r.bottom), h / 2, h / 2),
-                        toggle_on[i] ? g_br_main_sel : g_br_main_toggle_off);
-                    float d = h - 6;
-                    float kx = toggle_on[i] ? (float)r.right - 3 - d : (float)r.left + 3;
-                    // Windows 11 dark theme puts a black knob on the accent fill
-                    // and a white one on the off state, since the dark accent is a
-                    // light blue.
-                    g_rt_main->FillEllipse(
-                        D2D1::Ellipse(D2D1::Point2F(kx + d / 2, (float)r.top + 3 + d / 2), d / 2, d / 2),
-                        toggle_on[i] ? (ID2D1Brush*)g_br_main_onacc : g_br_main_white);
-                }
-
-
-                // Which search the keyboard-hold opens.
-                for (int i = 0; i < NSEARCH; i++) {
-                    D2D1_ROUNDED_RECT rr =
-                        D2D1::RoundedRect(to_f(search_seg(i)), 8.0f, 8.0f);
-                    bool on = (c.search_mode == i);
-                    if (on) g_rt_main->FillRoundedRectangle(rr, g_br_main_sel);
-                    else    g_rt_main->DrawRoundedRectangle(rr, g_br_main_key, 1.2f);
-                    if (g_tf_body) {
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(kSearchName[i],
-                                            (UINT32)wcslen(kSearchName[i]),
-                                            g_tf_body, to_f(search_seg(i)),
-                                            on ? (ID2D1Brush*)g_br_main_onacc
-                                               : g_br_main_dim);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
-
-                // The hotkey that summons the third-party launcher.
-                if (c.search_mode == 1) {
-                    RECT hk = search_key_rect();
-                    draw_control(g_rt_main, to_f(hk), 6.0f,
-                                 g_hotkey_capture ? g_br_main_armed : g_br_main_key,
-                                 NULL);
-                    if (g_tf_body) {
-                        wchar_t kn[48];
-                        if (g_hotkey_capture) wcscpy(kn, L"Press keys...");
-                        else hotkey_name(c.search_mods, c.search_vk, kn, 48);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_body,
-                                            to_f(hk), g_br_main_text);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
-
-                // Install button, only while HidHide is missing.
-                if (g_hh == INVALID_HANDLE_VALUE) {
-                    RECT r = hid_btn_rect();
-                    g_rt_main->FillRoundedRectangle(
-                        D2D1::RoundedRect(to_f(r), 10.0f, 10.0f), g_br_main_key);
-                    if (g_tf_body) {
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        g_rt_main->DrawText(L"Install", 7, g_tf_body, to_f(r), g_br_main_text);
-                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    }
-                }
+                ui_home(c);
             }
 
+            g_rt_main->PopAxisAlignedClip();
             g_rt_main->SetTransform(D2D1::Matrix3x2F::Identity());
+            ui_sidebar();
+            int extent=win_height();
+            if (extent>g_ch) {
+                float th=(float)g_ch*g_ch/extent;
+                float top=(float)g_scroll/extent*g_ch;
+                g_br_main_glow->SetOpacity(.28f);
+                draw_control(g_rt_main,D2D1::RectF((float)g_cw-7,top+3,(float)g_cw-4,top+th-3),1.5f,g_br_main_glow,NULL);
+                g_br_main_glow->SetOpacity(1);
+            }
             HRESULT hr = g_rt_main->EndDraw();
             if (g_mica_main.active && SUCCEEDED(hr))
                 g_mica_main.swap->Present(1, 0);
@@ -6857,6 +6492,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER: {
+        if (wp==90) {
+            if (--g_ui_frames<=0 || !IsWindowVisible(hwnd)) KillTimer(hwnd,90);
+            InvalidateRect(hwnd,NULL,FALSE); return 0;
+        }
         // The setup page shows live axis values, so it repaints on the tick
         // rather than only when something is clicked.
         if (g_page == 3) InvalidateRect(hwnd, NULL, FALSE);
@@ -7238,7 +6877,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     g_mica_capable = os_supports_mica();
 
-    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(win_height())};
+    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(820)};
     DWORD style = WS_OVERLAPPEDWINDOW;   // resizable: content reflows
     AdjustWindowRect(&r, style, FALSE);
     // Opening wide enough for the longest description is no good if that is

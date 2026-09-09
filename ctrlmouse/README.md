@@ -6,6 +6,14 @@ exe, no dependencies, no drivers, no installer.
 Works with DualSense / DualShock and other DirectInput controllers as well as
 XInput pads.
 
+## The settings window
+
+A navigation rail down the left switches between **Overview**, **Button
+layout**, **Per-app rules** and **Name the buttons**; the rail collapses to
+icons when the window is too narrow to keep both it and a readable content
+column. Overview carries the controller status panel, the pointer sliders two
+to a row, and the switches.
+
 ## Controls
 
 Every action below is rebindable: open **Button layout** in the settings
