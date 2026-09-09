@@ -1074,6 +1074,9 @@ static volatile bool g_batt_from_report = false;  // report beats the property
 // then hid_poll can only hand back the zeroed placeholder from the open, which
 // must not be mistaken for "every button released".
 static bool     g_hid_have_report = false;
+static bool     g_hid_generic = false;   // descriptor-driven, not DualSense
+
+static void hid_free_preparsed();
 
 static void hid_close() {
     if (g_hid != INVALID_HANDLE_VALUE) {
@@ -1081,6 +1084,8 @@ static void hid_close() {
         CloseHandle(g_hid);
         g_hid = INVALID_HANDLE_VALUE;
     }
+    hid_free_preparsed();
+    g_hid_generic = false;
     if (g_hid_ov.hEvent) { CloseHandle(g_hid_ov.hEvent); g_hid_ov.hEvent = NULL; }
     memset(&g_hid_state, 0, sizeof(g_hid_state));
     g_hid_state.hat = -1;
@@ -1112,6 +1117,7 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     if (!ok || caps.InputReportByteLength < 10) { CloseHandle(h); return false; }
 
     g_hid = h;
+    g_hid_generic = false;
     g_hid_inlen = caps.InputReportByteLength;
     if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
     // Transport decides how a report ID of 0x01 is laid out, and it cannot be
@@ -1209,6 +1215,210 @@ static bool path_is_dualsense(const wchar_t* path) {
     return ok;
 }
 
+
+// --- Generic HID gamepad ----------------------------------------------------
+// The DualSense gets a hand-written parser above because its reports are laid
+// out differently over USB and Bluetooth and neither is worth guessing at.
+// Every other pad describes itself: a HID report descriptor says which bits
+// are which axis and which are buttons, and HidP_* decodes a report against
+// it. That is what this reads.
+//
+// Doing it this way, rather than through DirectInput, is also what makes such
+// a pad hideable. HidHide's whitelist covers this process opening the device
+// itself; it does not cover DirectInput, which stops finding a device the
+// moment it is hidden. Same handle, same whitelist, so the pad stays ours.
+#define HID_PAGE_GENERIC 0x01
+#define HID_PAGE_BUTTON  0x09
+#define HID_USAGE_X      0x30
+#define HID_USAGE_Y      0x31
+#define HID_USAGE_Z      0x32
+#define HID_USAGE_RX     0x33
+#define HID_USAGE_RY     0x34
+#define HID_USAGE_RZ     0x35
+#define HID_USAGE_HAT    0x39
+#define HID_USAGE_JOYSTICK 0x04
+#define HID_USAGE_GAMEPAD  0x05
+
+struct HidVal {
+    bool   present;
+    USAGE  usage;
+    LONG   lmin, lmax;
+    USHORT bits;
+};
+
+static PHIDP_PREPARSED_DATA g_hid_pp = NULL; // kept for the life of the handle
+static HidVal g_hv_lx, g_hv_ly, g_hv_rx, g_hv_ry, g_hv_lt, g_hv_rt, g_hv_hat;
+static USHORT g_hid_vid = 0, g_hid_pid = 0;
+
+static void hid_free_preparsed() {
+    if (g_hid_pp) { HidD_FreePreparsedData(g_hid_pp); g_hid_pp = NULL; }
+}
+
+// One axis, normalised to the -1000..1000 the rest of the app works in.
+static int hid_read_axis(const HidVal& a, const BYTE* buf, DWORD len) {
+    if (!a.present || !g_hid_pp) return 0;
+    ULONG raw = 0;
+    if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, a.usage, &raw,
+                           g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
+        return 0;
+    // A descriptor with a negative logical minimum is reporting a signed
+    // value, which arrives here as the raw bits and has to be extended.
+    LONG v = (LONG)raw;
+    if (a.lmin < 0 && a.bits > 0 && a.bits < 32 &&
+        (raw & (1ul << (a.bits - 1))))
+        v = (LONG)(raw | (~0ul << a.bits));
+    double span = (double)a.lmax - (double)a.lmin;
+    if (span <= 0.0) return 0;
+    double n = ((double)v - (double)a.lmin) / span;      // 0..1
+    int out = (int)((n * 2.0 - 1.0) * 1000.0);
+    if (out >  1000) out =  1000;
+    if (out < -1000) out = -1000;
+    return out;
+}
+
+// Hats come as 4 or 8 positions, with anything outside the range meaning
+// centred. Folded to the same 0=up,1=right,2=down,3=left the rest uses.
+static int hid_read_hat(const BYTE* buf, DWORD len) {
+    if (!g_hv_hat.present || !g_hid_pp) return -1;
+    ULONG raw = 0;
+    if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, HID_USAGE_HAT, &raw,
+                           g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
+        return -1;
+    LONG v = (LONG)raw - g_hv_hat.lmin;
+    LONG n = g_hv_hat.lmax - g_hv_hat.lmin + 1;
+    if (v < 0 || v >= n) return -1;
+    if (n <= 4) return (int)v;
+    return (int)(((v + 1) / 2) % 4);      // 8-way, diagonals fold to a cardinal
+}
+
+static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st) {
+    if (!g_hid_pp) return false;
+    st.lx = hid_read_axis(g_hv_lx, buf, len);
+    st.ly = hid_read_axis(g_hv_ly, buf, len);
+    st.rx = hid_read_axis(g_hv_rx, buf, len);
+    st.ry = hid_read_axis(g_hv_ry, buf, len);
+    st.hat = hid_read_hat(buf, len);
+
+    st.mask = 0;
+    USAGE list[64];
+    ULONG n = 64;
+    if (HidP_GetUsages(HidP_Input, HID_PAGE_BUTTON, 0, list, &n, g_hid_pp,
+                       (PCHAR)buf, len) == HIDP_STATUS_SUCCESS)
+        for (ULONG i = 0; i < n; i++)
+            if (list[i] >= 1 && list[i] <= 16)
+                st.mask |= 1u << (list[i] - 1);
+
+    // Triggers that live on their own axes rather than as buttons become
+    // buttons here, the way the D-pad does, so they can be bound at all.
+    if (g_hv_lt.present && hid_read_axis(g_hv_lt, buf, len) > 200)
+        st.mask |= 1u << BTN_LTRIG;
+    if (g_hv_rt.present && hid_read_axis(g_hv_rt, buf, len) > 200)
+        st.mask |= 1u << BTN_RTRIG;
+    return true;
+}
+
+// Work out from the descriptor where everything is. Returns false if this
+// collection does not look like something with a stick and some buttons.
+static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
+    g_hv_lx = g_hv_ly = g_hv_rx = g_hv_ry = HidVal{};
+    g_hv_lt = g_hv_rt = g_hv_hat = HidVal{};
+    if (!caps.NumberInputValueCaps) return false;
+
+    USHORT n = caps.NumberInputValueCaps;
+    HIDP_VALUE_CAPS* vc = (HIDP_VALUE_CAPS*)calloc(n, sizeof(HIDP_VALUE_CAPS));
+    if (!vc) return false;
+    HidVal found[6] = {};        // X Y Z Rx Ry Rz, in that order
+    bool hat = false;
+    HidVal hatv = {};
+    if (HidP_GetValueCaps(HidP_Input, vc, &n, pp) == HIDP_STATUS_SUCCESS) {
+        for (USHORT i = 0; i < n; i++) {
+            if (vc[i].UsagePage != HID_PAGE_GENERIC || vc[i].IsRange) continue;
+            USAGE u = vc[i].NotRange.Usage;
+            HidVal v = {true, u, vc[i].LogicalMin, vc[i].LogicalMax,
+                        vc[i].BitSize};
+            if (u == HID_USAGE_HAT) { hat = true; hatv = v; }
+            else if (u >= HID_USAGE_X && u <= HID_USAGE_RZ)
+                found[u - HID_USAGE_X] = v;
+        }
+    }
+    free(vc);
+
+    HidVal X = found[0], Y = found[1], Z = found[2];
+    HidVal RX = found[3], RY = found[4], RZ = found[5];
+    if (!X.present || !Y.present) return false;
+
+    g_hv_lx = X;
+    g_hv_ly = Y;
+    g_hv_hat = hat ? hatv : HidVal{};
+
+    // Where the right stick lives is the one thing pads genuinely disagree
+    // on. Rx and Ry means an XInput-shaped descriptor, and Z and Rz are then
+    // the triggers; otherwise Z and Rz are the stick.
+    if (RX.present && RY.present) {
+        g_hv_rx = RX;
+        g_hv_ry = RY;
+        g_hv_lt = Z;
+        g_hv_rt = RZ;
+        // Rx and Ry with no Rz is the shape an XInput pad describes, and
+        // its button order comes with it. Anything else gets numbered
+        // buttons, which are never wrong even when the make is unknown.
+        g_pad_layout = RZ.present ? PADL_GENERIC : PADL_XINPUT;
+    } else {
+        g_hv_rx = Z;             // Z and Rz, where there is no Rx and Ry
+        g_hv_ry = RZ;
+        g_pad_layout = PADL_GENERIC;
+    }
+    return true;
+}
+
+// Open any HID gamepad or joystick, whatever make it is.
+static bool hid_try_path_generic(const wchar_t* path, bool exclusive) {
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE),
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    PHIDP_PREPARSED_DATA pp = NULL;
+    HIDP_CAPS caps = {};
+    if (!HidD_GetPreparsedData(h, &pp)) { CloseHandle(h); return false; }
+    if (HidP_GetCaps(pp, &caps) != HIDP_STATUS_SUCCESS ||
+        caps.UsagePage != HID_PAGE_GENERIC ||
+        (caps.Usage != HID_USAGE_GAMEPAD && caps.Usage != HID_USAGE_JOYSTICK) ||
+        !caps.NumberInputButtonCaps || !hid_map_generic(pp, caps)) {
+        HidD_FreePreparsedData(pp);
+        CloseHandle(h);
+        return false;
+    }
+
+    hid_free_preparsed();
+    g_hid_pp = pp;               // the parser needs this for every report
+    g_hid = h;
+    g_hid_generic = true;
+    g_hid_bt = false;
+    g_hid_inlen = caps.InputReportByteLength;
+    if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
+    g_hid_ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hid_pending = false;
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+    g_hid_gen++;
+    g_hid_have_report = false;
+
+    HIDD_ATTRIBUTES attr = {sizeof(attr)};
+    if (HidD_GetAttributes(h, &attr)) {
+        g_hid_vid = attr.VendorID;
+        g_hid_pid = attr.ProductID;
+    }
+    wchar_t prod[128] = L"";
+    if (HidD_GetProductString(h, prod, sizeof(prod)) && prod[0]) {
+        wcsncpy(g_pad_name, prod, 47);
+        g_pad_name[47] = 0;
+    } else {
+        wcscpy(g_pad_name, L"Controller");
+    }
+    return true;
+}
+
 // Every HID collection a given device exposes, by instance ID, which is what
 // HidHide blacklists by. Hiding only the collection we read from would leave
 // the rest of them visible to whatever else is listening - which for a pad
@@ -1290,6 +1500,31 @@ static bool hid_scan(bool exclusive) {
         free(det);
     }
     SetupDiDestroyDeviceInfoList(set);
+    if (opened) return true;
+
+    // No DualSense. Anything that describes itself as a gamepad will do -
+    // its report descriptor says where everything is, so it can be read
+    // through our own handle like the DualSense is, and hidden like it too.
+    set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                               DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return false;
+    for (DWORD i = 0; !opened &&
+         SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, NULL) &&
+            hid_try_path_generic(det->DevicePath, exclusive))
+            opened = true;
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    // Its own collections, so HidHide has the right thing to hide.
+    if (opened) hid_collect_instances(g_hid_vid, g_hid_pid);
     return opened;
 }
 
@@ -1339,7 +1574,10 @@ static void hid_buttons(const BYTE* b, PadState& st) {
 // The three report layouts the pad can be in. USB 0x01 and Bluetooth extended
 // 0x31 share a payload that differs only by a one-byte header shift; the short
 // Bluetooth 0x01 report orders its fields differently.
+static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st);
+
 static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
+    if (g_hid_generic) return hid_parse_generic(buf, len, st);
     if (len < 10) return false;
     if (buf[0] == 0x01 && g_hid_bt) {          // Bluetooth basic
         // Same axis offsets as the USB layout, but the button bytes sit three

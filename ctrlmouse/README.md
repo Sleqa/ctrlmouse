@@ -22,12 +22,19 @@ Buttons do nothing while that page is open, so pressing one to bind it cannot
 also fire whatever is already on it. The sticks keep working, since they are
 not what is being bound.
 
-Any pad Windows recognises works. A DualSense is talked to directly, for the
-buttons a generic driver hides; everything else goes through DirectInput, and
-the button names follow whichever kind is plugged in - PlayStation names for a
-DualShock-style pad, Xbox names for an XInput one, numbers for anything else.
-The stock bindings are the PlayStation ones, so on another pad they will land
-somewhere arbitrary until rebound.
+Any pad Windows recognises works. Pads are read over raw HID: a DualSense has
+a hand-written parser, since its reports differ between USB and Bluetooth, and
+everything else is decoded from its own HID report descriptor. DirectInput is
+kept only as a last resort for anything that fails to describe itself.
+
+Reading a pad through our own handle is also what lets HidHide hide it - its
+whitelist covers this process opening the device, not DirectInput, which stops
+finding a device the moment it is hidden.
+
+Button names follow whichever pad is plugged in: PlayStation names for a
+DualSense, Xbox names for an XInput-shaped one, numbers otherwise, which are
+never wrong. The stock bindings are the PlayStation ones, so on another pad
+they will land somewhere arbitrary until rebound.
 
 ### Per-app rules
 
