@@ -2212,8 +2212,16 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // D-pad and L3 cannot drive menus or media at the same time as us.
         // Whitelisting ourselves first is what stops us hiding it from
         // ourselves; if that failed we never hide anything.
+        //
+        // Only for a pad we read through our own HID handle. Being on
+        // HidHide's whitelist covers this process opening the device itself,
+        // which is what that backend does - it does not carry DirectInput,
+        // which stops finding the device the moment it is hidden. Hiding one
+        // of those takes the controller away from us along with everyone
+        // else, which is worse than not hiding it at all.
         if (g_hh != INVALID_HANDLE_VALUE)
-            hh_hide(now_exclusive && g_pad_inst_count > 0);
+            hh_hide(now_exclusive && g_pad_inst_count > 0 &&
+                    g_hid != INVALID_HANDLE_VALUE);
 
         Sleep(8);  // ~120 Hz
     }
@@ -4937,6 +4945,9 @@ static const wchar_t* hide_status_text() {
         return L"HidHide is installed but needs admin once - restart ctrlmouse as administrator.";
     if (!g_pad_inst_count)
         return L"HidHide is ready, but no controller was found to hide.";
+    if (g_hid == INVALID_HANDLE_VALUE)
+        return L"This controller is read through DirectInput, which cannot see "
+               L"a hidden device - so it is left visible to other apps.";
     return g_hh_hiding
         ? L"This controller is hidden from other apps while the mapping is on."
         : L"HidHide is ready. The controller is hidden while the mapping is on.";
