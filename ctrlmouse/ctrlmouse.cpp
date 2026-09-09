@@ -4471,6 +4471,7 @@ static void lx_nav(int dir) {
 static CRITICAL_SECTION g_med_cs;
 static HANDLE   g_med_thread = NULL;
 static volatile bool g_med_poll = false;   // the flyout wants updates
+static volatile bool g_med_run = true;     // the thread itself should live
 static bool     g_med_have = false;        // there is a session at all
 static double   g_med_pos = 0.0;           // seconds, when last sampled
 static double   g_med_dur = 0.0;
@@ -4479,10 +4480,14 @@ static ULONGLONG g_med_stamp = 0;          // tick when pos was sampled
 
 static DWORD WINAPI med_poll_proc(LPVOID) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    double last_reported = -1.0;      // the app's own number, last time round
     winrt::Windows::Media::Control::
         GlobalSystemMediaTransportControlsSessionManager mgr{nullptr};
-    while (g_med_poll) {
+    // One thread for the life of the app, idling when nothing is asking.
+    // Starting and stopping one per flyout raced: closing and reopening
+    // quickly set the flag back before the old thread had noticed it clear,
+    // and left two of them polling.
+    while (g_med_run) {
+        if (!g_med_poll) { Sleep(100); continue; }
         bool have = false, playing = false;
         double pos = 0.0, dur = 0.0;
         try {
@@ -4501,50 +4506,57 @@ static DWORD WINAPI med_poll_proc(LPVOID) {
                 };
                 pos = to_s(tl.Position()) - to_s(tl.StartTime());
                 dur = to_s(tl.EndTime()) - to_s(tl.StartTime());
+                // The session also says when the app last pushed that
+                // position, which is the whole answer to a player that only
+                // reports one when something happens to it: the real
+                // position is what it said plus however long ago it said it.
+                // Exact, and it needs no history of our own - which is what
+                // the previous guesswork was standing in for.
+                double age = (double)std::chrono::duration_cast<
+                                 std::chrono::milliseconds>(
+                                 winrt::clock::now() - tl.LastUpdatedTime())
+                                 .count() / 1000.0;
+                if (age < 0.0 || age > 86400.0) age = 0.0;   // no timestamp
                 playing = pb.PlaybackStatus() ==
                           GlobalSystemMediaTransportControlsSessionPlaybackStatus::
                               Playing;
+                if (playing) pos += age;
                 have = dur > 0.5;    // a live stream reports no length
             }
         } catch (...) {
             have = false;            // no session, or the app went away
             mgr = nullptr;           // ask for a fresh one next time round
         }
-        // Whether to take this reading as the new baseline. Plenty of
-        // apps - browsers especially - only push a timeline update when
-        // something happens to it, so their reported position sits still
-        // while the track plays on. Re-baselining on every poll pinned the
-        // clock to that stale value: it would creep for 400ms, get reset,
-        // and creep again, which reads as frozen. So the baseline only moves
-        // when the app's own number moves, and between those the clock runs
-        // from here. An app that does keep its position current moves it
-        // every poll, and is followed exactly.
+        // Every reading is already correct for the moment it was taken, so
+        // it simply replaces the last one. Between polls the clock below
+        // carries it forward, which is only for smoothness.
         EnterCriticalSection(&g_med_cs);
-        bool fresh = (have != g_med_have) || (playing != g_med_playing) ||
-                     (pos != last_reported) || (dur != g_med_dur);
-        if (fresh) {
-            g_med_pos = pos;
-            g_med_stamp = GetTickCount64();
-        }
         g_med_have = have;
+        g_med_pos = pos;
         g_med_dur = dur;
         g_med_playing = playing;
+        g_med_stamp = GetTickCount64();
         LeaveCriticalSection(&g_med_cs);
-        last_reported = pos;
-        for (int i = 0; i < 8 && g_med_poll; i++) Sleep(50);
+        for (int i = 0; i < 8 && g_med_poll && g_med_run; i++) Sleep(50);
     }
     winrt::uninit_apartment();
     return 0;
 }
 
 static void med_poll_start() {
-    if (g_med_poll) return;
     g_med_poll = true;
-    if (g_med_thread) { CloseHandle(g_med_thread); g_med_thread = NULL; }
-    g_med_thread = CreateThread(NULL, 0, med_poll_proc, NULL, 0, NULL);
+    if (!g_med_thread)
+        g_med_thread = CreateThread(NULL, 0, med_poll_proc, NULL, 0, NULL);
 }
 
-static void med_poll_stop() { g_med_poll = false; }
+static void med_poll_stop() {
+    g_med_poll = false;
+    // Forget the track as well: reopening on a different one would
+    // otherwise show the old position until the first sample lands.
+    EnterCriticalSection(&g_med_cs);
+    g_med_have = false;
+    LeaveCriticalSection(&g_med_cs);
+}
 
 // Where the track is now: the last sample, plus however long ago that was if
 // it is still playing, so the bar creeps rather than stepping every poll.
@@ -7102,6 +7114,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         remove_tray_icon();
         d2d_release_main();
         g_running = false;
+        g_med_run = false;      // let the now-playing poller finish too
         if (g_worker) {
             WaitForSingleObject(g_worker, 1000);
             CloseHandle(g_worker);
