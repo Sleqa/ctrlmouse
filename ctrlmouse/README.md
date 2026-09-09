@@ -31,10 +31,19 @@ Reading a pad through our own handle is also what lets HidHide hide it - its
 whitelist covers this process opening the device, not DirectInput, which stops
 finding a device the moment it is hidden.
 
-Button names follow whichever pad is plugged in: PlayStation names for a
-DualSense, Xbox names for an XInput-shaped one, numbers otherwise, which are
-never wrong. The stock bindings are the PlayStation ones, so on another pad
-they will land somewhere arbitrary until rebound.
+### Naming a controller's buttons
+
+A pad's descriptor says how many buttons it has, never what they are called.
+Anything past the face buttons - back paddles especially - has no conventional
+name to guess at, so **Name the buttons** in the settings window lets you say:
+press a button, type what it is, Enter. Names are kept against the
+controller's vendor and product ids, so unplugging it and plugging it back in
+gets them back.
+
+Until a pad is named its buttons are numbered, except where its shape gives it
+away - a DualSense gets PlayStation names, an XInput-shaped pad Xbox ones. The
+stock bindings are the PlayStation ones, so on another pad they will land
+somewhere arbitrary until rebound.
 
 ### Per-app rules
 
@@ -149,9 +158,10 @@ a version resource. Win32 + DirectInput + GDI only — no third-party libraries.
 
 Settings are saved automatically to `config.json` in
 `%APPDATA%\ctrlmouse`, alongside `apps.txt` (the launcher list, one path per
-line) and `apps-rules.txt` (the per-app rules: executable, display name,
-flags, and that app's layout, tab separated). Settings written by older
-builds are moved there on first run.
+line), `apps-rules.txt` (the per-app rules: executable, display name, flags,
+and that app's layout, tab separated) and `pads.txt` (button names per
+controller: vendor id, product id, button index, name). Settings written by
+older builds are moved there on first run.
 
 | Key | Meaning | Default |
 |---|---|---|

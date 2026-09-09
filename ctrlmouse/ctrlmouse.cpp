@@ -97,6 +97,11 @@ static const char* kBindKeyA[F_COUNT] = {
 // they get folded into the mask the same way the D-pad is.
 #define BTN_LTRIG      20
 #define BTN_RTRIG      21
+// Buttons 17 and up - back paddles, extra shoulder buttons - in the bits the
+// D-pad and triggers left over. A pad with more of them than this has more
+// than 32 inputs, which nothing here can carry.
+#define BTN_EXTRA_BASE 22
+#define BTN_EXTRA_N    10
 
 // Pads do not agree on where the right stick lives or what the buttons are
 // called, and guessing wrong is how Start ends up labelled L2. The layout is
@@ -557,6 +562,126 @@ static const WORD kMediaFlyVk[NMEDIA] = {
 // something different the second time.
 static bool media_repeats(int i) { return i == 1 || i == NMEDIA - 2; }
 
+
+
+// --- Per-controller button names --------------------------------------------
+// A pad's report descriptor says how many buttons it has, never what they are
+// called. Anything beyond the obvious face buttons - back paddles especially -
+// has no conventional name and no way to guess one, and guessing wrong is how
+// Select ended up labelled L2.
+//
+// So the pad is named once, by hand: press a button, say what it is. The names
+// are kept against the controller's vendor and product ids, so unplugging it
+// and plugging it back in - or rebooting - gets them back.
+#define NPADPROF     8            // controllers remembered
+#define NPADBTNNAME 32            // one per bit of the button mask
+
+struct PadProfile {
+    USHORT vid, pid;
+    bool   used;
+    std::wstring product;
+    std::wstring name[NPADBTNNAME];
+};
+static PadProfile g_padprof[NPADPROF];
+static int        g_padprof_count = 0;
+// Which profile the connected pad uses, -1 if it has none yet. Written when a
+// pad opens, read by the settings window, so it lives under g_cs.
+static volatile int g_pad_prof = -1;
+
+static std::wstring pads_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"pads.txt";
+}
+
+// Caller holds g_cs.
+static int padprof_find(USHORT vid, USHORT pid) {
+    for (int i = 0; i < g_padprof_count; i++)
+        if (g_padprof[i].used && g_padprof[i].vid == vid &&
+            g_padprof[i].pid == pid)
+            return i;
+    return -1;
+}
+
+static int padprof_add(USHORT vid, USHORT pid, const wchar_t* product) {
+    int at = padprof_find(vid, pid);
+    if (at >= 0) return at;
+    if (g_padprof_count >= NPADPROF) {
+        // Oldest out. Eight controllers is already more than anyone plugs
+        // into one machine.
+        for (int j = 0; j + 1 < NPADPROF; j++) g_padprof[j] = g_padprof[j + 1];
+        g_padprof_count = NPADPROF - 1;
+    }
+    PadProfile& p = g_padprof[g_padprof_count];
+    p = PadProfile();
+    p.used = true;
+    p.vid = vid;
+    p.pid = pid;
+    p.product = product ? product : L"";
+    return g_padprof_count++;
+}
+
+// True once at least one button has been named: what tells a controller that
+// has been set up from one that has only been seen.
+static bool padprof_mapped(int at) {
+    if (at < 0 || at >= g_padprof_count) return false;
+    for (int i = 0; i < NPADBTNNAME; i++)
+        if (!g_padprof[at].name[i].empty()) return true;
+    return false;
+}
+
+// One line per named button: vendor, product, index, name. Tab separated,
+// because a name is whatever the user typed.
+static void padprof_load() {
+    EnterCriticalSection(&g_cs);
+    g_padprof_count = 0;
+    FILE* f = _wfopen(pads_path().c_str(), L"rb, ccs=UTF-8");
+    if (f) {
+        wchar_t line[512];
+        while (fgetws(line, 512, f)) {
+            size_t n = wcslen(line);
+            while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r'))
+                line[--n] = 0;
+            if (!n) continue;
+            wchar_t* ctx = NULL;
+            wchar_t* a = wcstok(line, L"\t", &ctx);
+            wchar_t* b = wcstok(NULL, L"\t", &ctx);
+            wchar_t* c = wcstok(NULL, L"\t", &ctx);
+            wchar_t* d = wcstok(NULL, L"\t", &ctx);
+            if (!a || !b || !c || !d) continue;
+            int idx = _wtoi(c);
+            if (idx < 0 || idx >= NPADBTNNAME) continue;
+            int at = padprof_add((USHORT)_wtoi(a), (USHORT)_wtoi(b), NULL);
+            if (at >= 0) g_padprof[at].name[idx] = d;
+        }
+        fclose(f);
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+// Caller holds g_cs.
+static void padprof_save() {
+    FILE* f = _wfopen(pads_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_padprof_count; i++) {
+        if (!g_padprof[i].used) continue;
+        for (int b = 0; b < NPADBTNNAME; b++)
+            if (!g_padprof[i].name[b].empty())
+                fwprintf(f, L"%u\t%u\t%d\t%s\n", g_padprof[i].vid,
+                         g_padprof[i].pid, b, g_padprof[i].name[b].c_str());
+    }
+    fclose(f);
+}
+
+// Called when a pad opens, from the worker.
+static void padprof_bind(USHORT vid, USHORT pid, const wchar_t* product) {
+    EnterCriticalSection(&g_cs);
+    int at = padprof_find(vid, pid);
+    if (at < 0) at = padprof_add(vid, pid, product);
+    else if (product && *product) g_padprof[at].product = product;
+    g_pad_prof = at;
+    LeaveCriticalSection(&g_cs);
+}
 
 // --- Per-app rules ----------------------------------------------------------
 // Two things keyed off whichever app is in front, sharing one list because
@@ -1075,6 +1200,7 @@ static volatile bool g_batt_from_report = false;  // report beats the property
 // must not be mistaken for "every button released".
 static bool     g_hid_have_report = false;
 static bool     g_hid_generic = false;   // descriptor-driven, not DualSense
+static USHORT   g_hid_vid = 0, g_hid_pid = 0;   // whose pad it is
 
 static void hid_free_preparsed();
 
@@ -1140,8 +1266,11 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     // This backend only ever talks to a DualSense, so the PlayStation names
     // are right by construction here.
     g_pad_layout = PADL_PS;
+    g_hid_vid = attr.VendorID;
+    g_hid_pid = attr.ProductID;
     wcscpy(g_pad_name, attr.ProductID == PID_DUALSENSE_EDGE ? L"DualSense Edge"
                                                             : L"DualSense");
+    padprof_bind(g_hid_vid, g_hid_pid, g_pad_name);
     return true;
 }
 
@@ -1248,7 +1377,6 @@ struct HidVal {
 
 static PHIDP_PREPARSED_DATA g_hid_pp = NULL; // kept for the life of the handle
 static HidVal g_hv_lx, g_hv_ly, g_hv_rx, g_hv_ry, g_hv_lt, g_hv_rt, g_hv_hat;
-static USHORT g_hid_vid = 0, g_hid_pid = 0;
 
 static void hid_free_preparsed() {
     if (g_hid_pp) { HidD_FreePreparsedData(g_hid_pp); g_hid_pp = NULL; }
@@ -1304,9 +1432,12 @@ static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st) {
     ULONG n = 64;
     if (HidP_GetUsages(HidP_Input, HID_PAGE_BUTTON, 0, list, &n, g_hid_pp,
                        (PCHAR)buf, len) == HIDP_STATUS_SUCCESS)
-        for (ULONG i = 0; i < n; i++)
+        for (ULONG i = 0; i < n; i++) {
             if (list[i] >= 1 && list[i] <= 16)
                 st.mask |= 1u << (list[i] - 1);
+            else if (list[i] > 16 && list[i] <= 16 + BTN_EXTRA_N)
+                st.mask |= 1u << (BTN_EXTRA_BASE + (list[i] - 17));
+        }
 
     // Triggers that live on their own axes rather than as buttons become
     // buttons here, the way the D-pad does, so they can be bound at all.
@@ -1416,6 +1547,7 @@ static bool hid_try_path_generic(const wchar_t* path, bool exclusive) {
     } else {
         wcscpy(g_pad_name, L"Controller");
     }
+    padprof_bind(g_hid_vid, g_hid_pid, g_pad_name);
     return true;
 }
 
@@ -1752,10 +1884,14 @@ static bool try_open(const GUID& guid) {
     vp.diph.dwHeaderSize = sizeof(DIPROPHEADER);
     vp.diph.dwHow = DIPH_DEVICE;
     vp.diph.dwObj = 0;
-    if (SUCCEEDED(g_dev->GetProperty(DIPROP_VIDPID, &vp.diph)))
-        hid_collect_instances(LOWORD(vp.dwData), HIWORD(vp.dwData));
-    else
+    if (SUCCEEDED(g_dev->GetProperty(DIPROP_VIDPID, &vp.diph))) {
+        g_hid_vid = LOWORD(vp.dwData);
+        g_hid_pid = HIWORD(vp.dwData);
+        hid_collect_instances(g_hid_vid, g_hid_pid);
+        padprof_bind(g_hid_vid, g_hid_pid, NULL);
+    } else {
         g_pad_inst_count = 0;
+    }
 
     g_dev->Acquire();   // may fail transiently; the poll loop retries
     g_open_guid = guid;
@@ -4965,6 +5101,13 @@ static RECT apps_btn_rect() {
     RECT r = {rx - 116, APPS_Y + 18, rx - 14, APPS_Y + 44};
     return r;
 }
+#define SETUP_Y (APPS_Y + CARD_H + CARD_GAP)
+static RECT setup_row_card() { return card_rect(SETUP_Y); }
+static RECT setup_btn_rect() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 116, SETUP_Y + 18, rx - 14, SETUP_Y + 44};
+    return r;
+}
 static RECT sec3_header() {
     RECT r = {content_x(), SEC3_Y, content_x() + content_w(), SEC3_Y + 20};
     return r;
@@ -5150,7 +5293,49 @@ static RECT wp_row(int i) {
     return r;
 }
 
+// --- Controller setup page --------------------------------------------------
+// Page 3: naming a pad's buttons. Press one, type what it is, Enter. The pad
+// itself only says how many buttons it has, so this is the only way anything
+// beyond the face buttons gets a name worth showing.
+#define SET_HINT_Y   58
+#define SET_CARD_Y   86
+#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 22)
+#define SET_ROW_STEP 28
+#define SET_ROWS_MAX 14
+
+static bool    g_setup_editing = false;      // typing a name for g_bind_btn
+static wchar_t g_setup_text[40] = L"";
+
+static RECT setup_card()  { return card_rect(SET_CARD_Y); }
+static RECT setup_done_btn() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 96, SET_CARD_Y + 18, rx - 14, SET_CARD_Y + 44};
+    return r;
+}
+static RECT setup_row(int i) {
+    int y = SET_LIST_Y + i * SET_ROW_STEP;
+    RECT r = {content_x(), y, content_x() + content_w(), y + SET_ROW_STEP - 4};
+    return r;
+}
+
+// How many buttons this pad has been given names for, and which they are.
+static int setup_named(int* idx, int max) {
+    int n = 0;
+    EnterCriticalSection(&g_cs);
+    int pr = g_pad_prof;
+    if (pr >= 0 && pr < g_padprof_count)
+        for (int b = 0; b < NPADBTNNAME && n < max; b++)
+            if (!g_padprof[pr].name[b].empty()) idx[n++] = b;
+    LeaveCriticalSection(&g_cs);
+    return n;
+}
+
 static int win_height() {
+    if (g_page == 3) {
+        int idx[SET_ROWS_MAX];
+        int n = setup_named(idx, SET_ROWS_MAX);
+        return SET_LIST_Y + (n ? n : 1) * SET_ROW_STEP + 40;
+    }
     if (g_page == 1)
         return (g_bind_target < 0 ? BIND_SC_Y + CARD_H : BIND_SEC2_Y) + 46;
     if (g_page == 2) {
@@ -5162,7 +5347,7 @@ static int win_height() {
         }
         return h;
     }
-    return APPS_Y + CARD_H + 54;
+    return SETUP_Y + CARD_H + 54;
 }
 
 static const wchar_t* kFooterText =
@@ -5278,12 +5463,27 @@ static void button_name(int b, wchar_t* out, size_t n) {
         L"D-pad Up", L"D-pad Right", L"D-pad Down", L"D-pad Left"};
     int layout = g_pad_layout;
     if (b < 0) { swprintf(out, n, L"Unbound"); return; }
+    // Whatever this pad was set up as beats anything worked out from its
+    // shape - it is the only source here that actually knows.
+    if (b < NPADBTNNAME) {
+        EnterCriticalSection(&g_cs);
+        int pr = g_pad_prof;
+        std::wstring given = (pr >= 0 && pr < g_padprof_count)
+                                 ? g_padprof[pr].name[b] : std::wstring();
+        LeaveCriticalSection(&g_cs);
+        if (!given.empty()) {
+            swprintf(out, n, L"%s", given.c_str());
+            return;
+        }
+    }
     if (b >= BTN_DPAD_UP && b <= BTN_DPAD_LEFT) {
         swprintf(out, n, L"%s", dpad[b - BTN_DPAD_UP]);
     } else if (b == BTN_LTRIG) {
         swprintf(out, n, L"Left trigger");
     } else if (b == BTN_RTRIG) {
         swprintf(out, n, L"Right trigger");
+    } else if (b >= BTN_EXTRA_BASE && b < BTN_EXTRA_BASE + BTN_EXTRA_N) {
+        swprintf(out, n, L"Button %d", b - BTN_EXTRA_BASE + 17);
     } else if (layout == PADL_PS && b < 14) {
         swprintf(out, n, L"%s", ps[b]);
     } else if (layout == PADL_XINPUT && b < 10) {
@@ -5366,8 +5566,43 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:
         return 1;   // WM_PAINT clears the whole client area itself
+    case WM_CHAR:
+        // The setup page is the only thing here that takes typed text.
+        if (g_page == 3 && g_setup_editing) {
+            wchar_t ch = (wchar_t)wp;
+            size_t n = wcslen(g_setup_text);
+            if (ch == VK_BACK) {
+                if (n) g_setup_text[n - 1] = 0;
+            } else if (ch >= L' ' && n + 1 < 40) {
+                g_setup_text[n] = ch;
+                g_setup_text[n + 1] = 0;
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        if (g_page == 3 && g_setup_editing &&
+            (msg == WM_KEYDOWN) && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+            int btn = g_bind_btn;
+            if (wp == VK_RETURN && btn >= 0 && btn < NPADBTNNAME &&
+                g_setup_text[0]) {
+                EnterCriticalSection(&g_cs);
+                int pr = g_pad_prof;
+                if (pr >= 0 && pr < g_padprof_count) {
+                    g_padprof[pr].name[btn] = g_setup_text;
+                    padprof_save();
+                }
+                LeaveCriticalSection(&g_cs);
+            }
+            g_setup_editing = false;
+            g_setup_text[0] = 0;
+            g_bind_btn = -1;         // ready for the next one
+            clamp_scroll();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         // Recording a launcher hotkey. Alt combinations arrive as SYSKEYDOWN,
         // hence both messages; bare modifiers are ignored so the combination
         // can be built up before the real key lands.
@@ -5463,6 +5698,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 save_config(nc);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
+            }
+            return 0;
+        }
+        if (g_page == 3) {
+            RECT bb = back_btn_rect();
+            RECT db = setup_done_btn();
+            if (PtInRect(&bb, pt) || PtInRect(&db, pt)) {
+                g_page = 0;
+                g_listen = false;
+                g_setup_editing = false;
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
         }
@@ -5602,6 +5850,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            RECT nb = setup_btn_rect();
+            if (PtInRect(&nb, pt)) {
+                g_page = 3;
+                g_bind_btn = -1;
+                g_setup_editing = false;
+                g_setup_text[0] = 0;
+                g_listen = true;      // report presses, run nothing
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             RECT ab = apps_btn_rect();
             if (PtInRect(&ab, pt)) {
                 g_page = 2;
@@ -5676,6 +5936,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_tf_title && g_br_main_text) {
                 const wchar_t* t = (g_page == 1) ? L"Button layout"
                                  : (g_page == 2) ? L"Per-app rules"
+                                 : (g_page == 3) ? L"Name the buttons"
                                                  : L"ctrlmouse";
                 g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_title,
                                     to_f(title_rect()), g_br_main_text);
@@ -5878,6 +6139,101 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
                 }
+            } else if (g_page == 3) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (g_tf_label) {
+                    const wchar_t* h = g_setup_editing
+                        ? L"Type what that button is called, then press Enter. "
+                          L"Escape forgets it."
+                        : L"Press a button on the controller, then type what "
+                          L"it is called. Every button it has, including any "
+                          L"on the back.";
+                    RECT hr2 = {content_x(), SET_HINT_Y,
+                                content_x() + content_w(), SET_HINT_Y + 20};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
+                }
+
+                // What was pressed, and the name being typed for it.
+                int btn = g_bind_btn;
+                draw_control(g_rt_main, to_f(setup_card()), CARD_R,
+                             btn >= 0 ? (ID2D1Brush*)g_br_main_sel
+                                      : g_br_main_card,
+                             btn >= 0 ? NULL : (ID2D1Brush*)g_br_main_border);
+                if (g_tf_header) {
+                    wchar_t line[96];
+                    if (btn < 0)
+                        wcscpy(line, L"Waiting for a button...");
+                    else if (g_setup_editing)
+                        swprintf(line, 96, L"%s_", g_setup_text);
+                    else
+                        swprintf(line, 96, L"Button %d", btn + 1);
+                    RECT nr = {content_x() + 20, SET_CARD_Y + 12,
+                               content_x() + content_w() - 120,
+                               SET_CARD_Y + 38};
+                    g_rt_main->DrawText(line, (UINT32)wcslen(line), g_tf_header,
+                                        to_f(nr),
+                                        btn >= 0 ? (ID2D1Brush*)g_br_main_onacc
+                                                 : g_br_main_dim);
+                }
+                if (g_tf_label && btn >= 0) {
+                    wchar_t sub[64];
+                    if (g_setup_editing) swprintf(sub, 64, L"Naming button %d",
+                                                  btn + 1);
+                    else                 wcscpy(sub, L"Start typing a name");
+                    RECT sr = {content_x() + 20, SET_CARD_Y + 34,
+                               content_x() + content_w() - 120,
+                               SET_CARD_Y + 52};
+                    g_rt_main->DrawText(sub, (UINT32)wcslen(sub), g_tf_label,
+                                        to_f(sr), g_br_main_onacc);
+                }
+                {
+                    RECT db = setup_done_btn();
+                    draw_control(g_rt_main, to_f(db), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Done", 4, g_tf_body, to_f(db),
+                                            g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // Everything named so far, so it is obvious what is left.
+                int idx[SET_ROWS_MAX];
+                int named = setup_named(idx, SET_ROWS_MAX);
+                if (g_tf_label) {
+                    RECT hd = {content_x(), SET_LIST_Y - 24,
+                               content_x() + content_w(), SET_LIST_Y - 4};
+                    const wchar_t* t = named ? L"NAMED SO FAR"
+                                             : L"Nothing named yet.";
+                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_label,
+                                        to_f(hd), g_br_main_dim);
+                }
+                for (int i = 0; i < named; i++) {
+                    RECT rr = setup_row(i);
+                    EnterCriticalSection(&g_cs);
+                    int pr = g_pad_prof;
+                    std::wstring nm = (pr >= 0 && pr < g_padprof_count)
+                                          ? g_padprof[pr].name[idx[i]]
+                                          : std::wstring();
+                    LeaveCriticalSection(&g_cs);
+                    if (!g_tf_label) continue;
+                    wchar_t num[32];
+                    swprintf(num, 32, L"Button %d", idx[i] + 1);
+                    RECT nr = {rr.left + 8, rr.top, rr.left + 140, rr.bottom};
+                    g_rt_main->DrawText(num, (UINT32)wcslen(num), g_tf_label,
+                                        to_f(nr), g_br_main_dim);
+                    RECT vr = {rr.left + 150, rr.top, rr.right - 8, rr.bottom};
+                    g_rt_main->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                        g_tf_label, to_f(vr), g_br_main_text);
+                }
             } else if (g_page == 2) {
                 RECT bb = back_btn_rect();
                 draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
@@ -6037,6 +6393,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              g_br_main_card, g_br_main_border);
                 draw_control(g_rt_main, to_f(apps_card()), CARD_R,
                              g_br_main_card, g_br_main_border);
+                draw_control(g_rt_main, to_f(setup_row_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
                 {
                     // A small glyph on the left of each card, as WinUI does.
                     const int slideIcon[NTRACKS] = {IC_CURSOR, IC_UPDOWN,
@@ -6168,6 +6526,50 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                         g_rt_main->DrawText(L"Open", 4, g_tf_body, to_f(ab),
                                             g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+                {
+                    int y = SETUP_Y;
+                    EnterCriticalSection(&g_cs);
+                    int pr = g_pad_prof;
+                    bool mapped = padprof_mapped(pr);
+                    LeaveCriticalSection(&g_cs);
+                    draw_feature_icon(g_rt_main, (float)(content_x() + 22),
+                                      (float)y + CARD_H / 2, IC_KEYS,
+                                      g_br_main_sel);
+                    if (g_tf_label) {
+                        RECT nr = {content_x() + CARD_ICON, y + 11,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 29};
+                        g_rt_main->DrawText(L"Name the buttons", 16, g_tf_label,
+                                            to_f(nr), g_br_main_text);
+                        // An unnamed pad is worth pointing at: nothing else
+                        // knows what its extra buttons are.
+                        wchar_t d2[160];
+                        if (mapped)
+                            swprintf(d2, 160,
+                                     L"%s is set up. Press a button to rename "
+                                     L"it.", g_pad_name);
+                        else
+                            swprintf(d2, 160,
+                                     L"%s has not been set up. Its buttons are "
+                                     L"only numbered until it is.", g_pad_name);
+                        RECT dr = {content_x() + CARD_ICON, y + 30,
+                                   content_x() + content_w() - CARD_CTRL - 12,
+                                   y + 48};
+                        g_rt_main->DrawText(d2, (UINT32)wcslen(d2), g_tf_label,
+                                            to_f(dr),
+                                            mapped ? (ID2D1Brush*)g_br_main_dim
+                                                   : g_br_main_status);
+                    }
+                    RECT nb = setup_btn_rect();
+                    draw_control(g_rt_main, to_f(nb), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(mapped ? L"Edit" : L"Set up",
+                                            mapped ? 4 : 6, g_tf_body,
+                                            to_f(nb), g_br_main_text);
                         g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
                 }
@@ -6457,8 +6859,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case GP_PRESSED:
-            if (g_listen && g_bind_btn != (int)lp) {
+            // Not while a name is being typed: a brushed stick would
+            // otherwise throw the half-typed one away without saying so.
+            if (g_listen && g_bind_btn != (int)lp &&
+                !(g_page == 3 && g_setup_editing)) {
                 g_bind_btn = (int)lp;
+                // On the setup page a press is the start of naming it, so
+                // typing can begin straight away without another click.
+                if (g_page == 3) {
+                    g_setup_editing = true;
+                    g_setup_text[0] = 0;
+                    SetFocus(hwnd);
+                }
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             break;
@@ -6530,6 +6942,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_listen = false;
         g_sc_capture = false;
         g_win_picker = false;
+        g_setup_editing = false;
         hide_to_tray(hwnd);  // close button -> tray, keep running
         return 0;
     case WM_DESTROY:
@@ -6628,6 +7041,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     InitializeCriticalSection(&g_med_cs);
     g_cfg = load_config();
     rules_load();
+    padprof_load();
     init_theme();
     d2d_init_process();
 
