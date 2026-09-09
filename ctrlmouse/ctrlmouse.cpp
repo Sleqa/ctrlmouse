@@ -2664,9 +2664,12 @@ static DWORD WINAPI worker_thread(LPVOID) {
         // which stops finding the device the moment it is hidden. Hiding one
         // of those takes the controller away from us along with everyone
         // else, which is worse than not hiding it at all.
-        if (g_hh != INVALID_HANDLE_VALUE)
-            hh_hide(now_exclusive && g_pad_inst_count > 0 &&
-                    g_hid != INVALID_HANDLE_VALUE);
+        if (g_hh != INVALID_HANDLE_VALUE) {
+            bool want_hide = now_exclusive && g_hid != INVALID_HANDLE_VALUE;
+            if (want_hide && !g_pad_inst_count && (g_hid_vid || g_hid_pid))
+                hid_collect_instances(g_hid_vid, g_hid_pid);
+            hh_hide(want_hide && g_pad_inst_count > 0);
+        }
 
         Sleep(8);  // ~120 Hz
     }
@@ -5405,7 +5408,7 @@ static void pad_axis_summary(wchar_t* out, size_t n) {
 // beyond the face buttons gets a name worth showing.
 #define SET_HINT_Y   58
 #define SET_CARD_Y   86
-#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 22)
+#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 40)
 #define SET_ROW_STEP 28
 #define SET_ROWS_MAX 14
 
@@ -6338,6 +6341,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                content_x() + content_w(), SET_LIST_Y - 16};
                     g_rt_main->DrawText(lv, (UINT32)wcslen(lv), g_tf_label,
                                         to_f(lr), g_br_main_dim);
+                    wchar_t hh[200];
+                    swprintf(hh, 200,
+                             L"HidHide: %s, %s, %d collections, %s",
+                             g_hh == INVALID_HANDLE_VALUE ? L"not installed"
+                                                          : L"installed",
+                             g_hh_whitelisted ? L"we are whitelisted"
+                                              : L"NOT whitelisted (needs admin)",
+                             g_pad_inst_count,
+                             g_hh_hiding ? L"hiding now" : L"not hiding");
+                    RECT hr3 = {content_x(), SET_LIST_Y - 16,
+                                content_x() + content_w(), SET_LIST_Y + 2};
+                    g_rt_main->DrawText(hh, (UINT32)wcslen(hh), g_tf_label,
+                                        to_f(hr3), g_br_main_dim);
                 }
                 for (int i = 0; i < named; i++) {
                     RECT rr = setup_row(i);
