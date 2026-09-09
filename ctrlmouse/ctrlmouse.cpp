@@ -5480,6 +5480,15 @@ static const wchar_t* hide_status_text() {
     if (g_hid == INVALID_HANDLE_VALUE)
         return L"This controller is read through DirectInput, which cannot see "
                L"a hidden device - so it is left visible to other apps.";
+    // Hiding covers the HID interfaces, which is every app that reads a pad
+    // as a HID device. A controller in XInput mode is also presented through
+    // the XUSB driver, and XInput reads go there instead - past anything
+    // HidHide can filter. Nothing here can close that; switching the pad to
+    // its DirectInput mode removes the XUSB side altogether.
+    if (g_hh_hiding && g_pad_layout == PADL_XINPUT)
+        return L"Hidden from apps reading it as a controller, but this pad is "
+               L"in XInput mode and games using XInput can still see it. Its "
+               L"DirectInput mode can be hidden completely.";
     return g_hh_hiding
         ? L"This controller is hidden from other apps while the mapping is on."
         : L"HidHide is ready. The controller is hidden while the mapping is on.";

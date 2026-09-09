@@ -31,6 +31,13 @@ Reading a pad through our own handle is also what lets HidHide hide it - its
 whitelist covers this process opening the device, not DirectInput, which stops
 finding a device the moment it is hidden.
 
+Hiding covers the HID interfaces, which is every app that reads a pad as a HID
+device. A controller in **XInput mode** is also presented through the XUSB
+driver, and XInput reads go there instead - past anything HidHide can filter.
+Switching such a pad to its DirectInput mode removes the XUSB side and lets it
+be hidden completely. Note that many pads report a different product id per
+mode, so each mode keeps its own button names.
+
 ### Naming a controller's buttons
 
 A pad's descriptor says how many buttons it has, never what they are called.
