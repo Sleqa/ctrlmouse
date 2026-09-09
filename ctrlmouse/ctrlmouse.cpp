@@ -93,6 +93,22 @@ static const char* kBindKeyA[F_COUNT] = {
 #define BTN_DPAD_RIGHT 17
 #define BTN_DPAD_DOWN  18
 #define BTN_DPAD_LEFT  19
+// An XInput pad puts both triggers on one axis rather than on buttons, so
+// they get folded into the mask the same way the D-pad is.
+#define BTN_LTRIG      20
+#define BTN_RTRIG      21
+
+// Pads do not agree on where the right stick lives or what the buttons are
+// called, and guessing wrong is how Start ends up labelled L2. The layout is
+// worked out from the axes the device actually reports, once, when it opens.
+//
+//   PS      a DualShock/DualSense: right stick on Z and Rz.
+//   XINPUT  anything Windows maps through XInput - which is most third-party
+//           pads in their default mode - right stick on Rx and Ry, no Rz,
+//           and a different button order entirely.
+enum { PADL_PS = 0, PADL_XINPUT, PADL_GENERIC };
+static volatile int  g_pad_layout = PADL_PS;
+static volatile bool g_pad_rstick_rxry = false;
 
 // A button can also send a keyboard shortcut instead of, or as well as, one
 // of the actions above. Slots rather than an entry per button, so the config
@@ -1115,6 +1131,9 @@ static bool hid_try_path(const wchar_t* path, bool exclusive) {
     g_hid_state.hat = -1;
     g_hid_gen++;
     g_hid_have_report = false;
+    // This backend only ever talks to a DualSense, so the PlayStation names
+    // are right by construction here.
+    g_pad_layout = PADL_PS;
     wcscpy(g_pad_name, attr.ProductID == PID_DUALSENSE_EDGE ? L"DualSense Edge"
                                                             : L"DualSense");
     return true;
@@ -1344,6 +1363,19 @@ static bool hid_poll(PadState& out) {
 static LPDIRECTINPUT8       g_di = NULL;
 static LPDIRECTINPUTDEVICE8 g_dev = NULL;
 
+struct AxisScan { bool x, y, z, rx, ry, rz; };
+
+static BOOL CALLBACK axis_cb(LPCDIDEVICEOBJECTINSTANCEW o, LPVOID pv) {
+    AxisScan* a = (AxisScan*)pv;
+    if      (IsEqualGUID(o->guidType, GUID_XAxis))  a->x = true;
+    else if (IsEqualGUID(o->guidType, GUID_YAxis))  a->y = true;
+    else if (IsEqualGUID(o->guidType, GUID_ZAxis))  a->z = true;
+    else if (IsEqualGUID(o->guidType, GUID_RxAxis)) a->rx = true;
+    else if (IsEqualGUID(o->guidType, GUID_RyAxis)) a->ry = true;
+    else if (IsEqualGUID(o->guidType, GUID_RzAxis)) a->rz = true;
+    return DIENUM_CONTINUE;
+}
+
 static double apply_deadzone(double value, double dz) {
     double a = fabs(value);
     if (a < dz) return 0.0;
@@ -1409,9 +1441,20 @@ static bool try_open(const GUID& guid) {
         drop_device();
         return false;
     }
-    set_axis_range(DIJOFS_X);
-    set_axis_range(DIJOFS_Y);
-    set_axis_range(DIJOFS_RZ);
+    // Which axes exist tells us both where the right stick is and what the
+    // buttons should be called.
+    AxisScan ax = {};
+    g_dev->EnumObjects(axis_cb, &ax, DIDFT_ABSAXIS);
+    if (ax.x)  set_axis_range(DIJOFS_X);
+    if (ax.y)  set_axis_range(DIJOFS_Y);
+    if (ax.z)  set_axis_range(DIJOFS_Z);
+    if (ax.rx) set_axis_range(DIJOFS_RX);
+    if (ax.ry) set_axis_range(DIJOFS_RY);
+    if (ax.rz) set_axis_range(DIJOFS_RZ);
+    // Rx and Ry with no Rz is the shape Windows gives an XInput pad.
+    bool xin = ax.rx && ax.ry && !ax.rz;
+    g_pad_rstick_rxry = xin;
+    g_pad_layout = xin ? PADL_XINPUT : (ax.rz ? PADL_PS : PADL_GENERIC);
     g_dev->Acquire();   // may fail transiently; the poll loop retries
     g_open_guid = guid;
     g_hid_gen++;
@@ -1542,10 +1585,18 @@ static DWORD WINAPI worker_thread(LPVOID) {
             }
             st.lx = js.lX;
             st.ly = js.lY;
-            st.ry = js.lRz;
+            if (g_pad_rstick_rxry) { st.rx = js.lRx; st.ry = js.lRy; }
+            else                   { st.rx = js.lZ;  st.ry = js.lRz; }
             st.hat = pov_dir(js.rgdwPOV[0]);
-            for (int bi = 0; bi < 32; bi++)
+            for (int bi = 0; bi < 16; bi++)
                 if (js.rgbButtons[bi] & 0x80) st.mask |= (1u << bi);
+            // An XInput pad shares one axis between the two triggers, one
+            // pushing it each way, so neither is a button until we make it
+            // one. Without this the triggers cannot be bound at all.
+            if (g_pad_rstick_rxry) {
+                if (js.lZ < -400) st.mask |= 1u << BTN_LTRIG;
+                if (js.lZ >  400) st.mask |= 1u << BTN_RTRIG;
+            }
             if (st.mask || st.lx || st.ly || st.ry || st.hat != -1) {
                 g_last_good = g_open_guid;   // remember the real pad, not a virtual one
                 g_have_last_good = true;
@@ -4901,16 +4952,32 @@ static void update_value(int idx) {
 
 // DualSense / DualShock DirectInput button names for the common indices.
 static void button_name(int b, wchar_t* out, size_t n) {
-    static const wchar_t* names[] = {
+    // Named for the pad that is actually plugged in. Calling an 8BitDo's
+    // Select button "L2" because a DualSense has L2 there is worse than not
+    // naming it at all.
+    static const wchar_t* ps[] = {
         L"Square", L"Cross", L"Circle", L"Triangle", L"L1", L"R1", L"L2",
         L"R2", L"Create", L"Options", L"L3", L"R3", L"PS", L"Touchpad"};
+    static const wchar_t* xb[] = {
+        L"A", L"B", L"X", L"Y", L"LB", L"RB", L"Back", L"Start",
+        L"Left stick", L"Right stick"};
     static const wchar_t* dpad[] = {
         L"D-pad Up", L"D-pad Right", L"D-pad Down", L"D-pad Left"};
-    if (b >= 0 && b < 14) swprintf(out, n, L"%s", names[b]);
-    else if (b >= BTN_DPAD_UP && b <= BTN_DPAD_LEFT)
-                          swprintf(out, n, L"%s", dpad[b - BTN_DPAD_UP]);
-    else if (b >= 0)      swprintf(out, n, L"Button %d", b);
-    else                  swprintf(out, n, L"Unbound");
+    int layout = g_pad_layout;
+    if (b < 0) { swprintf(out, n, L"Unbound"); return; }
+    if (b >= BTN_DPAD_UP && b <= BTN_DPAD_LEFT) {
+        swprintf(out, n, L"%s", dpad[b - BTN_DPAD_UP]);
+    } else if (b == BTN_LTRIG) {
+        swprintf(out, n, L"Left trigger");
+    } else if (b == BTN_RTRIG) {
+        swprintf(out, n, L"Right trigger");
+    } else if (layout == PADL_PS && b < 14) {
+        swprintf(out, n, L"%s", ps[b]);
+    } else if (layout == PADL_XINPUT && b < 10) {
+        swprintf(out, n, L"%s", xb[b]);
+    } else {
+        swprintf(out, n, L"Button %d", b + 1);   // as every other tool counts
+    }
 }
 
 // Current trackbar position (in the same integer units the old TBM_* range

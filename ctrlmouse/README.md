@@ -22,6 +22,13 @@ Buttons do nothing while that page is open, so pressing one to bind it cannot
 also fire whatever is already on it. The sticks keep working, since they are
 not what is being bound.
 
+Any pad Windows recognises works. A DualSense is talked to directly, for the
+buttons a generic driver hides; everything else goes through DirectInput, and
+the button names follow whichever kind is plugged in - PlayStation names for a
+DualShock-style pad, Xbox names for an XInput one, numbers for anything else.
+The stock bindings are the PlayStation ones, so on another pad they will land
+somewhere arbitrary until rebound.
+
 ### Per-app rules
 
 **Per-app rules** in the settings window lists apps that get special
