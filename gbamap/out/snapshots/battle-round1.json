@@ -1,0 +1,262 @@
+{
+  "ok": true,
+  "stage": "after",
+  "target": "battle",
+  "description": "a byte that marks or counts battles",
+  "candidates": {
+    "counter (+1)": [
+      {
+        "address": "0x0200033A",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000340",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000379",
+        "before": 5,
+        "after": 6
+      },
+      {
+        "address": "0x0200060B",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000633",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200069C",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000832",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000836",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200083A",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200083E",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200A6E4",
+        "before": 3,
+        "after": 4
+      },
+      {
+        "address": "0x0200A6E6",
+        "before": 1,
+        "after": 2
+      },
+      {
+        "address": "0x0200A731",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200DADC",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200DB84",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200DD9C",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200E002",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ECEE",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ECF5",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ECF6",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ED0C",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ED0E",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ED11",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ED19",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200ED1A",
+        "before": 0,
+        "after": 1
+      }
+    ],
+    "flag (0 -> set)": [
+      {
+        "address": "0x020000B6",
+        "before": 0,
+        "after": 160
+      },
+      {
+        "address": "0x020000C4",
+        "before": 0,
+        "after": 240
+      },
+      {
+        "address": "0x020000C6",
+        "before": 0,
+        "after": 161
+      },
+      {
+        "address": "0x020000CF",
+        "before": 0,
+        "after": 232
+      },
+      {
+        "address": "0x020000D3",
+        "before": 0,
+        "after": 224
+      },
+      {
+        "address": "0x020000D8",
+        "before": 0,
+        "after": 230
+      },
+      {
+        "address": "0x02000338",
+        "before": 0,
+        "after": 204
+      },
+      {
+        "address": "0x02000339",
+        "before": 0,
+        "after": 228
+      },
+      {
+        "address": "0x0200033A",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200033B",
+        "before": 0,
+        "after": 2
+      },
+      {
+        "address": "0x0200033C",
+        "before": 0,
+        "after": 220
+      },
+      {
+        "address": "0x0200033D",
+        "before": 0,
+        "after": 4
+      },
+      {
+        "address": "0x0200033E",
+        "before": 0,
+        "after": 2
+      },
+      {
+        "address": "0x0200033F",
+        "before": 0,
+        "after": 2
+      },
+      {
+        "address": "0x02000340",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000360",
+        "before": 0,
+        "after": 9
+      },
+      {
+        "address": "0x02000361",
+        "before": 0,
+        "after": 5
+      },
+      {
+        "address": "0x020003C0",
+        "before": 0,
+        "after": 152
+      },
+      {
+        "address": "0x020003C1",
+        "before": 0,
+        "after": 2
+      },
+      {
+        "address": "0x02000575",
+        "before": 0,
+        "after": 255
+      },
+      {
+        "address": "0x0200060B",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000633",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x0200069C",
+        "before": 0,
+        "after": 1
+      },
+      {
+        "address": "0x02000830",
+        "before": 0,
+        "after": 248
+      },
+      {
+        "address": "0x02000831",
+        "before": 0,
+        "after": 166
+      }
+    ]
+  }
+}
