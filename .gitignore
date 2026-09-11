@@ -12,5 +12,9 @@ config.json
 # Local tooling
 .claude/
 
-# Sibling project (separate git repo, not part of ctrlmouse)
+# Sibling projects in this folder - each is its own thing, not part of
+# ctrlmouse. A checkpoint commit swept their build caches in here once.
 GBAPal/
+GBAPal-Remake/
+ctrlmouse-astra/
+gbamap/
