@@ -19,7 +19,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-cl /nologo /EHsc /O2 /W3 /DUNICODE /D_UNICODE ctrlmouse.cpp ctrlmouse.res ^
+cl /nologo /EHsc /std:c++17 /O2 /W3 /DUNICODE /D_UNICODE ctrlmouse.cpp ctrlmouse.res ^
    /Fe:ctrlmouse.exe ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED
 

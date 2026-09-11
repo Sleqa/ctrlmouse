@@ -1,0 +1,7053 @@
+// ControllerMouse (ctrlmouse) - map a game controller to mouse input (Windows).
+//
+// Left stick           -> mouse movement
+// Right stick Y-axis   -> scroll wheel
+// Cross/A button       -> left click
+// Circle/B button      -> right click
+//
+// Uses DirectInput, so it works with DualSense/DualShock and other HID pads as
+// well as XInput controllers - no extra software or drivers needed.
+//
+// A normal desktop window. Closing it hides it to the system tray (the mapping
+// keeps running); double-click the tray icon to restore, or right-click it for
+// Show / Quit. Settings persist in config.json next to the exe.
+//
+// Build: run compile.bat (MSVC) or use CMake.
+
+#define _CRT_SECURE_NO_WARNINGS
+#define DIRECTINPUT_VERSION 0x0800
+#include <windows.h>
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+#include <dinput.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <dwmapi.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dcomp.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
+#include <devpropdef.h>
+#include <wincodec.h>
+#include <commoncontrols.h>
+#include <shlobj.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
+extern "C" {
+#include <hidsdi.h>
+}
+#include <string>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dinput8.lib")
+#pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
+
+// Enable Windows visual styles (themed common controls v6) so the UI uses the
+// modern look instead of the classic grey Win95 controls.
+#pragma comment(linker, "\"/manifestdependency:type='win32' "                  \
+    "name='Microsoft.Windows.Common-Controls' version='6.0.0.0' "              \
+    "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+// --- Config ----------------------------------------------------------------
+// Every controller action is rebindable. Fullscreen and the launcher are hold
+// actions; the rest act on press or while held.
+enum { F_LCLICK, F_RCLICK, F_KEYBOARD, F_PLAYPAUSE, F_FULLSCREEN,
+       F_LAUNCHER, F_TOGGLE, F_FORWARD, F_BACK,
+       F_VOLUP, F_VOLDOWN, F_SEEKFWD, F_SEEKBACK, F_MEDIAFLY, F_COUNT };
+static const char* kBindKeyA[F_COUNT] = {
+    "bind_lclick", "bind_rclick", "bind_keyboard", "bind_playpause",
+    "bind_fullscreen", "bind_launcher", "bind_toggle",
+    "bind_forward", "bind_back",
+    "bind_volume_up", "bind_volume_down", "bind_seek_fwd", "bind_seek_back",
+    "bind_media"};
+
+// The D-pad is bindable like anything else. It arrives as a hat rather than
+// four bits, so its directions are folded into the button mask above the ones
+// the pad itself uses - everything downstream then treats them as buttons.
+#define BTN_DPAD_UP    16
+#define BTN_DPAD_RIGHT 17
+#define BTN_DPAD_DOWN  18
+#define BTN_DPAD_LEFT  19
+// An XInput pad puts both triggers on one axis rather than on buttons, so
+// they get folded into the mask the same way the D-pad is.
+#define BTN_LTRIG      20
+#define BTN_RTRIG      21
+// Buttons 17 and up - back paddles, extra shoulder buttons - in the bits the
+// D-pad and triggers left over. A pad with more of them than this has more
+// than 32 inputs, which nothing here can carry.
+#define BTN_EXTRA_BASE 22
+#define BTN_EXTRA_N    10
+
+// Pads do not agree on where the right stick lives or what the buttons are
+// called, and guessing wrong is how Start ends up labelled L2. The layout is
+// worked out from the axes the device actually reports, once, when it opens.
+//
+//   PS      a DualShock/DualSense: right stick on Z and Rz.
+//   XINPUT  anything Windows maps through XInput - which is most third-party
+//           pads in their default mode - right stick on Rx and Ry, no Rz,
+//           and a different button order entirely.
+enum { PADL_PS = 0, PADL_XINPUT, PADL_GENERIC };
+static volatile int  g_pad_layout = PADL_PS;
+static volatile bool g_pad_rstick_rxry = false;
+// The last values read off the pad, for the live readout on the setup page.
+static volatile int g_dbg_lx = 0, g_dbg_ly = 0, g_dbg_rx = 0, g_dbg_ry = 0;
+static volatile int g_dbg_hat = -1;
+static volatile unsigned g_dbg_mask = 0;
+
+// A button can also send a keyboard shortcut instead of, or as well as, one
+// of the actions above. Slots rather than an entry per button, so the config
+// only carries the ones actually set.
+#define NSC 12
+
+struct Config {
+    double mouse_sensitivity;   // pixels per poll at full stick deflection
+    double scroll_sensitivity;  // scroll steps per poll at full deflection
+    double deadzone;            // fraction of stick travel ignored near centre
+    bool   enabled;
+    bool   game_pause;          // auto-pause the mapping while a game is fullscreen
+    int    fullscreen_key;      // 0 = F11, 1 = Alt+Enter, 2 = F, 3 = radial pick
+    double mouse_curve;         // 1 = linear; higher = finer near centre
+    int    search_mode;         // 0 built-in, 1 third-party launcher
+    unsigned search_mods;       // MOD_* bits for the third-party hotkey
+    unsigned search_vk;         // and its key
+    int    bind[F_COUNT];       // controller button per action
+    int    sc_btn[NSC];         // button that sends a shortcut, -1 if unused
+    unsigned sc_mods[NSC];      // MOD_* bits for it
+    unsigned sc_vk[NSC];        // and its key
+};
+
+// Default toggle: 13 = touchpad click on a DualSense (unused by the mapping).
+// Cross, Circle, Triangle, Square, Square (hold), Options, Touchpad,
+// R1 (forward), L1 (back), then the D-pad: up and down for volume, right and
+// left to seek.
+static const Config DEFAULTS = {18.0, 1.0, 0.15, true, true, 0, 2.0,
+                                0, MOD_ALT, VK_SPACE,
+                                {1, 2, 3, 0, 0, 9, 13, 5, 4,
+                                 BTN_DPAD_UP, BTN_DPAD_DOWN,
+                                 BTN_DPAD_RIGHT, BTN_DPAD_LEFT, 8},
+                                {-1, -1, -1, -1, -1, -1,
+                                 -1, -1, -1, -1, -1, -1},
+                                {0}, {0}};
+static const wchar_t* MUTEX_NAME = L"ControllerMouse_SingleInstance";
+static const wchar_t* CLASS_NAME = L"ControllerMouseWindow";
+
+// --- Shared state (UI thread writes config, worker thread reads it) --------
+static CRITICAL_SECTION g_cs;
+static Config           g_cfg = DEFAULTS;
+static volatile bool    g_running = true;
+static volatile bool    g_connected = false;
+static HANDLE           g_worker = NULL;
+static HWND             g_hwnd = NULL;
+static NOTIFYICONDATAW  g_nid = {};
+static int              g_status_state = -1;
+static wchar_t          g_status_txt[64] = L"Controller";
+// Friendly name of the pad in use, shown in place of "Controller" once one is
+// found. Written by the worker, read by the UI thread; worst case a repaint
+// shows the previous name for one frame.
+static wchar_t          g_pad_name[48] = L"Controller";
+static wchar_t          g_mouse_val_txt[32] = L"";
+static wchar_t          g_scroll_val_txt[32] = L"";
+static wchar_t          g_dz_val_txt[32] = L"";
+static wchar_t          g_curve_val_txt[32] = L"";
+
+static Config get_cfg() {
+    EnterCriticalSection(&g_cs);
+    Config c = g_cfg;
+    LeaveCriticalSection(&g_cs);
+    return c;
+}
+
+// --- config.json (next to the exe) -----------------------------------------
+// Settings live in %APPDATA%\ctrlmouse, not beside the exe: people run this
+// straight out of Downloads, and clearing that folder was taking the settings
+// with it.
+static std::wstring exe_dir() {
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(NULL, buf, MAX_PATH);
+    std::wstring p(buf);
+    return p.substr(0, p.find_last_of(L"\\/") + 1);
+}
+
+static std::wstring data_dir() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
+    PWSTR base = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, NULL, &base)) &&
+        base) {
+        std::wstring d(base);
+        CoTaskMemFree(base);
+        d += L"\\ctrlmouse";
+        if (CreateDirectoryW(d.c_str(), NULL) ||
+            GetLastError() == ERROR_ALREADY_EXISTS) {
+            cached = d + L"\\";
+            return cached;
+        }
+    }
+    cached = exe_dir();   // fall back to the old location rather than fail
+    return cached;
+}
+
+static std::wstring config_path() { return data_dir() + L"config.json"; }
+
+// --- Run at login -----------------------------------------------------------
+// A Run key entry rather than a scheduled task or a service: it needs no
+// elevation, and it is where a user would look to remove it. The entry starts
+// us with --tray so login does not throw a window at them.
+#define RUN_KEY  L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_NAME L"ctrlmouse"
+
+static bool startup_enabled() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    bool found = RegQueryValueExW(k, RUN_NAME, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return found;
+}
+
+static void set_startup(bool on) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0, KEY_WRITE, NULL,
+                        &k, NULL) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        wchar_t exe[MAX_PATH];
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            std::wstring cmd = L"\"";
+            cmd += exe;
+            cmd += L"\" --tray";
+            RegSetValueExW(k, RUN_NAME, 0, REG_SZ, (const BYTE*)cmd.c_str(),
+                           (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(k, RUN_NAME);
+    }
+    RegCloseKey(k);
+}
+
+// Bring settings written by an older build across, once.
+static void migrate_old_data() {
+    if (data_dir() == exe_dir()) return;
+    const wchar_t* names[] = {L"config.json", L"apps.txt", L"hidhide_declined"};
+    for (int i = 0; i < 3; i++) {
+        std::wstring dst = data_dir() + names[i];
+        std::wstring src = exe_dir() + names[i];
+        if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES)
+            MoveFileW(src.c_str(), dst.c_str());
+    }
+}
+
+static void save_config(const Config& c) {
+    std::wstring path = config_path();
+    std::wstring tmp = path + L".tmp";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) return;
+    fprintf(f,
+            "{\n"
+            "  \"mouse_sensitivity\": %.3f,\n"
+            "  \"scroll_sensitivity\": %.3f,\n"
+            "  \"deadzone\": %.3f,\n"
+            "  \"enabled\": %s,\n"
+            "  \"game_pause\": %s,\n"
+            "  \"fullscreen_key\": %d,\n"
+            "  \"mouse_curve\": %.2f,\n"
+            "  \"search_mode\": %d,\n"
+            "  \"search_mods\": %u,\n"
+            "  \"search_vk\": %u",
+            c.mouse_sensitivity, c.scroll_sensitivity, c.deadzone,
+            c.enabled ? "true" : "false",
+            c.game_pause ? "true" : "false", c.fullscreen_key,
+            c.mouse_curve, c.search_mode, c.search_mods, c.search_vk);
+    // Flat keys rather than a nested object: the reader looks each name up
+    // directly, so nesting would buy nothing and cost a real parser.
+    for (int i = 0; i < F_COUNT; i++)
+        fprintf(f, ",\n  \"%s\": %d", kBindKeyA[i], c.bind[i]);
+    for (int i = 0; i < NSC; i++) {
+        if (c.sc_btn[i] < 0) continue;
+        fprintf(f, ",\n  \"sc%d_btn\": %d,\n  \"sc%d_mods\": %u,"
+                   "\n  \"sc%d_vk\": %u",
+                i, c.sc_btn[i], i, c.sc_mods[i], i, c.sc_vk[i]);
+    }
+    fprintf(f, "\n}\n");
+    fclose(f);
+    MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+// PowerToys installs per-user or per-machine depending on the installer, so
+// check both. Only used to pick a sensible default the first time.
+static bool powertoys_installed() {
+    const wchar_t* env[3] = {L"LOCALAPPDATA", L"ProgramFiles", L"ProgramW6432"};
+    for (int i = 0; i < 3; i++) {
+        wchar_t base[MAX_PATH];
+        if (!GetEnvironmentVariableW(env[i], base, MAX_PATH)) continue;
+        std::wstring p = std::wstring(base) + L"\\PowerToys\\PowerToys.exe";
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    }
+    return false;
+}
+
+static bool parse_double(const std::string& s, const char* key, double& out) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return false;
+    p = s.find(':', p + k.size());
+    if (p == std::string::npos) return false;
+    out = strtod(s.c_str() + p + 1, NULL);
+    return true;
+}
+
+static void parse_bool(const std::string& s, const char* key, bool& out) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return;
+    p = s.find(':', p + k.size());
+    if (p == std::string::npos) return;
+    size_t end = s.find_first_of(",}", p);
+    out = s.substr(p, end - p).find("true") != std::string::npos;
+}
+
+static Config load_config() {
+    Config c = DEFAULTS;
+    FILE* f = _wfopen(config_path().c_str(), L"rb");
+    if (!f) {
+        save_config(c);
+        return c;
+    }
+    std::string s;
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    fclose(f);
+    parse_double(s, "mouse_sensitivity", c.mouse_sensitivity);
+    parse_double(s, "scroll_sensitivity", c.scroll_sensitivity);
+    parse_double(s, "deadzone", c.deadzone);
+    parse_bool(s, "enabled", c.enabled);
+    parse_bool(s, "game_pause", c.game_pause);
+    double tb;
+    // Older configs stored only the toggle under its own name.
+    if (parse_double(s, "toggle_button", tb)) c.bind[F_TOGGLE] = (int)tb;
+    for (int i = 0; i < F_COUNT; i++) {
+        double v;
+        if (parse_double(s, kBindKeyA[i], v) && v >= -1 && v < 32)
+            c.bind[i] = (int)v;
+    }
+    for (int i = 0; i < NSC; i++) {
+        char kb[24], km[24], kv[24];
+        snprintf(kb, sizeof(kb), "sc%d_btn", i);
+        snprintf(km, sizeof(km), "sc%d_mods", i);
+        snprintf(kv, sizeof(kv), "sc%d_vk", i);
+        double b, m, k;
+        if (parse_double(s, kb, b) && b >= 0 && b < 32 &&
+            parse_double(s, kv, k) && k > 0 && k < 256) {
+            c.sc_btn[i] = (int)b;
+            c.sc_vk[i] = (unsigned)k;
+            c.sc_mods[i] = parse_double(s, km, m) ? (unsigned)m : 0u;
+        }
+    }
+    double fk;
+    if (parse_double(s, "fullscreen_key", fk)) {
+        c.fullscreen_key = (int)fk;
+        if (c.fullscreen_key < 0 || c.fullscreen_key > 3) c.fullscreen_key = 0;
+    }
+    parse_double(s, "mouse_curve", c.mouse_curve);
+    if (c.mouse_curve < 1.0) c.mouse_curve = 1.0;
+    if (c.mouse_curve > 3.0) c.mouse_curve = 3.0;
+    double sm;
+    if (parse_double(s, "search_mode", sm) && sm >= 0 && sm <= 1)
+        c.search_mode = (int)sm;
+    else if (powertoys_installed())
+        c.search_mode = 1;   // a launcher is already there, so use it
+    double v;
+    if (parse_double(s, "search_mods", v)) c.search_mods = (unsigned)v;
+    if (parse_double(s, "search_vk", v) && v > 0) c.search_vk = (unsigned)v;
+    return c;
+}
+
+// --- Mouse output ----------------------------------------------------------
+static void mouse_move(LONG dx, LONG dy) {
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    SendInput(1, &in, sizeof(in));
+}
+
+// Raw wheel delta, not whole notches. WHEEL_DELTA (120) is one notch, and
+// applications have accepted fractions of it since Vista, so sending small
+// deltas every poll scrolls smoothly instead of jumping a line at a time.
+static void mouse_scroll(int delta) {
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.mouseData = (DWORD)delta;
+    in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    SendInput(1, &in, sizeof(in));
+}
+
+static void mouse_button(DWORD flag) {
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = flag;
+    SendInput(1, &in, sizeof(in));
+}
+
+// Tap a virtual key. Used for the media keys, which Windows routes to
+// whichever app owns media playback, so this works without knowing about it.
+static void tap_key(WORD vk) {
+    INPUT in[2] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = vk;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = vk;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+
+// Fullscreen has no system-wide key, so this sends whichever shortcut the
+// user's player actually uses.
+static void send_fullscreen(int which) {
+    if (which == 1) {   // Alt+Enter
+        INPUT in[4] = {};
+        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_MENU;
+        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_RETURN;
+        in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = VK_RETURN;
+        in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_MENU;
+        in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(4, in, sizeof(INPUT));
+    } else {
+        tap_key(which == 2 ? 'F' : VK_F11);
+    }
+}
+
+// The mouse's side buttons, which is what browsers and Explorer listen to for
+// navigation - XBUTTON1 is back, XBUTTON2 forward.
+static void mouse_xbutton(int which) {
+    INPUT in[2] = {};
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_XDOWN;
+    in[0].mi.mouseData = (DWORD)which;
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = MOUSEEVENTF_XUP;
+    in[1].mi.mouseData = (DWORD)which;
+    SendInput(2, in, sizeof(INPUT));
+}
+
+// Summon PowerToys' own launcher by its default hotkey - Win+Alt+Space for
+// Command Palette, Alt+Space for the older PowerToys Run. Nothing here talks
+// to PowerToys directly, so this is the real thing with its own ranking,
+// history and extensions rather than an imitation of it. It relies on the
+// hotkey being the default; if it has been changed, the built-in search is
+// still there in the settings.
+static void send_hotkey(unsigned mods, unsigned vk) {
+    if (!vk) return;
+    WORD mk[4];
+    int mc = 0;
+    if (mods & MOD_CONTROL) mk[mc++] = VK_CONTROL;
+    if (mods & MOD_ALT)     mk[mc++] = VK_MENU;
+    if (mods & MOD_SHIFT)   mk[mc++] = VK_SHIFT;
+    if (mods & MOD_WIN)     mk[mc++] = VK_LWIN;
+    INPUT in[10] = {};
+    int n = 0;
+    for (int i = 0; i < mc; i++) {
+        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mk[i]; n++;
+    }
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = (WORD)vk; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = (WORD)vk;
+    in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    for (int i = mc - 1; i >= 0; i--) {
+        in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = mk[i];
+        in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    }
+    SendInput(n, in, sizeof(INPUT));
+}
+
+// Render a hotkey the way a person would write it.
+static void hotkey_name(unsigned mods, unsigned vk, wchar_t* out, size_t n) {
+    std::wstring t;
+    if (mods & MOD_CONTROL) t += L"Ctrl+";
+    if (mods & MOD_ALT)     t += L"Alt+";
+    if (mods & MOD_SHIFT)   t += L"Shift+";
+    if (mods & MOD_WIN)     t += L"Win+";
+    wchar_t key[32] = L"";
+    switch (vk) {
+    case VK_SPACE:  wcscpy(key, L"Space"); break;
+    case VK_RETURN: wcscpy(key, L"Enter"); break;
+    case VK_TAB:    wcscpy(key, L"Tab"); break;
+    case VK_ESCAPE: wcscpy(key, L"Esc"); break;
+    default:
+        if (vk >= VK_F1 && vk <= VK_F24) swprintf(key, 32, L"F%u", vk - VK_F1 + 1);
+        else {
+            UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0x7FFF;
+            if (ch > 32) swprintf(key, 32, L"%c", (wchar_t)ch);
+            else         swprintf(key, 32, L"0x%02X", vk);
+        }
+    }
+    t += key;
+    wcsncpy(out, t.c_str(), n - 1);
+    out[n - 1] = 0;
+}
+
+static void edge_click(bool pressed, bool& prev, DWORD down, DWORD up) {
+    if (pressed && !prev) {
+        mouse_button(down);
+        prev = true;
+    } else if (!pressed && prev) {
+        mouse_button(up);
+        prev = false;
+    }
+}
+
+// Release any held buttons (e.g. when the controller is unplugged).
+static void edge_click_release_all(bool& a_down, bool& b_down) {
+    if (a_down) { mouse_button(MOUSEEVENTF_LEFTUP); a_down = false; }
+    if (b_down) { mouse_button(MOUSEEVENTF_RIGHTUP); b_down = false; }
+}
+
+// --- On-screen keyboard: state shared with the worker ------------------------
+// The worker thread only detects controller events and posts them here; all
+// window/state manipulation happens on the UI thread.
+#define WM_GAMEPAD (WM_APP + 2)
+enum { GP_KB_TOGGLE = 1, GP_KB_SELECT, GP_KB_BACKSPACE, GP_KB_NAV,
+       GP_TOGGLE,
+       GP_LX_TOGGLE, GP_LX_NAV, GP_LX_SELECT, GP_LX_CLOSE, GP_KB_SEARCH,
+       GP_RAD_SHOW, GP_RAD_SEL, GP_RAD_PICK, GP_KB_ENTER, GP_PT_SEARCH,
+       GP_PRESSED, GP_MED_REPEAT, GP_RAD_HIDE, GP_RAD_ROW, GP_MED_SEEK };
+
+static volatile bool g_kb_visible = false;
+static volatile bool g_lx_visible = false;   // app launcher popup
+static volatile bool g_rad_visible = false;  // radial fullscreen picker
+// Set while the button-layout page is open: the worker reports presses
+// and runs nothing, so binding a button cannot also trigger it.
+static volatile bool g_listen = false;
+// Keyboard open purely to type into someone else's search box, so its result
+// list is navigated rather than ours. Read by the worker, hence up here.
+static volatile bool g_kb_external = false;
+// The three fullscreen shortcuts the flyout offers.
+#define NRADIAL 3
+static const wchar_t* kRadName[NRADIAL] = {L"F11", L"Alt+Enter", L"F"};
+
+// The same flyout also serves media, with icons rather than names: previous
+// track, volume down, play/pause, volume up, next track, over a seek bar.
+// Play/pause sits in the middle, so opening the flyout and letting go without
+// touching the stick does the obvious thing.
+#define NMEDIA 5
+#define MED_PLAY 2
+static const WORD kMediaFlyVk[NMEDIA] = {
+    VK_MEDIA_PREV_TRACK, VK_VOLUME_DOWN, VK_MEDIA_PLAY_PAUSE,
+    VK_VOLUME_UP, VK_MEDIA_NEXT_TRACK};
+// Only volume is worth repeating: play/pause and track skips all mean
+// something different the second time.
+static bool media_repeats(int i) { return i == 1 || i == NMEDIA - 2; }
+
+
+
+// --- Per-controller button names --------------------------------------------
+// A pad's report descriptor says how many buttons it has, never what they are
+// called. Anything beyond the obvious face buttons - back paddles especially -
+// has no conventional name and no way to guess one, and guessing wrong is how
+// Select ended up labelled L2.
+//
+// So the pad is named once, by hand: press a button, say what it is. The names
+// are kept against the controller's vendor and product ids, so unplugging it
+// and plugging it back in - or rebooting - gets them back.
+#define NPADPROF     8            // controllers remembered
+#define NPADBTNNAME 32            // one per bit of the button mask
+
+struct PadProfile {
+    USHORT vid, pid;
+    bool   used;
+    std::wstring product;
+    std::wstring name[NPADBTNNAME];
+};
+static PadProfile g_padprof[NPADPROF];
+static int        g_padprof_count = 0;
+// Which profile the connected pad uses, -1 if it has none yet. Written when a
+// pad opens, read by the settings window, so it lives under g_cs.
+static volatile int g_pad_prof = -1;
+
+static std::wstring pads_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"pads.txt";
+}
+
+// Caller holds g_cs.
+static int padprof_find(USHORT vid, USHORT pid) {
+    for (int i = 0; i < g_padprof_count; i++)
+        if (g_padprof[i].used && g_padprof[i].vid == vid &&
+            g_padprof[i].pid == pid)
+            return i;
+    return -1;
+}
+
+static int padprof_add(USHORT vid, USHORT pid, const wchar_t* product) {
+    int at = padprof_find(vid, pid);
+    if (at >= 0) return at;
+    if (g_padprof_count >= NPADPROF) {
+        // Oldest out. Eight controllers is already more than anyone plugs
+        // into one machine.
+        for (int j = 0; j + 1 < NPADPROF; j++) g_padprof[j] = g_padprof[j + 1];
+        g_padprof_count = NPADPROF - 1;
+    }
+    PadProfile& p = g_padprof[g_padprof_count];
+    p = PadProfile();
+    p.used = true;
+    p.vid = vid;
+    p.pid = pid;
+    p.product = product ? product : L"";
+    return g_padprof_count++;
+}
+
+// True once at least one button has been named: what tells a controller that
+// has been set up from one that has only been seen.
+static bool padprof_mapped(int at) {
+    if (at < 0 || at >= g_padprof_count) return false;
+    for (int i = 0; i < NPADBTNNAME; i++)
+        if (!g_padprof[at].name[i].empty()) return true;
+    return false;
+}
+
+// One line per named button: vendor, product, index, name. Tab separated,
+// because a name is whatever the user typed.
+static void padprof_load() {
+    EnterCriticalSection(&g_cs);
+    g_padprof_count = 0;
+    FILE* f = _wfopen(pads_path().c_str(), L"rb, ccs=UTF-8");
+    if (f) {
+        wchar_t line[512];
+        while (fgetws(line, 512, f)) {
+            size_t n = wcslen(line);
+            while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r'))
+                line[--n] = 0;
+            if (!n) continue;
+            wchar_t* ctx = NULL;
+            wchar_t* a = wcstok(line, L"\t", &ctx);
+            wchar_t* b = wcstok(NULL, L"\t", &ctx);
+            wchar_t* c = wcstok(NULL, L"\t", &ctx);
+            wchar_t* d = wcstok(NULL, L"\t", &ctx);
+            if (!a || !b || !c || !d) continue;
+            int idx = _wtoi(c);
+            if (idx < 0 || idx >= NPADBTNNAME) continue;
+            int at = padprof_add((USHORT)_wtoi(a), (USHORT)_wtoi(b), NULL);
+            if (at >= 0) g_padprof[at].name[idx] = d;
+        }
+        fclose(f);
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+// Caller holds g_cs.
+static void padprof_save() {
+    FILE* f = _wfopen(pads_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_padprof_count; i++) {
+        if (!g_padprof[i].used) continue;
+        for (int b = 0; b < NPADBTNNAME; b++)
+            if (!g_padprof[i].name[b].empty())
+                fwprintf(f, L"%u\t%u\t%d\t%s\n", g_padprof[i].vid,
+                         g_padprof[i].pid, b, g_padprof[i].name[b].c_str());
+    }
+    fclose(f);
+}
+
+// Called when a pad opens, from the worker.
+static void padprof_bind(USHORT vid, USHORT pid, const wchar_t* product) {
+    EnterCriticalSection(&g_cs);
+    int at = padprof_find(vid, pid);
+    if (at < 0) at = padprof_add(vid, pid, product);
+    else if (product && *product) g_padprof[at].product = product;
+    g_pad_prof = at;
+    LeaveCriticalSection(&g_cs);
+}
+
+// --- Per-app rules ----------------------------------------------------------
+// Two things keyed off whichever app is in front, sharing one list because
+// they share the hard part - saying which app you mean.
+//
+//  * Don't pause here. The game check is a heuristic: anything covering its
+//    whole monitor looks like a game, which catches fullscreen video just as
+//    readily. Listing an app says it never counts, however it fills the
+//    screen.
+//  * Its own button layout, in effect only while that app is focused. The
+//    base layout applies everywhere else.
+//
+// Matched on the executable's file name rather than its full path, so it
+// still works when the same program lives somewhere else on another machine -
+// and so an app added by picking one of its open windows keeps working after
+// that window closes.
+#define NAPPS 24
+struct AppRule {
+    std::wstring exe;           // file name, e.g. "chrome.exe"
+    std::wstring label;         // what to show, e.g. "Chrome"
+    bool no_pause;
+    bool profile;
+    int  bind[F_COUNT];
+};
+static AppRule g_apps[NAPPS];
+static int     g_app_count = 0;         // guarded by g_cs, like the config
+
+static const wchar_t* base_name(const wchar_t* p) {
+    const wchar_t* s = wcsrchr(p, L'\\');
+    return s ? s + 1 : p;
+}
+
+// The executable of whatever holds the foreground, file name only.
+static void foreground_exe(wchar_t* out, size_t n) {
+    out[0] = 0;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD len = MAX_PATH;
+    if (QueryFullProcessImageNameW(ph, 0, img, &len)) {
+        wcsncpy(out, base_name(img), n - 1);
+        out[n - 1] = 0;
+    }
+    CloseHandle(ph);
+}
+
+// Index of the rule for this executable, or -1. Caller holds g_cs.
+static int app_rule_index(const wchar_t* exe) {
+    if (!exe || !exe[0]) return -1;
+    for (int i = 0; i < g_app_count; i++)
+        if (_wcsicmp(g_apps[i].exe.c_str(), exe) == 0) return i;
+    return -1;
+}
+
+static std::wstring rules_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"apps-rules.txt";
+}
+
+// One rule per line: name, flags, then the layout. Tab separated, because a
+// file name can contain almost anything else.
+static void rules_load() {
+    g_app_count = 0;
+    FILE* f = _wfopen(rules_path().c_str(), L"rb, ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[1024];
+    while (g_app_count < NAPPS && fgetws(line, 1024, f)) {
+        size_t n = wcslen(line);
+        while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r')) line[--n] = 0;
+        if (!n) continue;
+        wchar_t* ctx = NULL;
+        wchar_t* exe = wcstok(line, L"\t", &ctx);
+        wchar_t* label = wcstok(NULL, L"\t", &ctx);
+        wchar_t* flags = wcstok(NULL, L"\t", &ctx);
+        wchar_t* binds = wcstok(NULL, L"\t", &ctx);
+        if (!exe || !*exe) continue;
+        AppRule& r = g_apps[g_app_count];
+        r.exe = exe;
+        r.label = (label && *label) ? label : exe;
+        int fl = flags ? _wtoi(flags) : 0;
+        r.no_pause = (fl & 1) != 0;
+        r.profile = (fl & 2) != 0;
+        for (int i = 0; i < F_COUNT; i++) r.bind[i] = DEFAULTS.bind[i];
+        if (binds) {
+            wchar_t* bctx = NULL;
+            wchar_t* t = wcstok(binds, L",", &bctx);
+            for (int i = 0; i < F_COUNT && t; i++) {
+                int v = _wtoi(t);
+                if (v >= -1 && v < 32) r.bind[i] = v;
+                t = wcstok(NULL, L",", &bctx);
+            }
+        }
+        g_app_count++;
+    }
+    fclose(f);
+}
+
+static void rules_save() {
+    FILE* f = _wfopen(rules_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_app_count; i++) {
+        const AppRule& r = g_apps[i];
+        fwprintf(f, L"%s\t%s\t%d\t", r.exe.c_str(), r.label.c_str(),
+                 (r.no_pause ? 1 : 0) | (r.profile ? 2 : 0));
+        for (int b = 0; b < F_COUNT; b++)
+            fwprintf(f, L"%d%s", r.bind[b], b + 1 < F_COUNT ? L"," : L"\n");
+    }
+    fclose(f);
+}
+
+// Add by executable path, or do nothing if it is already listed. Returns the
+// index either way, or -1 if the list is full.
+static int rules_add(const wchar_t* path, const wchar_t* label) {
+    const wchar_t* exe = base_name(path);
+    int at = app_rule_index(exe);
+    if (at >= 0) return at;
+    if (g_app_count >= NAPPS) return -1;
+    AppRule& r = g_apps[g_app_count];
+    r.exe = exe;
+    r.label = (label && *label) ? label : exe;
+    r.no_pause = true;          // the reason to add one, most of the time
+    r.profile = false;
+    for (int i = 0; i < F_COUNT; i++) r.bind[i] = DEFAULTS.bind[i];
+    return g_app_count++;
+}
+
+static void rules_remove(int i) {
+    if (i < 0 || i >= g_app_count) return;
+    for (int j = i; j + 1 < g_app_count; j++) g_apps[j] = g_apps[j + 1];
+    g_app_count--;
+}
+
+// --- Game detection / toggle-bind state (shared with the worker) -----------
+static volatile bool g_game_active = false;  // fullscreen game detected
+static volatile bool g_override    = false;  // user forced mapping on in-game
+
+// True when a fullscreen game (or other fullscreen app) is in front. Two cheap
+// checks, no process enumeration: the shell's own notification state (which
+// reports exclusive D3D fullscreen), plus a "foreground window covers its whole
+// monitor" heuristic to catch borderless-fullscreen games.
+static bool is_game_running() {
+    // Listed apps never count. Checked first, so fullscreen video in a
+    // browser stays fullscreen video however the shell reports it.
+    {
+        wchar_t exe[128];
+        foreground_exe(exe, 128);
+        EnterCriticalSection(&g_cs);
+        int r = app_rule_index(exe);
+        bool skip = (r >= 0 && g_apps[r].no_pause);
+        LeaveCriticalSection(&g_cs);
+        if (skip) return false;
+    }
+
+    QUERY_USER_NOTIFICATION_STATE q;
+    if (SUCCEEDED(SHQueryUserNotificationState(&q)) &&
+        (q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE))
+        return true;
+
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_hwnd || fg == GetShellWindow()) return false;
+    wchar_t cls[64] = L"";
+    GetClassNameW(fg, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
+        !wcscmp(cls, L"Shell_TrayWnd"))
+        return false;
+    RECT wr;
+    if (!GetWindowRect(fg, &wr)) return false;
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mi))
+        return false;
+    return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
+           wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+}
+
+// Map a DirectInput POV hat value to 0=up,1=right,2=down,3=left (-1 centred).
+static int pov_dir(DWORD pov) {
+    if (LOWORD(pov) == 0xFFFF) return -1;
+    return (int)(((pov + 4500) / 9000) % 4);
+}
+
+// Device instance IDs of every DualSense HID collection present, in the form
+// SetupDiGetDeviceInstanceId returns - this is what HidHide blacklists by.
+// Filled by hid_scan() below; declared here because the HidHide code uses it.
+#define MAX_INST 16
+static std::wstring g_pad_inst[MAX_INST];
+static int          g_pad_inst_count = 0;
+
+// --- HidHide integration ----------------------------------------------------
+// Opening the pad exclusively is not enough to stop other software reacting to
+// it: that only blocks other user-mode CreateFile opens, while RawInput
+// consumers, the Game Bar and Steam Input keep getting fed by the OS itself.
+// Genuinely hiding a device needs a kernel filter driver sitting under the HID
+// stack, which is exactly what HidHide is. It is optional - without it the app
+// still works, it just cannot stop the pad reaching other software.
+//
+// Contract from HidHide's Shared/HidHideIoctlContract.h.
+#define HH_DEVICE_PATH L"\\\\.\\HidHide"
+#define HH_CTL(n)      CTL_CODE(32769, (n), METHOD_BUFFERED, FILE_READ_DATA)
+#define HH_GET_WHITELIST          HH_CTL(2048)
+#define HH_SET_WHITELIST          HH_CTL(2049)
+#define HH_GET_BLACKLIST          HH_CTL(2050)
+#define HH_SET_BLACKLIST          HH_CTL(2051)
+#define HH_GET_ACTIVE             HH_CTL(2052)
+#define HH_SET_ACTIVE             HH_CTL(2053)
+// NOTE: the session blacklist (2056/2057) exists only on HidHide's master
+// branch - no released build implements it - so the persistent blacklist is
+// the only option that works on an installable version. That means the change
+// has to be rolled back explicitly, including after a crash; see
+// hh_restore_file().
+#define HH_RELEASES_URL L"https://github.com/nefarius/HidHide/releases/latest"
+
+static HANDLE g_hh = INVALID_HANDLE_VALUE;
+static bool   g_hh_whitelisted = false;   // are we allowed to see hidden pads?
+static bool   g_hh_hiding = false;        // is the pad currently hidden?
+
+static bool is_elevated() {
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el = {};
+    DWORD sz = 0;
+    BOOL ok = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &sz);
+    CloseHandle(tok);
+    return ok && el.TokenIsElevated;
+}
+
+static bool hh_present() {
+    HANDLE h = CreateFileW(HH_DEVICE_PATH, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+static bool hh_open() {
+    if (g_hh != INVALID_HANDLE_VALUE) return true;
+    g_hh = CreateFileW(HH_DEVICE_PATH, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+    return g_hh != INVALID_HANDLE_VALUE;
+}
+
+static void hh_close() {
+    if (g_hh != INVALID_HANDLE_VALUE) { CloseHandle(g_hh); g_hh = INVALID_HANDLE_VALUE; }
+    g_hh_hiding = false;
+}
+
+// HidHide identifies applications by NT full image name, e.g.
+// \Device\HarddiskVolume3\Apps\ctrlmouse.exe - volume-based so it survives a
+// drive-letter change.
+static bool hh_self_image_name(std::wstring& out) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!n || n >= MAX_PATH || path[1] != L':') return false;
+    wchar_t drive[3] = {path[0], L':', 0};
+    wchar_t devname[512];
+    if (!QueryDosDeviceW(drive, devname, 512)) return false;
+    out = std::wstring(devname) + (path + 2);
+    return true;
+}
+
+// MULTI_SZ: each string null-terminated, list closed by one more null.
+static std::wstring hh_multi_sz(const std::wstring* items, int n) {
+    std::wstring b;
+    for (int i = 0; i < n; i++) {
+        if (items[i].empty()) continue;
+        b += items[i];
+        b.push_back(L'\0');
+    }
+    b.push_back(L'\0');
+    return b;
+}
+
+static bool hh_ioctl(DWORD code, std::wstring& payload) {
+    DWORD ret = 0;
+    return DeviceIoControl(g_hh, code, (LPVOID)payload.data(),
+                           (DWORD)(payload.size() * sizeof(wchar_t)),
+                           NULL, 0, &ret, NULL) != 0;
+}
+
+// Add ourselves to HidHide's whitelist, preserving whatever is already there.
+// This must succeed before anything is hidden, otherwise we would hide the pad
+// from ourselves too.
+static bool hh_whitelist_self() {
+    std::wstring me;
+    if (!hh_self_image_name(me)) return false;
+
+    DWORD need = 0;
+    DeviceIoControl(g_hh, HH_GET_WHITELIST, NULL, 0, NULL, 0, &need, NULL);
+    std::wstring cur;
+    if (need >= sizeof(wchar_t)) {
+        cur.resize(need / sizeof(wchar_t));
+        DWORD got = 0;
+        if (!DeviceIoControl(g_hh, HH_GET_WHITELIST, NULL, 0, &cur[0],
+                             (DWORD)(cur.size() * sizeof(wchar_t)), &got, NULL))
+            return false;   // never overwrite a list we failed to read
+        cur.resize(got / sizeof(wchar_t));
+    }
+
+    // Walk the MULTI_SZ looking for ourselves (paths are case-insensitive).
+    std::wstring items[64];
+    int n = 0;
+    for (size_t i = 0; i < cur.size() && n < 63;) {
+        size_t e = cur.find(L'\0', i);
+        if (e == std::wstring::npos || e == i) break;
+        items[n++] = cur.substr(i, e - i);
+        i = e + 1;
+    }
+    for (int i = 0; i < n; i++)
+        if (_wcsicmp(items[i].c_str(), me.c_str()) == 0) return true;  // already there
+
+    items[n++] = me;
+    std::wstring payload = hh_multi_sz(items, n);
+    return hh_ioctl(HH_SET_WHITELIST, payload);
+}
+
+// Hide every DualSense collection from other software, for this session only.
+// Session entries are owned by this process and the driver drops them if we
+// exit or crash, so the pad can never be left hidden.
+static BOOLEAN g_hh_prev_active = FALSE;
+static bool    g_hh_changed_active = false;
+static std::wstring g_hh_saved_blacklist;   // caller's list, before we touched it
+static bool         g_hh_have_saved = false;
+
+static bool hh_read_multi_sz(DWORD code, std::wstring& out) {
+    DWORD need = 0;
+    DeviceIoControl(g_hh, code, NULL, 0, NULL, 0, &need, NULL);
+    out.clear();
+    if (need < sizeof(wchar_t)) { out.push_back(L'\0'); return true; }
+    out.resize(need / sizeof(wchar_t));
+    DWORD got = 0;
+    if (!DeviceIoControl(g_hh, code, NULL, 0, &out[0],
+                         (DWORD)(out.size() * sizeof(wchar_t)), &got, NULL))
+        return false;
+    out.resize(got / sizeof(wchar_t));
+    if (out.empty()) out.push_back(L'\0');
+    return true;
+}
+
+// Because we have to mutate HidHide's persistent blacklist, a crash between
+// hiding and restoring would leave the user's pad hidden with no obvious
+// cause. So the original list is written to disk before the first change and
+// replayed on the next start if it is still there.
+static std::wstring hh_restore_file() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"hidhide_restore.bin";
+}
+
+static void hh_write_restore(const std::wstring& list) {
+    HANDLE f = CreateFileW(hh_restore_file().c_str(), GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(f, list.data(), (DWORD)(list.size() * sizeof(wchar_t)), &w, NULL);
+    CloseHandle(f);
+}
+
+static void hh_clear_restore() { DeleteFileW(hh_restore_file().c_str()); }
+
+// Replay a blacklist left behind by a previous run that did not shut down
+// cleanly. Runs before we touch anything else.
+static void hh_recover_blacklist() {
+    HANDLE f = CreateFileW(hh_restore_file().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD sz = GetFileSize(f, NULL);
+    if (sz && sz != INVALID_FILE_SIZE && (sz % sizeof(wchar_t)) == 0) {
+        std::wstring list;
+        list.resize(sz / sizeof(wchar_t));
+        DWORD r = 0;
+        if (ReadFile(f, &list[0], sz, &r, NULL) && r == sz)
+            hh_ioctl(HH_SET_BLACKLIST, list);
+    }
+    CloseHandle(f);
+    hh_clear_restore();
+}
+
+// Rebuild the device stack so HidHide's filter re-evaluates it. Without this
+// the blacklist only takes effect the next time the pad is reconnected, which
+// is what HidHide's own documentation tells users to do by hand.
+static void hh_restart_devices() {
+    for (int i = 0; i < g_pad_inst_count; i++) {
+        DEVINST inst;
+        if (CM_Locate_DevNodeW(&inst, (DEVINSTID_W)g_pad_inst[i].c_str(),
+                               CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+            continue;
+        PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
+        CM_Query_And_Remove_SubTreeW(inst, &veto, NULL, 0, CM_REMOVE_NO_RESTART);
+        CM_Setup_DevNode(inst, CM_SETUP_DEVNODE_READY);
+    }
+}
+
+static bool hh_hide(bool on) {
+    if (g_hh == INVALID_HANDLE_VALUE || on == g_hh_hiding) return true;
+    DWORD ret = 0;
+    if (!on) {
+        if (g_hh_have_saved) {
+            hh_ioctl(HH_SET_BLACKLIST, g_hh_saved_blacklist);
+            g_hh_have_saved = false;
+            hh_clear_restore();
+        }
+        // Only put the global switch back if we were the ones who turned it
+        // on. The user may be hiding other devices with it, and forcing it off
+        // would silently break their own HidHide setup.
+        if (g_hh_changed_active) {
+            DeviceIoControl(g_hh, HH_SET_ACTIVE, &g_hh_prev_active,
+                            sizeof(g_hh_prev_active), NULL, 0, &ret, NULL);
+            g_hh_changed_active = false;
+        }
+        g_hh_hiding = false;
+        hh_restart_devices();
+        return true;
+    }
+    if (!g_hh_whitelisted || !g_pad_inst_count) return false;
+
+    // Append our pad to whatever the user already hides, never replace it.
+    if (!g_hh_have_saved) {
+        if (!hh_read_multi_sz(HH_GET_BLACKLIST, g_hh_saved_blacklist))
+            return false;   // never overwrite a list we could not read
+        hh_write_restore(g_hh_saved_blacklist);
+        g_hh_have_saved = true;
+    }
+    std::wstring items[MAX_INST + 64];
+    int n = 0;
+    for (size_t i = 0; i < g_hh_saved_blacklist.size() && n < 64;) {
+        size_t e = g_hh_saved_blacklist.find(L'\0', i);
+        if (e == std::wstring::npos || e == i) break;
+        items[n++] = g_hh_saved_blacklist.substr(i, e - i);
+        i = e + 1;
+    }
+    for (int i = 0; i < g_pad_inst_count && n < MAX_INST + 64; i++) {
+        bool dup = false;
+        for (int j = 0; j < n; j++)
+            if (_wcsicmp(items[j].c_str(), g_pad_inst[i].c_str()) == 0) dup = true;
+        if (!dup) items[n++] = g_pad_inst[i];
+    }
+    std::wstring payload = hh_multi_sz(items, n);
+    if (!hh_ioctl(HH_SET_BLACKLIST, payload)) return false;
+
+    // HidHide has a global on/off switch, and a blacklist means nothing while
+    // it is off. Read the old value if we can - purely so we can put it back -
+    // but always write TRUE, and treat failure to do so as failure to hide.
+    // Making the write conditional on a successful read is what previously let
+    // this report success while HidHide was globally disabled.
+    BOOLEAN prev = FALSE;
+    bool have_prev = DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &prev,
+                                     sizeof(prev), &ret, NULL) != 0;
+    BOOLEAN on_val = TRUE;
+    if (!DeviceIoControl(g_hh, HH_SET_ACTIVE, &on_val, sizeof(on_val),
+                         NULL, 0, &ret, NULL))
+        return false;
+    g_hh_changed_active = have_prev && !prev;   // only restore what we changed
+    g_hh_prev_active = prev;
+
+    // Confirm it really is on rather than trusting the write.
+    BOOLEAN now = FALSE;
+    if (DeviceIoControl(g_hh, HH_GET_ACTIVE, NULL, 0, &now, sizeof(now),
+                        &ret, NULL) && !now)
+        return false;
+
+    g_hh_hiding = true;
+    hh_restart_devices();   // make the filter re-evaluate the pad right away
+    return true;
+}
+
+// --- Normalised pad state ---------------------------------------------------
+// Both input backends below fill this, so the worker loop does not care which
+// one is in use. Axes are [-1000, 1000]; button bit indices deliberately match
+// the DirectInput button order for a DualSense, so an existing
+// config.json "toggle_button" keeps meaning the same physical button.
+//   0 Square  1 Cross  2 Circle  3 Triangle  4 L1  5 R1  6 L2  7 R2
+//   8 Create  9 Options  10 L3  11 R3  12 PS  13 Touchpad
+struct PadState {
+    int      lx, ly, rx, ry;
+    unsigned mask;
+    int      hat;   // 0=up,1=right,2=down,3=left, -1 centred
+};
+
+// --- Raw HID backend (DualSense) --------------------------------------------
+// Why this exists: any app that takes direct HID control of a DualSense (game
+// streaming clients such as Artemis/Moonlight, DS4Windows, Steam) switches the
+// pad from its basic Bluetooth report (0x01) into the extended report (0x31).
+// The pad stays in that mode after the app exits, and Windows' own HID game
+// controller mapping cannot decode it - joy.cpl goes dead, DirectInput reports
+// nothing, and only re-pairing Bluetooth resets it. Reading the reports
+// ourselves sidesteps the whole problem: we understand both formats, so the
+// mode the pad happens to be in stops mattering.
+#define SONY_VID          0x054C
+#define PID_DUALSENSE     0x0CE6
+#define PID_DUALSENSE_EDGE 0x0DF2
+
+static HANDLE   g_hid = INVALID_HANDLE_VALUE;
+static OVERLAPPED g_hid_ov = {};
+static BYTE     g_hid_buf[256];
+static bool     g_hid_pending = false;
+static USHORT   g_hid_inlen = 0;
+static PadState g_hid_state = {};
+static bool     g_hid_exclusive = false;   // did we actually get exclusive access?
+static bool     g_hid_bt = false;          // Bluetooth transport (vs USB)
+// Bumped on every (re)open. The worker uses it to tell that its edge-detection
+// state refers to a handle that no longer exists.
+static unsigned g_hid_gen = 0;
+// Battery, as reported by the pad itself. -1 until a report carries it.
+static volatile int  g_pad_batt = -1;
+static volatile bool g_pad_charging = false;
+static volatile bool g_batt_from_report = false;  // report beats the property
+// False until a genuine report has been parsed on the current handle. Until
+// then hid_poll can only hand back the zeroed placeholder from the open, which
+// must not be mistaken for "every button released".
+static bool     g_hid_have_report = false;
+static bool     g_hid_generic = false;   // descriptor-driven, not DualSense
+static USHORT   g_hid_vid = 0, g_hid_pid = 0;   // whose pad it is
+
+static void hid_free_preparsed();
+
+static void hid_close() {
+    if (g_hid != INVALID_HANDLE_VALUE) {
+        if (g_hid_pending) { CancelIo(g_hid); g_hid_pending = false; }
+        CloseHandle(g_hid);
+        g_hid = INVALID_HANDLE_VALUE;
+    }
+    hid_free_preparsed();
+    g_hid_generic = false;
+    if (g_hid_ov.hEvent) { CloseHandle(g_hid_ov.hEvent); g_hid_ov.hEvent = NULL; }
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+}
+
+static bool hid_try_path(const wchar_t* path, bool exclusive) {
+    // Exclusive (share mode 0) stops other user-mode apps opening the pad, so
+    // D-pad/L3/face buttons stop leaking into whatever else is running while
+    // we own the controller. Shared lets a streaming client or Steam hold it
+    // at the same time; we only ever read either way.
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE),
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    HIDD_ATTRIBUTES attr = {sizeof(attr)};
+    if (!HidD_GetAttributes(h, &attr) || attr.VendorID != SONY_VID ||
+        (attr.ProductID != PID_DUALSENSE && attr.ProductID != PID_DUALSENSE_EDGE)) {
+        CloseHandle(h);
+        return false;
+    }
+    PHIDP_PREPARSED_DATA pp = NULL;
+    HIDP_CAPS caps = {};
+    if (!HidD_GetPreparsedData(h, &pp)) { CloseHandle(h); return false; }
+    bool ok = HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS;
+    HidD_FreePreparsedData(pp);
+    // Skip the vendor-defined collections the DualSense also exposes; only the
+    // gamepad collection has input reports big enough to be the real thing.
+    if (!ok || caps.InputReportByteLength < 10) { CloseHandle(h); return false; }
+
+    g_hid = h;
+    g_hid_generic = false;
+    g_hid_inlen = caps.InputReportByteLength;
+    if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
+    // Transport decides how a report ID of 0x01 is laid out, and it cannot be
+    // inferred from the size of a received report: HID ReadFile always returns
+    // the full advertised report length, zero-padded, so a 10-byte Bluetooth
+    // report arrives as 78 bytes. A DualSense advertises 64-byte input reports
+    // over USB and 78 over Bluetooth.
+    g_hid_bt = caps.InputReportByteLength > 64;
+    {
+        std::wstring p(path);
+        for (size_t i = 0; i < p.size(); i++) p[i] = (wchar_t)towlower(p[i]);
+        if (p.find(L"bth") != std::wstring::npos) g_hid_bt = true;
+    }
+    g_hid_ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hid_pending = false;
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+    g_hid_gen++;
+    g_hid_have_report = false;
+    // This backend only ever talks to a DualSense, so the PlayStation names
+    // are right by construction here.
+    g_pad_layout = PADL_PS;
+    g_hid_vid = attr.VendorID;
+    g_hid_pid = attr.ProductID;
+    wcscpy(g_pad_name, attr.ProductID == PID_DUALSENSE_EDGE ? L"DualSense Edge"
+                                                            : L"DualSense");
+    padprof_bind(g_hid_vid, g_hid_pid, g_pad_name);
+    return true;
+}
+
+// Ask the device what it is rather than pattern-matching its path. Path
+// formats differ by transport - USB gives HID\VID_054C&PID_0CE6\..., while
+// Bluetooth gives HID\{00001124-...}_VID&0002054C_PID&0CE6\... - so any
+// string match silently misses one of them. Opening with zero desired access
+// is a query-only open: it always succeeds and never conflicts with an
+// exclusive handle.
+// Reduce a raw HID/DirectInput product string to something worth showing.
+// Pads rarely report a tidy name - a DualShock 4 calls itself "Wireless
+// Controller" - so match the families we know and fall back to the raw name.
+static void set_pad_name(const wchar_t* raw) {
+    std::wstring s(raw ? raw : L"");
+    for (size_t i = 0; i < s.size(); i++) s[i] = (wchar_t)towlower(s[i]);
+    const wchar_t* name = NULL;
+    if (s.find(L"dualsense") != std::wstring::npos) name = L"DualSense";
+    else if (s.find(L"dualshock") != std::wstring::npos) name = L"DualShock";
+    else if (s.find(L"xbox") != std::wstring::npos) name = L"Xbox Controller";
+    else if (s.find(L"pro controller") != std::wstring::npos ||
+             s.find(L"switch") != std::wstring::npos) name = L"Switch Controller";
+    else if (s.find(L"wireless controller") != std::wstring::npos) name = L"DualShock";
+    if (name) wcscpy(g_pad_name, name);
+    else if (raw && *raw) { wcsncpy(g_pad_name, raw, 47); g_pad_name[47] = 0; }
+    else wcscpy(g_pad_name, L"Third Party");
+}
+
+// Battery, the other way round.
+//
+// Only the long USB and Bluetooth-extended reports carry a battery byte. A
+// DualSense paired over Bluetooth sends the short report until something puts
+// it into extended mode - and doing that ourselves is exactly what leaves the
+// pad unreadable to every other app, which is the bug this project already
+// spent a long time chasing. So instead we ask Windows, which surfaces the
+// figure it shows in Settings as a device property on the Bluetooth node
+// above our HID device.
+static const DEVPROPKEY kPkeyBattery = {
+    {0x104ea319, 0x6ee2, 0x4701, {0xbd, 0x47, 0x8d, 0xdb, 0xf4, 0x25, 0xbb, 0xe5}},
+    2};
+
+static int battery_from_devnode() {
+    if (!g_pad_inst_count) return -1;
+    DEVINST inst;
+    if (CM_Locate_DevNodeW(&inst, (DEVINSTID_W)g_pad_inst[0].c_str(),
+                           CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+        return -1;
+    // The property sits on the Bluetooth device, a few nodes above the HID
+    // interface we opened, so walk up until it turns up.
+    for (int depth = 0; depth < 6; depth++) {
+        DEVPROPTYPE type = 0;
+        BYTE val = 0;
+        ULONG size = sizeof(val);
+        if (CM_Get_DevNode_PropertyW(inst, &kPkeyBattery, &type, &val, &size, 0)
+                == CR_SUCCESS && type == DEVPROP_TYPE_BYTE && val <= 100)
+            return val;
+        DEVINST parent;
+        if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS) break;
+        inst = parent;
+    }
+    return -1;
+}
+
+static bool path_is_dualsense(const wchar_t* path) {
+    HANDLE q = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (q == INVALID_HANDLE_VALUE) return false;
+    HIDD_ATTRIBUTES a = {sizeof(a)};
+    bool ok = HidD_GetAttributes(q, &a) != FALSE && a.VendorID == SONY_VID &&
+              (a.ProductID == PID_DUALSENSE || a.ProductID == PID_DUALSENSE_EDGE);
+    CloseHandle(q);
+    return ok;
+}
+
+
+// --- Generic HID gamepad ----------------------------------------------------
+// The DualSense gets a hand-written parser above because its reports are laid
+// out differently over USB and Bluetooth and neither is worth guessing at.
+// Every other pad describes itself: a HID report descriptor says which bits
+// are which axis and which are buttons, and HidP_* decodes a report against
+// it. That is what this reads.
+//
+// Doing it this way, rather than through DirectInput, is also what makes such
+// a pad hideable. HidHide's whitelist covers this process opening the device
+// itself; it does not cover DirectInput, which stops finding a device the
+// moment it is hidden. Same handle, same whitelist, so the pad stays ours.
+#define HID_PAGE_GENERIC 0x01
+#define HID_PAGE_BUTTON  0x09
+#define HID_USAGE_X      0x30
+#define HID_USAGE_Y      0x31
+#define HID_USAGE_Z      0x32
+#define HID_USAGE_RX     0x33
+#define HID_USAGE_RY     0x34
+#define HID_USAGE_RZ     0x35
+#define HID_USAGE_HAT    0x39
+#define HID_USAGE_JOYSTICK 0x04
+#define HID_USAGE_GAMEPAD  0x05
+
+struct HidVal {
+    bool   present;
+    USAGE  usage;
+    LONG   lmin, lmax;
+    USHORT bits;
+};
+
+static PHIDP_PREPARSED_DATA g_hid_pp = NULL; // kept for the life of the handle
+static HidVal g_hv_lx, g_hv_ly, g_hv_rx, g_hv_ry, g_hv_lt, g_hv_rt, g_hv_hat;
+static bool   g_hv_trig_shared = false;   // one axis carries both triggers
+static USHORT g_hv_btn_max = 0;           // highest button the pad declares
+
+static void hid_free_preparsed() {
+    if (g_hid_pp) { HidD_FreePreparsedData(g_hid_pp); g_hid_pp = NULL; }
+}
+
+// One axis, normalised to the -1000..1000 the rest of the app works in.
+// The range a field really spans.
+//
+// A report descriptor writes Logical Maximum as the smallest number of bytes
+// that will hold it, and the HID parser sign-extends what it finds. So a pad
+// declaring a maximum of 255 in one byte reports it back as -1, and 32767 in
+// two bytes as -1 likewise: the range reads as empty or inverted. Every axis
+// then scaled to exactly zero and never moved, which is what a dead stick
+// looks like. Where the declared range is unusable, the field's own width is
+// what it actually spans.
+static bool hid_range(const HidVal& a, LONG& lmin, LONG& lmax) {
+    lmin = a.lmin;
+    lmax = a.lmax;
+    if (lmax > lmin) return true;
+    if (a.bits > 0 && a.bits < 32) {
+        lmin = 0;
+        lmax = (LONG)((1ul << a.bits) - 1);
+        return true;
+    }
+    return false;
+}
+
+static int hid_read_axis(const HidVal& a, const BYTE* buf, DWORD len) {
+    if (!a.present || !g_hid_pp) return 0;
+    LONG lmin, lmax;
+    if (!hid_range(a, lmin, lmax)) return 0;
+    ULONG raw = 0;
+    if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, a.usage, &raw,
+                           g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
+        return 0;
+    // A descriptor with a negative logical minimum is reporting a signed
+    // value, which arrives here as the raw bits and has to be extended.
+    LONG v = (LONG)raw;
+    if (lmin < 0 && a.bits > 0 && a.bits < 32 &&
+        (raw & (1ul << (a.bits - 1))))
+        v = (LONG)(raw | (~0ul << a.bits));
+    double span = (double)lmax - (double)lmin;
+    if (span <= 0.0) return 0;
+    double n = ((double)v - (double)lmin) / span;      // 0..1
+    int out = (int)((n * 2.0 - 1.0) * 1000.0);
+    if (out >  1000) out =  1000;
+    if (out < -1000) out = -1000;
+    return out;
+}
+
+// Hats come as 4 or 8 positions, with anything outside the range meaning
+// centred. Folded to the same 0=up,1=right,2=down,3=left the rest uses.
+static int hid_read_hat(const BYTE* buf, DWORD len) {
+    if (!g_hv_hat.present || !g_hid_pp) return -1;
+    ULONG raw = 0;
+    if (HidP_GetUsageValue(HidP_Input, HID_PAGE_GENERIC, 0, HID_USAGE_HAT, &raw,
+                           g_hid_pp, (PCHAR)buf, len) != HIDP_STATUS_SUCCESS)
+        return -1;
+    LONG lmin, lmax;
+    if (!hid_range(g_hv_hat, lmin, lmax)) return -1;
+    LONG v = (LONG)raw - lmin;
+    LONG n = lmax - lmin + 1;
+    if (v < 0 || v >= n) return -1;
+    if (n <= 4) return (int)v;
+    return (int)(((v + 1) / 2) % 4);      // 8-way, diagonals fold to a cardinal
+}
+
+static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st) {
+    if (!g_hid_pp) return false;
+    st.lx = hid_read_axis(g_hv_lx, buf, len);
+    st.ly = hid_read_axis(g_hv_ly, buf, len);
+    st.rx = hid_read_axis(g_hv_rx, buf, len);
+    st.ry = hid_read_axis(g_hv_ry, buf, len);
+    st.hat = hid_read_hat(buf, len);
+
+    st.mask = 0;
+    USAGE list[64];
+    ULONG n = 64;
+    if (HidP_GetUsages(HidP_Input, HID_PAGE_BUTTON, 0, list, &n, g_hid_pp,
+                       (PCHAR)buf, len) == HIDP_STATUS_SUCCESS)
+        for (ULONG i = 0; i < n; i++) {
+            if (list[i] >= 1 && list[i] <= 16)
+                st.mask |= 1u << (list[i] - 1);
+            else if (list[i] > 16 && list[i] <= 16 + BTN_EXTRA_N)
+                st.mask |= 1u << (BTN_EXTRA_BASE + (list[i] - 17));
+        }
+
+    // Triggers that live on their own axes rather than as buttons become
+    // buttons here, the way the D-pad does, so they can be bound at all.
+    if (g_hv_trig_shared) {
+        int t = hid_read_axis(g_hv_lt, buf, len);
+        if (t < -400) st.mask |= 1u << BTN_LTRIG;
+        if (t >  400) st.mask |= 1u << BTN_RTRIG;
+    } else {
+        if (g_hv_lt.present && hid_read_axis(g_hv_lt, buf, len) > 200)
+            st.mask |= 1u << BTN_LTRIG;
+        if (g_hv_rt.present && hid_read_axis(g_hv_rt, buf, len) > 200)
+            st.mask |= 1u << BTN_RTRIG;
+    }
+    return true;
+}
+
+// Work out from the descriptor where everything is. Returns false if this
+// collection does not look like something with a stick and some buttons.
+static bool hid_map_generic(PHIDP_PREPARSED_DATA pp, const HIDP_CAPS& caps) {
+    g_hv_lx = g_hv_ly = g_hv_rx = g_hv_ry = HidVal{};
+    g_hv_lt = g_hv_rt = g_hv_hat = HidVal{};
+    g_hv_trig_shared = false;
+    g_hv_btn_max = 0;
+    if (!caps.NumberInputValueCaps) return false;
+
+    USHORT n = caps.NumberInputValueCaps;
+    HIDP_VALUE_CAPS* vc = (HIDP_VALUE_CAPS*)calloc(n, sizeof(HIDP_VALUE_CAPS));
+    if (!vc) return false;
+    HidVal found[6] = {};        // X Y Z Rx Ry Rz, in that order
+    bool hat = false;
+    HidVal hatv = {};
+    if (HidP_GetValueCaps(HidP_Input, vc, &n, pp) == HIDP_STATUS_SUCCESS) {
+        for (USHORT i = 0; i < n; i++) {
+            if (vc[i].UsagePage != HID_PAGE_GENERIC) continue;
+            // A descriptor may name each axis, or declare a run of them as
+            // one range - X through Rz in a single entry. Skipping the range
+            // form loses every axis on the pads that use it.
+            USAGE lo = vc[i].IsRange ? vc[i].Range.UsageMin
+                                     : vc[i].NotRange.Usage;
+            USAGE hi = vc[i].IsRange ? vc[i].Range.UsageMax
+                                     : vc[i].NotRange.Usage;
+            for (USAGE u = lo; u <= hi; u++) {
+                HidVal v = {true, u, vc[i].LogicalMin, vc[i].LogicalMax,
+                            vc[i].BitSize};
+                if (u == HID_USAGE_HAT) { hat = true; hatv = v; }
+                else if (u >= HID_USAGE_X && u <= HID_USAGE_RZ)
+                    found[u - HID_USAGE_X] = v;
+            }
+        }
+    }
+    free(vc);
+
+    g_hv_btn_max = 0;
+    if (caps.NumberInputButtonCaps) {
+        USHORT bn = caps.NumberInputButtonCaps;
+        HIDP_BUTTON_CAPS* bc =
+            (HIDP_BUTTON_CAPS*)calloc(bn, sizeof(HIDP_BUTTON_CAPS));
+        if (bc) {
+            if (HidP_GetButtonCaps(HidP_Input, bc, &bn, pp) ==
+                HIDP_STATUS_SUCCESS)
+                for (USHORT i = 0; i < bn; i++) {
+                    if (bc[i].UsagePage != HID_PAGE_BUTTON) continue;
+                    USHORT hi = bc[i].IsRange ? bc[i].Range.UsageMax
+                                              : bc[i].NotRange.Usage;
+                    if (hi > g_hv_btn_max) g_hv_btn_max = hi;
+                }
+            free(bc);
+        }
+    }
+
+    HidVal X = found[0], Y = found[1], Z = found[2];
+    HidVal RX = found[3], RY = found[4], RZ = found[5];
+    if (!X.present || !Y.present) return false;
+
+    g_hv_lx = X;
+    g_hv_ly = Y;
+    g_hv_hat = hat ? hatv : HidVal{};
+
+    // Where the right stick lives is the one thing pads genuinely disagree
+    // on. Rx and Ry means an XInput-shaped descriptor, and Z and Rz are then
+    // the triggers; otherwise Z and Rz are the stick.
+    if (RX.present && RY.present) {
+        g_hv_rx = RX;
+        g_hv_ry = RY;
+        g_hv_lt = Z;
+        g_hv_rt = RZ;
+        // XInput hands both triggers to one axis, one pushing it each way.
+        // Treating that as a single trigger left the other unreachable.
+        g_hv_trig_shared = Z.present && !RZ.present;
+        // Rx and Ry with no Rz is the shape an XInput pad describes, and
+        // its button order comes with it. Anything else gets numbered
+        // buttons, which are never wrong even when the make is unknown.
+        g_pad_layout = RZ.present ? PADL_GENERIC : PADL_XINPUT;
+    } else {
+        g_hv_rx = Z;             // Z and Rz, where there is no Rx and Ry
+        g_hv_ry = RZ;
+        g_pad_layout = PADL_GENERIC;
+    }
+    return true;
+}
+
+// Open any HID gamepad or joystick, whatever make it is.
+static bool hid_try_path_generic(const wchar_t* path, bool exclusive) {
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE),
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    PHIDP_PREPARSED_DATA pp = NULL;
+    HIDP_CAPS caps = {};
+    if (!HidD_GetPreparsedData(h, &pp)) { CloseHandle(h); return false; }
+    if (HidP_GetCaps(pp, &caps) != HIDP_STATUS_SUCCESS ||
+        caps.UsagePage != HID_PAGE_GENERIC ||
+        (caps.Usage != HID_USAGE_GAMEPAD && caps.Usage != HID_USAGE_JOYSTICK) ||
+        !caps.NumberInputButtonCaps || !hid_map_generic(pp, caps)) {
+        HidD_FreePreparsedData(pp);
+        CloseHandle(h);
+        return false;
+    }
+
+    hid_free_preparsed();
+    g_hid_pp = pp;               // the parser needs this for every report
+    g_hid = h;
+    g_hid_generic = true;
+    g_hid_bt = false;
+    g_hid_inlen = caps.InputReportByteLength;
+    if (g_hid_inlen > sizeof(g_hid_buf)) g_hid_inlen = sizeof(g_hid_buf);
+    g_hid_ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_hid_pending = false;
+    memset(&g_hid_state, 0, sizeof(g_hid_state));
+    g_hid_state.hat = -1;
+    g_hid_gen++;
+    g_hid_have_report = false;
+
+    HIDD_ATTRIBUTES attr = {sizeof(attr)};
+    if (HidD_GetAttributes(h, &attr)) {
+        g_hid_vid = attr.VendorID;
+        g_hid_pid = attr.ProductID;
+    }
+    wchar_t prod[128] = L"";
+    if (HidD_GetProductString(h, prod, sizeof(prod)) && prod[0]) {
+        wcsncpy(g_pad_name, prod, 47);
+        g_pad_name[47] = 0;
+    } else {
+        wcscpy(g_pad_name, L"Controller");
+    }
+    padprof_bind(g_hid_vid, g_hid_pid, g_pad_name);
+    return true;
+}
+
+// Every HID collection a given device exposes, by instance ID, which is what
+// HidHide blacklists by. Hiding only the collection we read from would leave
+// the rest of them visible to whatever else is listening - which for a pad
+// with separate gamepad, motion and audio collections is most of it.
+//
+// Split out from hid_scan because that only ever looks for a DualSense: a pad
+// reached through DirectInput has to be found by the ids DirectInput reports
+// for it, or it never gets hidden at all.
+static void hid_collect_instances(USHORT vid, USHORT pid) {
+    g_pad_inst_count = 0;
+    if (!vid && !pid) return;
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return;
+    SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd) &&
+         g_pad_inst_count < MAX_INST; i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        SP_DEVINFO_DATA dev = {sizeof(dev)};
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, &dev)) {
+            HANDLE q = CreateFileW(det->DevicePath, 0,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+            if (q != INVALID_HANDLE_VALUE) {
+                HIDD_ATTRIBUTES a = {sizeof(a)};
+                bool match = HidD_GetAttributes(q, &a) && a.VendorID == vid &&
+                             a.ProductID == pid;
+                CloseHandle(q);
+                wchar_t inst[512];
+                if (match &&
+                    SetupDiGetDeviceInstanceIdW(set, &dev, inst, 512, NULL))
+                    g_pad_inst[g_pad_inst_count++] = inst;
+            }
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+}
+
+static bool hid_scan(bool exclusive) {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return false;
+
+    bool opened = false;
+    g_pad_inst_count = 0;
+    SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        SP_DEVINFO_DATA dev = {sizeof(dev)};
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, &dev)) {
+            // Record every DualSense collection, not just the one we read
+            // from: hiding only the gamepad collection would leave the others
+            // visible to whatever else is listening.
+            if (path_is_dualsense(det->DevicePath) && g_pad_inst_count < MAX_INST) {
+                wchar_t inst[512];
+                if (SetupDiGetDeviceInstanceIdW(set, &dev, inst, 512, NULL))
+                    g_pad_inst[g_pad_inst_count++] = inst;
+            }
+            if (!opened && hid_try_path(det->DevicePath, exclusive)) opened = true;
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    if (opened) return true;
+
+    // No DualSense. Anything that describes itself as a gamepad will do -
+    // its report descriptor says where everything is, so it can be read
+    // through our own handle like the DualSense is, and hidden like it too.
+    set = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                               DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return false;
+    for (DWORD i = 0; !opened &&
+         SetupDiEnumDeviceInterfaces(set, NULL, &hidGuid, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* det =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(need);
+        if (!det) continue;
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, NULL, NULL) &&
+            hid_try_path_generic(det->DevicePath, exclusive))
+            opened = true;
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    // Its own collections, so HidHide has the right thing to hide.
+    if (opened) hid_collect_instances(g_hid_vid, g_hid_pid);
+    return opened;
+}
+
+// Exclusive is best-effort: if something already holds the pad we still want
+// to work, just without blocking it.
+static bool hid_open(bool exclusive) {
+    if (g_hid != INVALID_HANDLE_VALUE) return true;
+    if (exclusive && hid_scan(true)) { g_hid_exclusive = true; return true; }
+    if (hid_scan(false)) { g_hid_exclusive = false; return true; }
+    return false;
+}
+
+static inline int hid_axis(BYTE v) {   // 0..255 (128 centre) -> -1000..1000
+    int n = ((int)v - 128) * 1000 / 127;
+    if (n > 1000) n = 1000;
+    if (n < -1000) n = -1000;
+    return n;
+}
+
+// DualSense hat: 0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW,8+=centred.
+static inline int hid_hat(BYTE b) {
+    int h = b & 0x0F;
+    if (h > 7) return -1;
+    return ((h + 1) / 2) % 4;
+}
+
+static void hid_buttons(const BYTE* b, PadState& st) {
+    st.hat = hid_hat(b[0]);
+    unsigned m = 0;
+    if (b[0] & 0x10) m |= 1u << 0;    // Square
+    if (b[0] & 0x20) m |= 1u << 1;    // Cross
+    if (b[0] & 0x40) m |= 1u << 2;    // Circle
+    if (b[0] & 0x80) m |= 1u << 3;    // Triangle
+    if (b[1] & 0x01) m |= 1u << 4;    // L1
+    if (b[1] & 0x02) m |= 1u << 5;    // R1
+    if (b[1] & 0x04) m |= 1u << 6;    // L2
+    if (b[1] & 0x08) m |= 1u << 7;    // R2
+    if (b[1] & 0x10) m |= 1u << 8;    // Create
+    if (b[1] & 0x20) m |= 1u << 9;    // Options
+    if (b[1] & 0x40) m |= 1u << 10;   // L3
+    if (b[1] & 0x80) m |= 1u << 11;   // R3
+    if (b[2] & 0x01) m |= 1u << 12;   // PS
+    if (b[2] & 0x02) m |= 1u << 13;   // Touchpad click
+    st.mask = m;
+}
+
+// The three report layouts the pad can be in. USB 0x01 and Bluetooth extended
+// 0x31 share a payload that differs only by a one-byte header shift; the short
+// Bluetooth 0x01 report orders its fields differently.
+static bool hid_parse_generic(const BYTE* buf, DWORD len, PadState& st);
+
+static bool hid_parse(const BYTE* buf, DWORD len, PadState& st) {
+    if (g_hid_generic) return hid_parse_generic(buf, len, st);
+    if (len < 10) return false;
+    if (buf[0] == 0x01 && g_hid_bt) {          // Bluetooth basic
+        // Same axis offsets as the USB layout, but the button bytes sit three
+        // earlier - which is why getting this branch wrong leaves the sticks
+        // working and every button dead.
+        st.lx = hid_axis(buf[1]);
+        st.ly = hid_axis(buf[2]);
+        st.rx = hid_axis(buf[3]);
+        st.ry = hid_axis(buf[4]);
+        hid_buttons(buf + 5, st);
+        return true;
+    }
+    int off;
+    if (buf[0] == 0x01) off = 1;               // USB full report
+    else if (buf[0] == 0x31) off = 2;          // Bluetooth extended
+    else return false;
+    if (len < (DWORD)off + 10) return false;
+
+    // Battery lives in the status byte 52 bytes into the payload, past the
+    // sensor and touch blocks. Low nibble is a 0-10 capacity, high nibble the
+    // charging state. Only the long reports carry it; the short Bluetooth one
+    // stops well before, so the last known value stands.
+    if (len >= (DWORD)off + 53) {
+        BYTE status = buf[off + 52];
+        int level = status & 0x0F;
+        int charge = (status >> 4) & 0x0F;
+        int pct = level * 10 + 5;
+        if (pct > 100) pct = 100;
+        g_pad_batt = pct;
+        g_pad_charging = (charge == 0x1 || charge == 0x2);
+        g_batt_from_report = true;
+    }
+    st.lx = hid_axis(buf[off + 0]);
+    st.ly = hid_axis(buf[off + 1]);
+    st.rx = hid_axis(buf[off + 2]);
+    st.ry = hid_axis(buf[off + 3]);
+    hid_buttons(buf + off + 7, st);
+    return true;
+}
+
+// Drain every report queued since the last call and keep the newest, so input
+// never lags behind a pad that reports faster than this loop runs.
+static bool hid_poll(PadState& out) {
+    if (g_hid == INVALID_HANDLE_VALUE) return false;
+    bool alive = true;
+    for (int guard = 0; guard < 64; guard++) {
+        if (!g_hid_pending) {
+            ResetEvent(g_hid_ov.hEvent);
+            if (!ReadFile(g_hid, g_hid_buf, g_hid_inlen, NULL, &g_hid_ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) { alive = false; break; }
+            }
+            g_hid_pending = true;
+        }
+        if (WaitForSingleObject(g_hid_ov.hEvent, 0) != WAIT_OBJECT_0) break;
+        DWORD got = 0;
+        if (!GetOverlappedResult(g_hid, &g_hid_ov, &got, FALSE)) { alive = false; break; }
+        g_hid_pending = false;
+        if (hid_parse(g_hid_buf, got, g_hid_state)) g_hid_have_report = true;
+    }
+    if (!alive) { hid_close(); return false; }
+    out = g_hid_state;
+    return true;
+}
+
+// --- DirectInput controller worker -----------------------------------------
+// DirectInput axes are mapped (after SetProperty below) to [-1000, 1000]:
+//   lX  = left stick X     lY  = left stick Y     lRz = right stick Y
+// Buttons (DualSense / DualShock layout): [1] = Cross, [2] = Circle.
+static LPDIRECTINPUT8       g_di = NULL;
+static LPDIRECTINPUTDEVICE8 g_dev = NULL;
+
+struct AxisScan { bool x, y, z, rx, ry, rz; };
+
+static BOOL CALLBACK axis_cb(LPCDIDEVICEOBJECTINSTANCEW o, LPVOID pv) {
+    AxisScan* a = (AxisScan*)pv;
+    if      (IsEqualGUID(o->guidType, GUID_XAxis))  a->x = true;
+    else if (IsEqualGUID(o->guidType, GUID_YAxis))  a->y = true;
+    else if (IsEqualGUID(o->guidType, GUID_ZAxis))  a->z = true;
+    else if (IsEqualGUID(o->guidType, GUID_RxAxis)) a->rx = true;
+    else if (IsEqualGUID(o->guidType, GUID_RyAxis)) a->ry = true;
+    else if (IsEqualGUID(o->guidType, GUID_RzAxis)) a->rz = true;
+    return DIENUM_CONTINUE;
+}
+
+static double apply_deadzone(double value, double dz) {
+    double a = fabs(value);
+    if (a < dz) return 0.0;
+    double scaled = (a - dz) / (1.0 - dz);
+    if (scaled > 1.0) scaled = 1.0;
+    return (value > 0 ? 1.0 : -1.0) * scaled;
+}
+
+static double norm(LONG raw, double dz) {
+    double n = raw / 1000.0;
+    if (n > 1.0) n = 1.0;
+    if (n < -1.0) n = -1.0;
+    return apply_deadzone(n, dz);
+}
+
+#define MAX_PADS 8
+static GUID g_pad_guids[MAX_PADS];
+static int  g_pad_count = 0;
+static GUID g_open_guid = {};        // pad we currently have open
+static GUID g_last_good = {};        // last pad that actually produced input
+static bool g_have_last_good = false;
+
+static std::wstring g_pad_names[MAX_PADS];
+
+static BOOL CALLBACK enum_cb(const DIDEVICEINSTANCEW* inst, void*) {
+    if (g_pad_count < MAX_PADS) {
+        g_pad_names[g_pad_count] = inst->tszProductName;
+        g_pad_guids[g_pad_count++] = inst->guidInstance;
+    }
+    return DIENUM_CONTINUE;   // collect them all; ensure_device() picks
+}
+
+static void set_axis_range(DWORD offset) {
+    DIPROPRANGE pr = {};
+    pr.diph.dwSize = sizeof(DIPROPRANGE);
+    pr.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+    pr.diph.dwHow = DIPH_BYOFFSET;
+    pr.diph.dwObj = offset;
+    pr.lMin = -1000;
+    pr.lMax = 1000;
+    g_dev->SetProperty(DIPROP_RANGE, &pr.diph);
+}
+
+static void drop_device() {
+    if (g_dev) {
+        g_dev->Unacquire();
+        g_dev->Release();
+        g_dev = NULL;
+        // The collections listed belong to the device that just went away.
+        g_pad_inst_count = 0;
+    }
+}
+
+// Open one specific pad. Returns false (leaving no device open) unless it was
+// configured completely - a half-configured device polls fine but reports
+// nothing, which is indistinguishable from a dead controller.
+static bool try_open(const GUID& guid) {
+    if (FAILED(g_di->CreateDevice(guid, &g_dev, NULL))) {
+        g_dev = NULL;
+        return false;
+    }
+    if (FAILED(g_dev->SetDataFormat(&c_dfDIJoystick2)) ||
+        FAILED(g_dev->SetCooperativeLevel(g_hwnd,
+                                          DISCL_BACKGROUND | DISCL_NONEXCLUSIVE))) {
+        drop_device();
+        return false;
+    }
+    // Which axes exist tells us both where the right stick is and what the
+    // buttons should be called.
+    AxisScan ax = {};
+    g_dev->EnumObjects(axis_cb, &ax, DIDFT_ABSAXIS);
+    if (ax.x)  set_axis_range(DIJOFS_X);
+    if (ax.y)  set_axis_range(DIJOFS_Y);
+    if (ax.z)  set_axis_range(DIJOFS_Z);
+    if (ax.rx) set_axis_range(DIJOFS_RX);
+    if (ax.ry) set_axis_range(DIJOFS_RY);
+    if (ax.rz) set_axis_range(DIJOFS_RZ);
+    // Rx and Ry with no Rz is the shape Windows gives an XInput pad.
+    bool xin = ax.rx && ax.ry && !ax.rz;
+    g_pad_rstick_rxry = xin;
+    g_pad_layout = xin ? PADL_XINPUT : (ax.rz ? PADL_PS : PADL_GENERIC);
+
+    // Which HID device this actually is, so HidHide has something to hide.
+    // Without this only a DualSense was ever hideable, and every other pad
+    // reported "no controller was found to hide" while plainly connected.
+    DIPROPDWORD vp = {};
+    vp.diph.dwSize = sizeof(vp);
+    vp.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+    vp.diph.dwHow = DIPH_DEVICE;
+    vp.diph.dwObj = 0;
+    if (SUCCEEDED(g_dev->GetProperty(DIPROP_VIDPID, &vp.diph))) {
+        g_hid_vid = LOWORD(vp.dwData);
+        g_hid_pid = HIWORD(vp.dwData);
+        hid_collect_instances(g_hid_vid, g_hid_pid);
+        padprof_bind(g_hid_vid, g_hid_pid, NULL);
+    } else {
+        g_pad_inst_count = 0;
+    }
+
+    g_dev->Acquire();   // may fail transiently; the poll loop retries
+    g_open_guid = guid;
+    g_hid_gen++;
+    return true;
+}
+
+static bool ensure_device() {
+    if (g_dev) return true;
+    if (!g_di) {
+        if (FAILED(DirectInput8Create(GetModuleHandleW(NULL), DIRECTINPUT_VERSION,
+                                      IID_IDirectInput8, (void**)&g_di, NULL)))
+            return false;
+    }
+    g_pad_count = 0;
+    g_di->EnumDevices(DI8DEVCLASS_GAMECTRL, enum_cb, NULL, DIEDFL_ATTACHEDONLY);
+    if (!g_pad_count) return false;
+
+    // Prefer the pad we last actually received input from. Games (and Steam
+    // Input) can register virtual controllers that enumerate ahead of the real
+    // one; binding to a virtual pad looks exactly like a dead controller, and
+    // it persists across app restarts because the enumeration order does.
+    if (g_have_last_good)
+        for (int i = 0; i < g_pad_count; i++)
+            if (IsEqualGUID(g_pad_guids[i], g_last_good) && try_open(g_pad_guids[i])) {
+                set_pad_name(g_pad_names[i].c_str());
+                return true;
+            }
+
+    for (int i = 0; i < g_pad_count; i++)
+        if (try_open(g_pad_guids[i])) {
+            set_pad_name(g_pad_names[i].c_str());
+            return true;
+        }
+    return false;
+}
+
+static DWORD WINAPI worker_thread(LPVOID) {
+    double scroll_accum = 0.0;
+    double move_ax = 0.0, move_ay = 0.0;   // sub-pixel cursor remainder
+    double scroll_vel = 0.0;               // smoothed stick input for the wheel
+    bool a_down = false, b_down = false;
+
+    int dpad_prev = -1;
+    ULONGLONG dpad_t0 = 0, dpad_last = 0;  // hold-to-repeat timing
+    unsigned btn_mask_prev = 0;            // all-button mask, for edge detection
+    ULONGLONG hold_t0[F_COUNT] = {};       // when each bound button went down
+    bool hold_fired[F_COUNT] = {};         // its hold action already ran
+    ULONGLONG tbtn_last_fire = 0;          // debounce reference for the toggle
+    ULONGLONG gamechk_last = 0;            // last fullscreen-game check
+    bool game_prev = false;                // previous fullscreen-game state
+    // Whether the pad should be held exclusively right now. Computed at the
+    // end of each iteration from the mapping state, so the pad is grabbed only
+    // while we are actually driving the mouse and is handed straight back the
+    // moment the mapping is switched off or pauses for a game.
+    bool want_exclusive = false;
+    int  open_fail_streak = 0;             // consecutive failures to see any pad
+    bool radial_up = false;                // radial picker is on screen
+    int  rad_idx = 1;                      // flyout selection, tracked locally
+    int  rad_deflect = -1;                 // -1 centred, 0 left, 2 right
+    bool med_up = false;                   // the media flyout is on screen
+    int  med_idx = 0, med_deflect = -1;
+    int  med_row = 0;                      // 0 controls, 1 the seek bar
+    int  med_vdeflect = 0, med_seek_dir = 0;
+    ULONGLONG med_hold_t0 = 0, med_last = 0;
+    int  med_reps = 0;
+    ULONGLONG batt_last = 0;               // last battery property read
+    unsigned hid_gen_seen = 0;             // handle generation our edges refer to
+    // Volume and seek repeat state, one set each, in F_VOLUP order.
+    ULONGLONG fgchk_last = 0;              // when the foreground was last read
+    bool      fg_profile = false;          // the focused app has its own layout
+    int       fg_bind[F_COUNT] = {};
+    ULONGLONG media_t0[4] = {}, media_last[4] = {};
+    int       media_reps[4] = {};          // repeats so far, drives acceleration
+
+    while (g_running) {
+        Config cfg = get_cfg();
+        bool a = false, b = false;
+
+        // Prefer raw HID (a DualSense we can read in any report mode); fall
+        // back to DirectInput for every other pad.
+        PadState st = {};
+        st.hat = -1;
+        bool got = false;
+
+        if (g_hid != INVALID_HANDLE_VALUE || (!g_dev && hid_open(want_exclusive)))
+            got = hid_poll(st);
+
+        if (!got && g_hid == INVALID_HANDLE_VALUE) {
+            if (!ensure_device()) {
+                g_connected = false;
+                scroll_accum = 0.0;
+                edge_click_release_all(a_down, b_down);
+                // If we are hiding the pad and can no longer see it either,
+                // the whitelist is not doing its job - unhide rather than sit
+                // there having made the controller invisible to everyone.
+                if (g_hh_hiding && ++open_fail_streak >= 8) {
+                    hh_hide(false);
+                    g_hh_whitelisted = false;   // stop re-hiding until restart
+                    open_fail_streak = 0;
+                }
+                Sleep(400);
+                continue;
+            }
+            open_fail_streak = 0;
+            DIJOYSTATE2 js;
+            HRESULT hr = g_dev->Poll();
+            if (FAILED(hr)) {
+                hr = g_dev->Acquire();
+                if (SUCCEEDED(hr)) hr = g_dev->Poll();  // fresh data after re-acquiring
+            }
+            if (SUCCEEDED(hr)) hr = g_dev->GetDeviceState(sizeof(js), &js);
+
+            if (FAILED(hr)) {  // unplugged, or another app took the device
+                drop_device();
+                g_connected = false;
+                scroll_accum = 0.0;
+                // Let go of anything we are holding down. Without this an
+                // injected LEFTDOWN outlives the app: the desktop is stuck
+                // mid-drag, and even killing the process cannot clear it,
+                // because the button state lives in the OS input stack
+                // rather than in here.
+                edge_click_release_all(a_down, b_down);
+                for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
+                dpad_prev = -1;
+                btn_mask_prev = 0;
+                Sleep(300);
+                continue;
+            }
+            st.lx = js.lX;
+            st.ly = js.lY;
+            if (g_pad_rstick_rxry) { st.rx = js.lRx; st.ry = js.lRy; }
+            else                   { st.rx = js.lZ;  st.ry = js.lRz; }
+            st.hat = pov_dir(js.rgdwPOV[0]);
+            for (int bi = 0; bi < 16; bi++)
+                if (js.rgbButtons[bi] & 0x80) st.mask |= (1u << bi);
+            // An XInput pad shares one axis between the two triggers, one
+            // pushing it each way, so neither is a button until we make it
+            // one. Without this the triggers cannot be bound at all.
+            if (g_pad_rstick_rxry) {
+                if (js.lZ < -400) st.mask |= 1u << BTN_LTRIG;
+                if (js.lZ >  400) st.mask |= 1u << BTN_RTRIG;
+            }
+            if (st.mask || st.lx || st.ly || st.ry || st.hat != -1) {
+                g_last_good = g_open_guid;   // remember the real pad, not a virtual one
+                g_have_last_good = true;
+            }
+            got = true;
+        }
+
+        if (!got) {   // HID pad went away mid-read
+            g_connected = false;
+            scroll_accum = 0.0;
+            scroll_vel = 0.0;
+            move_ax = move_ay = 0.0;
+            edge_click_release_all(a_down, b_down);
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
+            dpad_prev = -1;
+            btn_mask_prev = 0;
+            Sleep(300);
+            continue;
+        }
+
+        g_connected = true;
+        g_dbg_lx = st.lx; g_dbg_ly = st.ly;
+        g_dbg_rx = st.rx; g_dbg_ry = st.ry;
+        g_dbg_hat = st.hat; g_dbg_mask = st.mask;
+        unsigned mask = st.mask;
+        if (st.hat >= 0) mask |= 1u << (BTN_DPAD_UP + st.hat);
+
+        // A reopened handle starts with no history, so a button still held
+        // across the reopen would look like a brand new press. That is what
+        // made the toggle button fire twice: toggling changes the hide state,
+        // which rebuilds the device stack, which reopens the handle - all
+        // while the touchpad is still physically down. Treat everything as
+        // already-held; these clear themselves on the first poll that shows a
+        // button released.
+        // Wait for a genuine report before reconciling, then adopt exactly
+        // what the pad currently reads. Adopting the real state (rather than
+        // assuming everything is held) means a button spanning the reopen
+        // produces no edge, while one released during it still works on its
+        // next press.
+        if (g_hid_gen != hid_gen_seen &&
+            (g_hid == INVALID_HANDLE_VALUE || g_hid_have_report)) {
+            hid_gen_seen = g_hid_gen;
+            btn_mask_prev = mask;              // adopt every button at once
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
+            dpad_prev = st.hat;
+        }
+
+        // Edge helpers over the raw mask, so every action reads its own bound
+        // button rather than a hard-coded index.
+        unsigned prev_mask = btn_mask_prev;
+        auto bit = [&](int f) {
+            int b = cfg.bind[f];
+            return (b >= 0 && b < 32) ? b : -1;
+        };
+        auto is_down = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && ((mask >> b) & 1) != 0;
+        };
+        auto went_down = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && ((mask >> b) & 1) && !((prev_mask >> b) & 1);
+        };
+        auto btn_is_down = [&](int b) {
+            return b >= 0 && b < 32 && ((mask >> b) & 1) != 0;
+        };
+        auto btn_went_down = [&](int b) {
+            return b >= 0 && b < 32 && ((mask >> b) & 1) &&
+                   !((prev_mask >> b) & 1);
+        };
+        auto went_up = [&](int f) {
+            int b = bit(f);
+            return b >= 0 && !((mask >> b) & 1) && ((prev_mask >> b) & 1);
+        };
+
+        ULONGLONG bnow = GetTickCount64();
+        // Cleared on press, not on release: the release-edge checks below run
+        // in this same iteration and rely on hold_fired still saying whether a
+        // hold already ran. Clearing it here made every hold look like a tap
+        // as well, which closed the search keyboard the moment the button came
+        // up and fired play/pause on top of a fullscreen hold.
+        for (int f = 0; f < F_COUNT; f++)
+            if (went_down(f)) { hold_t0[f] = bnow; hold_fired[f] = false; }
+
+        // Works even while the mapping is off, so it can turn it back on.
+        // Debounced: toggling rebuilds the device stack and a touchpad click
+        // can bounce, either of which can present a second edge within a few
+        // tens of milliseconds.
+        if (went_down(F_TOGGLE) && bnow - tbtn_last_fire >= 300) {
+            tbtn_last_fire = bnow;
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_TOGGLE, 0);
+        }
+        btn_mask_prev = mask;
+
+        // Battery: only worth asking Windows when the pad itself is not
+        // telling us, and it moves slowly enough that once a minute is plenty.
+        if (!g_batt_from_report && bnow - batt_last >= 60000) {
+            batt_last = bnow;
+            int b = battery_from_devnode();
+            if (b >= 0) { g_pad_batt = b; g_pad_charging = false; }
+        }
+
+        // Which app is in front, and so whose layout applies. Same
+        // cadence as the game check below, for the same reason.
+        if (bnow - fgchk_last >= 400) {
+            fgchk_last = bnow;
+            wchar_t exe[128];
+            foreground_exe(exe, 128);
+            EnterCriticalSection(&g_cs);
+            int r = app_rule_index(exe);
+            if (r >= 0 && g_apps[r].profile) {
+                memcpy(fg_bind, g_apps[r].bind, sizeof(fg_bind));
+                fg_profile = true;
+            } else {
+                fg_profile = false;
+            }
+            LeaveCriticalSection(&g_cs);
+        }
+        if (fg_profile) memcpy(cfg.bind, fg_bind, sizeof(cfg.bind));
+
+        // Game check: at most two cheap API calls every 2 seconds.
+        if (cfg.game_pause) {
+            ULONGLONG gnow = GetTickCount64();
+            if (gnow - gamechk_last >= 2000) {
+                g_game_active = is_game_running();
+                gamechk_last = gnow;
+            }
+        } else {
+            g_game_active = false;
+        }
+        if (!g_game_active) g_override = false;  // override lasts one game session
+
+        // A fullscreen game just exited. Re-open the pad from scratch: an
+        // acquisition held across a game that grabbed the device can survive
+        // in a state where it polls and reads fine but never reports input
+        // again - which looked like a soft lock that only replugging fixed.
+        if (game_prev && !g_game_active) {
+            drop_device();
+            hid_close();   // reopened next iteration, in whatever mode it is now in
+            edge_click_release_all(a_down, b_down);
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
+            dpad_prev = -1;
+            btn_mask_prev = mask;
+            game_prev = false;
+            Sleep(150);
+            continue;
+        }
+        game_prev = g_game_active;
+
+        // Stick to cursor and wheel. Pulled out of the main path because
+        // the button-layout page wants this and nothing else: the sticks
+        // aren't what is being bound, so there is no reason to strand the
+        // cursor while someone presses buttons at it.
+        auto run_pointer = [&]() {
+            // Three things matter here for fine control, and they have to
+            // work together:
+            //
+            //  * Radial deadzone and magnitude. Treating the axes separately
+            //    lets a diagonal reach a magnitude of 1.41, so diagonals ran
+            //    faster than cardinals; this normalises the vector instead.
+            //  * A response curve. Raising the normalised magnitude to a power
+            //    keeps full deflection at full speed while stretching the
+            //    slow end of the range over much more stick travel, which is
+            //    what makes small adjustments possible at a high sensitivity.
+            //  * Sub-pixel accumulation. Rounding each poll independently
+            //    discards anything under half a pixel, so below a certain
+            //    deflection the cursor simply would not move no matter how
+            //    gentle the curve. The remainder is carried to the next poll.
+            //  * A floor under that accumulation. Carrying the remainder
+            //    means any speed above zero eventually emits a pixel, so a
+            //    stick resting a hair outside its dead zone crawls - about a
+            //    pixel every three seconds, which is invisible as motion but
+            //    perfectly visible to anything watching for it. That is what
+            //    kept a video's controls awake: they would time out and a
+            //    stray pixel would wake them immediately, forever. Anything
+            //    slower than a pixel a second is drift, not aiming - it would
+            //    take a quarter of an hour to cross a screen - so it is
+            //    dropped rather than banked.
+            double rx = st.lx / 1000.0, ry = st.ly / 1000.0;
+            double m = sqrt(rx * rx + ry * ry);
+            if (m > 1.0) { rx /= m; ry /= m; m = 1.0; }
+            if (radial_up || med_up) m = 0.0;   // stick is steering a flyout
+            double speed = 0.0;
+            if (m > cfg.deadzone) {
+                double t = (m - cfg.deadzone) / (1.0 - cfg.deadzone);
+                speed = pow(t, cfg.mouse_curve) * cfg.mouse_sensitivity;
+            }
+            // ~120 polls a second, so this is roughly a pixel per second.
+            if (speed > 0.008) {
+                move_ax += (rx / m) * speed;
+                move_ay += (ry / m) * speed;   // Y is screen-oriented
+                LONG dx = (LONG)move_ax, dy = (LONG)move_ay;
+                if (dx || dy) {
+                    mouse_move(dx, dy);
+                    move_ax -= dx;
+                    move_ay -= dy;
+                }
+            } else {
+                move_ax = move_ay = 0.0;
+            }
+
+            // Scrolling, smoothed three ways, with the same floor under it
+            // and for the same reason. The wheel used to move only in whole
+            // notches, which at 120Hz meant long gaps followed by a jump.
+            //  * a low-pass filter on the stick, so the wheel eases in and out
+            //    of motion instead of snapping to it and twitching on noise;
+            //  * the same response curve as the cursor, so a small push scrolls
+            //    slowly and fine control survives a high sensitivity;
+            //  * fractional wheel deltas, so movement is spread across every
+            //    poll rather than saved up into discrete steps.
+            double target = norm(st.ry, cfg.deadzone);   // stick up -> scroll down
+            scroll_vel += (target - scroll_vel) * 0.22;
+            if (fabs(scroll_vel) > 0.012) {
+                double mag = pow(fabs(scroll_vel), cfg.mouse_curve);
+                double dir = scroll_vel < 0 ? -1.0 : 1.0;
+                scroll_accum += dir * mag * cfg.scroll_sensitivity;
+                int delta = (int)(scroll_accum * WHEEL_DELTA);
+                if (delta) {
+                    mouse_scroll(delta);
+                    scroll_accum -= (double)delta / WHEEL_DELTA;
+                }
+            } else {
+                scroll_vel = 0.0;
+                scroll_accum = 0.0;
+            }
+        };
+
+        bool mapping_on = cfg.enabled &&
+                          !(cfg.game_pause && g_game_active && !g_override);
+
+        if ((!mapping_on || g_listen) && med_up) {
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_HIDE, 0);
+            med_up = false;
+        }
+
+        if (g_listen) {
+            // The button-layout page is open. Report the first button of any
+            // fresh press and act on none of them, so the press being bound
+            // doesn't also fire whatever is already on it - but keep driving
+            // the cursor, since the page still has to be usable.
+            unsigned fresh = mask & ~prev_mask;
+            if (fresh) {
+                int idx = 0;
+                while (!(fresh & (1u << idx))) idx++;
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_PRESSED, idx);
+            }
+            if (cfg.enabled) run_pointer();
+            edge_click_release_all(a_down, b_down);
+            btn_mask_prev = mask;
+            Sleep(8);
+            continue;
+        }
+
+
+        if (mapping_on) {
+            run_pointer();
+
+            if (is_down(F_KEYBOARD) && !hold_fired[F_KEYBOARD] &&
+                bnow - hold_t0[F_KEYBOARD] >= 500) {
+                // Already open: close it, rather than sending the search
+                // hotkey a second time. Several launchers treat that hotkey
+                // as their own open/close toggle, so resending it looked
+                // like ctrlmouse itself was fighting to close the search.
+                PostMessageW(g_hwnd, WM_GAMEPAD,
+                             g_kb_visible ? GP_KB_TOGGLE
+                             : (cfg.search_mode ? GP_PT_SEARCH : GP_KB_SEARCH),
+                             0);
+                hold_fired[F_KEYBOARD] = true;
+            }
+            if (went_up(F_KEYBOARD) && !hold_fired[F_KEYBOARD])
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
+
+            // Browser-style navigation on the shoulder buttons, sent as the
+            // mouse side buttons so it works wherever those already do.
+            if (!g_kb_external) {
+                if (went_down(F_BACK))    mouse_xbutton(XBUTTON1);
+                if (went_down(F_FORWARD)) mouse_xbutton(XBUTTON2);
+            }
+
+            // Checked before the popups so it works whichever of them
+            // happens to be up.
+            if (went_down(F_LAUNCHER))
+                PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_TOGGLE, 0);
+
+            if (g_lx_visible) {
+                // Launcher owns navigation and the click buttons while up.
+                if (went_down(F_LCLICK))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_SELECT, 0);
+                if (went_down(F_RCLICK))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_CLOSE, 0);
+                int dir = st.hat;
+                if (dir != dpad_prev) {
+                    if (dir != -1) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
+                        dpad_t0 = dpad_last = bnow;
+                    }
+                    dpad_prev = dir;
+                } else if (dir != -1 && bnow - dpad_t0 >= 400 &&
+                           bnow - dpad_last >= 110) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_LX_NAV, dir);
+                    dpad_last = bnow;
+                }
+            } else if (g_kb_visible) {
+
+                // PowerToys owns the result list, and our D-pad is busy with
+                // the keys, so the shoulder buttons walk it.
+                if (g_kb_external) {
+                    if (went_down(F_BACK))    tap_key(VK_UP);
+                    if (went_down(F_FORWARD)) tap_key(VK_DOWN);
+                }
+                // While typing, the play/pause button is a shortcut to Enter -
+                // it moves the selection there rather than pressing it, so a
+                // second press is still a deliberate act.
+                if (went_down(F_PLAYPAUSE))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_ENTER, 0);
+                if (went_down(F_LCLICK))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_SELECT, 0);
+                if (went_down(F_RCLICK))
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_BACKSPACE, 0);
+                // D-pad with hold-to-repeat: first move immediately, then
+                // after 400ms repeat every 110ms while held.
+                int dir = st.hat;
+                if (dir != dpad_prev) {
+                    if (dir != -1) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_NAV, dir);
+                        dpad_t0 = dpad_last = bnow;
+                    }
+                    dpad_prev = dir;
+                } else if (dir != -1 && bnow - dpad_t0 >= 400 &&
+                           bnow - dpad_last >= 110) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_NAV, dir);
+                    dpad_last = bnow;
+                }
+            } else {
+                // The media flyout borrows Cross and the D-pad while it
+                // is up, so neither does its usual job.
+                a = is_down(F_LCLICK) && !med_up;
+                b = is_down(F_RCLICK) && !med_up;
+                dpad_prev = -1;
+
+                // Fullscreen is a hold: the flyout appears, the left stick
+                // slides the underline along it, and letting go sends the
+                // shortcut under it.
+                if (is_down(F_FULLSCREEN) && !hold_fired[F_FULLSCREEN] &&
+                    !med_up && bnow - hold_t0[F_FULLSCREEN] >= 300) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 0);
+                    hold_fired[F_FULLSCREEN] = true;
+                    radial_up = true;
+                    rad_idx = 1;            // always opens on the middle option
+                    rad_deflect = -1;
+                }
+
+                // Media is a toggle rather than a hold: it stays up until
+                // the same button puts it away again, so the stick is free
+                // and both hands are. Cross is what fires the highlighted
+                // control - holding it repeats volume and seek, accelerating
+                // the way the D-pad already does, since one step of volume is
+                // rarely what anyone wanted. Play/pause never repeats.
+                if (went_down(F_MEDIAFLY) && !radial_up) {
+                    if (med_up) {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_HIDE, 0);
+                        med_up = false;
+                    } else {
+                        PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SHOW, 1);
+                        med_up = true;
+                        med_idx = MED_PLAY;
+                        med_row = 0;
+                        med_deflect = -1;
+                        med_vdeflect = 0;
+                        med_seek_dir = 0;
+                        med_hold_t0 = 0;
+                        med_last = 0;
+                        med_reps = 0;
+                    }
+                }
+                if (med_up) {
+                    // Up and down move between the controls and the seek
+                    // bar; either stick or D-pad, and the stick is read as a
+                    // step rather than a position for the same reason the
+                    // fullscreen one is.
+                    double sx = st.lx / 1000.0, sy = st.ly / 1000.0;
+                    int vdir = (sy < -0.5) ? -1 : (sy > 0.5) ? 1 : 0;
+                    int vstep = 0;
+                    if (vdir != med_vdeflect) { vstep = vdir; med_vdeflect = vdir; }
+                    if (btn_went_down(BTN_DPAD_UP))   vstep = -1;
+                    if (btn_went_down(BTN_DPAD_DOWN)) vstep = 1;
+                    if (vstep) {
+                        int want = med_row + (vstep > 0 ? 1 : -1);
+                        if (want >= 0 && want <= 1 && want != med_row) {
+                            med_row = want;
+                            med_seek_dir = 0;
+                            med_hold_t0 = 0;
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_ROW, med_row);
+                        }
+                    }
+
+                    int hdir = (sx < -0.33) ? -1 : (sx > 0.33) ? 1 : 0;
+                    if (btn_is_down(BTN_DPAD_LEFT))  hdir = -1;
+                    if (btn_is_down(BTN_DPAD_RIGHT)) hdir = 1;
+
+                    if (med_row == 0) {
+                        // The controls row steps between the icons.
+                        int step = 0;
+                        if (hdir != med_deflect) { step = hdir; med_deflect = hdir; }
+                        if (btn_went_down(BTN_DPAD_LEFT))  step = -1;
+                        if (btn_went_down(BTN_DPAD_RIGHT)) step = 1;
+                        if (step) {
+                            int want = med_idx + step;
+                            if (want >= 0 && want < NMEDIA && want != med_idx) {
+                                med_idx = want;
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL,
+                                             med_idx);
+                            }
+                        }
+                        // Cross fires it, and keeps firing what is worth
+                        // repeating.
+                        if (went_down(F_LCLICK)) {
+                            med_hold_t0 = bnow;
+                            med_last = bnow;
+                            med_reps = 0;
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                         med_idx);
+                        } else if (is_down(F_LCLICK) && media_repeats(med_idx) &&
+                                   med_hold_t0 && bnow - med_hold_t0 >= 350) {
+                            int gap = 140 - med_reps * 8;
+                            if (gap < 40) gap = 40;
+                            if (bnow - med_last >= (ULONGLONG)gap) {
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_REPEAT,
+                                             med_idx);
+                                med_last = bnow;
+                                med_reps++;
+                            }
+                        }
+                    } else {
+                        // On the bar, left and right seek directly - no
+                        // second button, since there is only one thing the
+                        // row can do - and hold to keep going.
+                        med_deflect = hdir;
+                        if (hdir != med_seek_dir) {
+                            med_seek_dir = hdir;
+                            med_hold_t0 = bnow;
+                            med_last = bnow;
+                            med_reps = 0;
+                            if (hdir)
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_SEEK,
+                                             hdir);
+                        } else if (hdir && bnow - med_hold_t0 >= 350) {
+                            int gap = 140 - med_reps * 8;
+                            if (gap < 40) gap = 40;
+                            if (bnow - med_last >= (ULONGLONG)gap) {
+                                PostMessageW(g_hwnd, WM_GAMEPAD, GP_MED_SEEK,
+                                             hdir);
+                                med_last = bnow;
+                                med_reps++;
+                            }
+                        }
+                    }
+                }
+                if (radial_up && is_down(F_FULLSCREEN)) {
+                    // Read as a step, not a live position: the stick springs
+                    // back to dead centre - the same place a genuine push
+                    // toward the middle option would leave it - the instant
+                    // it's let go, so position alone can't tell "released"
+                    // from "chose the middle option" apart. A fresh push past
+                    // the threshold steps the selection one way or the other
+                    // instead, and the middle option is simply one step off
+                    // either side, so it's still reachable - releasing the
+                    // stick just isn't itself a step.
+                    double sx = st.lx / 1000.0;
+                    int dir = (sx < -0.33) ? 0 : (sx > 0.33) ? 2 : -1;
+                    if (dir != rad_deflect) {
+                        if (dir == 0 && rad_idx > 0) rad_idx--;
+                        if (dir == 2 && rad_idx < NRADIAL - 1) rad_idx++;
+                        rad_deflect = dir;
+                        if (dir != -1)
+                            PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_SEL, rad_idx);
+                    }
+                }
+                if (radial_up && went_up(F_FULLSCREEN)) {
+                    PostMessageW(g_hwnd, WM_GAMEPAD, GP_RAD_PICK, 0);
+                    radial_up = false;
+                }
+                // Play/pause is a tap. If it shares a button with fullscreen -
+                // as it does by default - it can only fire on release, once a
+                // hold has been ruled out. On its own button it fires at once.
+                if (cfg.bind[F_PLAYPAUSE] == cfg.bind[F_FULLSCREEN]) {
+                    if (went_up(F_PLAYPAUSE) && !hold_fired[F_FULLSCREEN])
+                        tap_key(VK_MEDIA_PLAY_PAUSE);
+                } else if (went_down(F_PLAYPAUSE)) {
+                    tap_key(VK_MEDIA_PLAY_PAUSE);
+                }
+
+                // Whatever shortcut this button carries, if any. Sent on
+                // the press edge, like the taps above.
+                for (int i = 0; i < NSC; i++) {
+                    int sb = cfg.sc_btn[i];
+                    if (sb < 0 || sb >= 32 || !cfg.sc_vk[i]) continue;
+                    if (((mask >> sb) & 1) && !((prev_mask >> sb) & 1))
+                        send_hotkey(cfg.sc_mods[i], cfg.sc_vk[i]);
+                }
+
+                // Volume and seek. Ordinary actions now rather than the
+                // D-pad specifically, so they can be moved anywhere; they
+                // just start out on it. Each holds to repeat, and speeds up
+                // the longer it is held: 140ms down to 40ms. The gap is
+                // signed on purpose - in unsigned it wrapped once the
+                // subtraction went negative and stalled the repeat.
+                static const WORD kMediaVk[4] = {
+                    VK_VOLUME_UP, VK_VOLUME_DOWN, VK_RIGHT, VK_LEFT};
+                for (int m = 0; m < 4 && !med_up; m++) {
+                    int f = F_VOLUP + m;
+                    if (went_down(f)) {
+                        media_t0[m] = media_last[m] = bnow;
+                        media_reps[m] = 0;
+                        tap_key(kMediaVk[m]);
+                    } else if (is_down(f) && bnow - media_t0[m] >= 350) {
+                        int gap = 140 - media_reps[m] * 8;
+                        if (gap < 40) gap = 40;
+                        if (bnow - media_last[m] >= (ULONGLONG)gap) {
+                            tap_key(kMediaVk[m]);
+                            media_last[m] = bnow;
+                            media_reps[m]++;
+                        }
+                    }
+                }
+            }
+        } else {
+            scroll_accum = 0.0;
+            scroll_vel = 0.0;
+            move_ax = move_ay = 0.0;
+            dpad_prev = -1;
+
+            for (int f = 0; f < F_COUNT; f++) hold_fired[f] = true;
+        }
+
+        btn_mask_prev = mask;
+
+        edge_click(a, a_down, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+        edge_click(b, b_down, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
+
+        // Re-open the pad if the required access level changed. Dropping the
+        // handle is what hands the controller back to other apps, so this is
+        // also what makes the toggle button work as a "give me my pad back"
+        // gesture mid-stream.
+        bool now_exclusive = mapping_on;
+        if (now_exclusive != want_exclusive) {
+            want_exclusive = now_exclusive;
+            if (g_hid != INVALID_HANDLE_VALUE && g_hid_exclusive != now_exclusive)
+                hid_close();   // reopened at the top of the next iteration
+        }
+
+        // Hide the pad from every other application while we own it, so the
+        // D-pad and L3 cannot drive menus or media at the same time as us.
+        // Whitelisting ourselves first is what stops us hiding it from
+        // ourselves; if that failed we never hide anything.
+        //
+        // Only for a pad we read through our own HID handle. Being on
+        // HidHide's whitelist covers this process opening the device itself,
+        // which is what that backend does - it does not carry DirectInput,
+        // which stops finding the device the moment it is hidden. Hiding one
+        // of those takes the controller away from us along with everyone
+        // else, which is worse than not hiding it at all.
+        if (g_hh != INVALID_HANDLE_VALUE) {
+            bool want_hide = now_exclusive && g_hid != INVALID_HANDLE_VALUE;
+            if (want_hide && !g_pad_inst_count && (g_hid_vid || g_hid_pid))
+                hid_collect_instances(g_hid_vid, g_hid_pid);
+            hh_hide(want_hide && g_pad_inst_count > 0);
+        }
+
+        Sleep(8);  // ~120 Hz
+    }
+
+    // Never exit holding a button: an unmatched LEFTDOWN would leave the whole
+    // desktop stuck in a drag after we are gone.
+    edge_click_release_all(a_down, b_down);
+    hh_hide(false);   // give the pad back before we go
+    hid_close();
+    drop_device();
+    if (g_di) {
+        g_di->Release();
+        g_di = NULL;
+    }
+    return 0;
+}
+
+// --- On-screen keyboard window ----------------------------------------------
+// A non-activating topmost popup: it never takes focus, so the keys it sends
+// go to whichever application the user is actually working in.
+struct KbKey { const wchar_t* label; WORD vk; int units; };
+
+static const KbKey KB_ROW0[] = {{L"1",'1',1},{L"2",'2',1},{L"3",'3',1},{L"4",'4',1},{L"5",'5',1},
+                                {L"6",'6',1},{L"7",'7',1},{L"8",'8',1},{L"9",'9',1},{L"0",'0',1}};
+static const KbKey KB_ROW1[] = {{L"Q",'Q',1},{L"W",'W',1},{L"E",'E',1},{L"R",'R',1},{L"T",'T',1},
+                                {L"Y",'Y',1},{L"U",'U',1},{L"I",'I',1},{L"O",'O',1},{L"P",'P',1}};
+static const KbKey KB_ROW2[] = {{L"A",'A',1},{L"S",'S',1},{L"D",'D',1},{L"F",'F',1},{L"G",'G',1},
+                                {L"H",'H',1},{L"J",'J',1},{L"K",'K',1},{L"L",'L',1}};
+static const KbKey KB_ROW3[] = {{L"Z",'Z',1},{L"X",'X',1},{L"C",'C',1},{L"V",'V',1},{L"B",'B',1},
+                                {L"N",'N',1},{L"M",'M',1},{L",",VK_OEM_COMMA,1},{L".",VK_OEM_PERIOD,1}};
+static const KbKey KB_ROW4[] = {{L"Shift",VK_SHIFT,2},{L"Space",VK_SPACE,6},{L"Enter",VK_RETURN,2}};
+
+static const KbKey* KB_ROWS[] = {KB_ROW0, KB_ROW1, KB_ROW2, KB_ROW3, KB_ROW4};
+static const int    KB_COUNT[] = {10, 10, 9, 9, 3};
+#define KB_NROWS 5
+
+// Geometry, in DIPs: 48 unit keys, 6 gaps, 12 margin.
+//
+// No drop shadow around the card: this window is WS_EX_LAYERED with a single
+// constant alpha (that is what the open/close fade animates), which gives no
+// per-pixel alpha, and ID2D1HwndRenderTarget is opaque - so anything drawn
+// outside the card would composite as solid black rather than as a soft
+// shadow. Depth comes from DWM's rounded corners plus the in-card key glow
+// instead. Real per-pixel shadows would need UpdateLayeredWindow with a WIC
+// bitmap target, which is incompatible with the constant-alpha fade.
+#define KB_KU 48
+#define KB_GAP 6
+#define KB_M 12
+#define KB_W (10 * KB_KU + 9 * KB_GAP + 2 * KB_M)
+#define KB_H (KB_NROWS * KB_KU + (KB_NROWS - 1) * KB_GAP + 2 * KB_M)
+
+// Dark theme palette. Keys are not flat fills: each is a soft vertical
+// gradient with a lit top edge and a faint sheen falling away from it, which
+// is what gives a physical, raised look without any transparency.
+// Windows 11 Fluent dark theme. Values follow the documented WinUI resources
+// so the popups read as part of the OS rather than as a lookalike: flat fills,
+// a single hairline border, small corner radii, and accent-filled selection
+// with black text - which is what dark-theme Windows does, because the dark
+// accent is a light blue.
+#define KB_CLR_BG     RGB(32, 32, 32)    // SolidBackgroundFillColorBase
+#define KB_CLR_KEY    RGB(59, 59, 59)    // ControlFillColorDefault over the base
+#define KB_CLR_SEL    RGB(76, 194, 255)  // AccentFillColorDefault (dark theme)
+#define KB_CLR_ARMED  RGB(90, 90, 90)    // toggled control, kept neutral so it
+                                         // does not compete with selection
+#define KB_CLR_TEXT   RGB(255, 255, 255) // TextFillColorPrimary
+#define KB_CLR_TEXT2  RGB(200, 200, 200) // TextFillColorSecondary (~78.6%)
+#define KB_CLR_ONACC  RGB(0, 0, 0)       // TextOnAccentFillColorPrimary
+#define KB_BORDER_A   0.08f              // ControlStrokeColorDefault (~7%)
+#define KB_RADIUS     6.0f               // control corner radius
+#define KB_CARD_RADIUS 8.0f              // flyout / container corner radius
+
+static HWND   g_kb = NULL;
+static int    g_kb_row = 1, g_kb_col = 0;
+static bool   g_kb_shift = false;
+
+// --- Search mode ------------------------------------------------------------
+// Holding the keyboard button opens it with a search field instead of typing
+// into whatever has focus. This exists because the on-screen keyboard cannot
+// be drawn over the Start menu - the shell reserves that z-order band for
+// uiAccess processes - so rather than fight for the Start search box, the
+// keyboard carries its own.
+#define KB_SEARCH_FIELD 46
+#define KB_RES_H        30
+#define KB_RES_MAX      5
+#define KB_SEARCH_H     (KB_SEARCH_FIELD + KB_RES_MAX * KB_RES_H + 10)
+#define KB_INDEX_MAX    600
+
+struct AppEntry { std::wstring name, path; };
+static AppEntry g_index[KB_INDEX_MAX];
+static int      g_index_count = 0;
+static bool     g_index_built = false;
+
+static bool     g_kb_search = false;      // keyboard is in search mode
+static wchar_t  g_kb_query[64] = L"";
+static int      g_kb_res[KB_RES_MAX];     // indices into g_index
+static int      g_kb_res_count = 0;
+static int      g_kb_res_sel = 0;
+static bool     g_kb_in_res = false;      // focus is in the results, not the keys
+
+static int kb_y_off() { return g_kb_search ? KB_SEARCH_H : 0; }
+
+// Everything the Start menu lists comes from these two folders, so walking
+// them gives the same set of applications without touching the search index.
+static void index_dir(const std::wstring& dir, int depth) {
+    if (g_index_count >= KB_INDEX_MAX || depth > 4) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        std::wstring full = dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            index_dir(full, depth + 1);
+        } else {
+            const wchar_t* ext = wcsrchr(fd.cFileName, L'.');
+            if (ext && _wcsicmp(ext, L".lnk") == 0 && g_index_count < KB_INDEX_MAX) {
+                std::wstring nm(fd.cFileName);
+                nm.resize(nm.size() - 4);          // drop .lnk
+                g_index[g_index_count].name = nm;
+                g_index[g_index_count].path = full;
+                g_index_count++;
+            }
+        }
+    } while (g_index_count < KB_INDEX_MAX && FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void build_index() {
+    if (g_index_built) return;
+    g_index_built = true;
+    g_index_count = 0;
+    const int folders[2] = {CSIDL_COMMON_PROGRAMS, CSIDL_PROGRAMS};
+    for (int i = 0; i < 2; i++) {
+        wchar_t path[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, folders[i], NULL, 0, path)))
+            index_dir(path, 0);
+    }
+}
+
+static std::wstring lower_of(const std::wstring& s) {
+    std::wstring o(s);
+    for (size_t i = 0; i < o.size(); i++) o[i] = (wchar_t)towlower(o[i]);
+    return o;
+}
+
+// Prefix matches first, then anything containing the query - the same ordering
+// intuition as Start, without pretending to be a real ranker.
+// Defined with the launcher, which shares it: opening something already
+// running should switch to it rather than start a second copy.
+static bool activate_running(const std::wstring& path);
+
+// Prefix matches first, then anything containing the query - the same ordering
+// intuition as Start, without pretending to be a real ranker.
+static void kb_search_update() {
+    g_kb_res_count = 0;
+    g_kb_res_sel = 0;
+    if (!g_kb_query[0]) return;
+    build_index();
+    std::wstring q = lower_of(g_kb_query);
+    for (int pass = 0; pass < 2 && g_kb_res_count < KB_RES_MAX; pass++) {
+        for (int i = 0; i < g_index_count && g_kb_res_count < KB_RES_MAX; i++) {
+            std::wstring n = lower_of(g_index[i].name);
+            size_t at = n.find(q);
+            if (at == std::wstring::npos) continue;
+            if ((pass == 0) != (at == 0)) continue;
+            bool dup = false;
+            for (int j = 0; j < g_kb_res_count; j++)
+                if (g_kb_res[j] == i) dup = true;
+            if (!dup) g_kb_res[g_kb_res_count++] = i;
+        }
+    }
+}
+
+static void kb_search_launch() {
+    if (g_kb_res_sel < 0 || g_kb_res_sel >= g_kb_res_count) return;
+    std::wstring path = g_index[g_kb_res[g_kb_res_sel]].path;
+    PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);   // dismiss, then run
+    if (!activate_running(path))
+        ShellExecuteW(NULL, L"open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+// The only GDI object left: the window-class background brush, which just
+// prevents a white flash between window creation and the first D2D paint.
+static HBRUSH g_kb_bg = NULL;
+
+// Open/close + key-press animation state.
+static int       g_kb_anim = 0;           // 0 idle, 1 opening, 2 closing
+static ULONGLONG g_kb_anim_t0 = 0;
+static ULONGLONG g_kb_pulse_t0 = 0;       // key-press flash start (0 = none)
+static int       g_kb_x = 0, g_kb_y = 0;  // resting position
+#define KB_TIMER    1
+#define KB_ANIM_MS  160
+#define KB_PULSE_MS 140
+#define KB_SLIDE    26
+
+static void init_theme() {
+    g_kb_bg = CreateSolidBrush(KB_CLR_BG);
+}
+
+// --- Direct2D / DirectWrite --------------------------------------------------
+// Both windows are fully D2D-drawn. All layout in this file is expressed in
+// DIPs (device-independent pixels, 1 DIP = 1px at 96 DPI); each render target
+// is told the real monitor DPI, so Direct2D scales every shape and glyph to
+// physical pixels itself. That is what keeps the UI sharp on a 4K display
+// instead of being bitmap-stretched by the compositor.
+static UINT g_dpi = 96;
+
+static inline float  dpi_scale()          { return g_dpi / 96.0f; }
+static inline int    dip_to_px(int dip)   { return MulDiv(dip, (int)g_dpi, 96); }
+static inline int    px_to_dip(int px)    { return MulDiv(px, 96, (int)g_dpi); }
+
+static ID2D1Factory1*     g_d2d_factory = NULL;
+
+// Undocumented but stable since Windows 10: the API real flyouts and
+// tooltips use for frosted glass behind a borderless popup, as opposed to
+// the Windows 11 Mica APIs, which only render properly behind windows with a
+// real caption/frame - a plain WS_EX_TOOLWINDOW popup got a solid white
+// plate instead of material from those. Plain blur-behind rather than the
+// "acrylic" variant: acrylic's own noise-texture layer painted as a square
+// covering the whole window rectangle regardless of our own alpha mask,
+// showing as a boxy outline around the rounded card; this respects the
+// per-pixel alpha shape properly, the way custom-shaped overlays have relied
+// on it to for years.
+static void enable_acrylic(HWND hwnd) {
+    enum { WCA_ACCENT_POLICY = 19 };
+    enum { ACCENT_ENABLE_BLURBEHIND = 3 };
+    struct ACCENT_POLICY {
+        int   AccentState;
+        int   AccentFlags;
+        DWORD GradientColor;   // 0xAABBGGRR: alpha is the tint's own strength
+        int   AnimationId;
+    };
+    struct WINCOMPATTRDATA {
+        int   Attrib;
+        void* pvData;
+        SIZE  cbData;
+    };
+    typedef BOOL(WINAPI * SetWCA)(HWND, WINCOMPATTRDATA*);
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    SetWCA set = u ? (SetWCA)GetProcAddress(u, "SetWindowCompositionAttribute")
+                   : NULL;
+    if (!set) return;
+    ACCENT_POLICY accent = {ACCENT_ENABLE_BLURBEHIND, 0,
+                            (DWORD)((140u << 24) | RGB(32, 32, 36)), 0};
+    WINCOMPATTRDATA data = {WCA_ACCENT_POLICY, &accent, sizeof(accent)};
+    set(hwnd, &data);
+}
+
+// A window that needs per-pixel alpha - blur-behind, and any rounded corner
+// that isn't a plain rectangle, both need it - can't use an
+// ID2D1HwndRenderTarget: that always presents opaque. This is the DC render
+// target + DIB + UpdateLayeredWindow combination that gives real per-pixel
+// alpha instead, bundled up since three windows now use it.
+struct LayeredSurface {
+    ID2D1DCRenderTarget* rt = NULL;
+    HDC     dc = NULL;
+    HBITMAP dib = NULL;
+    int     w = 0, h = 0;
+};
+
+static void layered_release(LayeredSurface& s) {
+    if (s.dc) { DeleteDC(s.dc); s.dc = NULL; }
+    if (s.dib) { DeleteObject(s.dib); s.dib = NULL; }
+    if (s.rt) { s.rt->Release(); s.rt = NULL; }
+    s.w = s.h = 0;
+}
+
+// Binds the DIB (recreating it if the pixel size changed) and starts drawing.
+// Follow with the usual Direct2D calls, then layered_present().
+static bool layered_begin(LayeredSurface& s, int w, int h) {
+    if (!s.rt) {
+        if (!g_d2d_factory) return false;
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED),
+            (float)g_dpi, (float)g_dpi);
+        if (FAILED(g_d2d_factory->CreateDCRenderTarget(&props, &s.rt))) {
+            s.rt = NULL;
+            return false;
+        }
+        s.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    }
+    if (!s.dib || s.w != w || s.h != h) {
+        if (s.dc) { DeleteDC(s.dc); s.dc = NULL; }
+        if (s.dib) { DeleteObject(s.dib); s.dib = NULL; }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;          // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HDC screen = GetDC(NULL);
+        s.dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        s.dc = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+        if (!s.dib || !s.dc) return false;
+        SelectObject(s.dc, s.dib);
+        s.w = w;
+        s.h = h;
+    }
+    RECT bind = {0, 0, w, h};
+    if (FAILED(s.rt->BindDC(s.dc, &bind))) return false;
+    s.rt->BeginDraw();
+    return true;
+}
+
+// alpha is the whole-window blend (0-255), for entry/exit fades. pos is the
+// window's screen position to move it to, or NULL to leave wherever it
+// already is - for a window whose position is driven separately (by
+// SetWindowPos, during a slide animation), moving it again here would fight
+// that rather than help it.
+static bool layered_present(LayeredSurface& s, HWND hwnd, const POINT* pos,
+                            BYTE alpha) {
+    if (s.rt->EndDraw() == D2DERR_RECREATE_TARGET) { layered_release(s); return false; }
+    SIZE size = {s.w, s.h};
+    POINT src = {0, 0};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    HDC screen = GetDC(NULL);
+    POINT ptbuf;
+    if (pos) ptbuf = *pos;
+    UpdateLayeredWindow(hwnd, screen, pos ? &ptbuf : NULL, &size, s.dc, &src,
+                        0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+    return true;
+}
+
+// Re-presents the already-drawn content at a new whole-window alpha, without
+// redrawing it - all a slide/fade animation tick needs, and much cheaper
+// than a full BeginDraw/EndDraw cycle every 15ms.
+static void layered_present_alpha(LayeredSurface& s, HWND hwnd, BYTE alpha) {
+    if (!s.dc) return;
+    SIZE size = {s.w, s.h};
+    POINT src = {0, 0};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    HDC screen = GetDC(NULL);
+    UpdateLayeredWindow(hwnd, screen, NULL, &size, s.dc, &src, 0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+}
+
+static IDWriteFactory*    g_dwrite_factory = NULL;
+// Sizes are DIPs, and a touch larger than the old GDI fonts: this is often
+// driven from a couch, so the text needs to hold up at a distance.
+static IDWriteTextFormat* g_tf_body = NULL;    // 13, values
+static IDWriteTextFormat* g_tf_label = NULL;   // 13, dim labels
+static IDWriteTextFormat* g_tf_header = NULL;  // 15 semibold, status line
+static IDWriteTextFormat* g_tf_key = NULL;     // 18 semibold, keyboard keys
+static IDWriteTextFormat* g_tf_title = NULL;   // 24 semibold, page title
+static IDWriteTextFormat* g_tf_fly = NULL;     // 14 medium, flyout
+static IDWriteTextFormat* g_tf_ico = NULL;     // 17, the icon font
+static IDWriteTextFormat* g_tf_ico_lg = NULL;  // 21, same, for flyouts
+
+static ID2D1RenderTarget*     g_rt_main = NULL;  // Mica DC, or the Hwnd RT
+static ID2D1HwndRenderTarget* g_rt_main_hwnd = NULL;
+static ID2D1SolidColorBrush*  g_br_main_key = NULL;
+static ID2D1SolidColorBrush*  g_br_main_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_main_armed = NULL;
+static ID2D1SolidColorBrush*  g_br_main_toggle_off = NULL;
+static ID2D1SolidColorBrush*  g_br_main_text = NULL;
+static ID2D1SolidColorBrush*  g_br_main_dim = NULL;
+static ID2D1SolidColorBrush*  g_br_main_white = NULL;
+static ID2D1SolidColorBrush*  g_br_main_status = NULL;  // color set per-draw
+static ID2D1SolidColorBrush*  g_br_main_glow = NULL;    // alpha set per-draw
+static ID2D1SolidColorBrush*  g_br_main_onacc = NULL;   // knob/label on accent
+static ID2D1SolidColorBrush*  g_br_main_card = NULL;    // settings card face
+static ID2D1SolidColorBrush*  g_br_main_panel = NULL;   // opaque flyout surface
+static ID2D1SolidColorBrush*  g_br_main_border = NULL;  // its hairline stroke
+
+static LayeredSurface g_surf_kb;
+static float g_kb_alpha = 1.0f;   // whole-window blend for the slide/fade
+static ID2D1SolidColorBrush*  g_br_kb_bg = NULL;      // translucent card fill
+static ID2D1SolidColorBrush*  g_br_kb_key = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_armed = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_text = NULL;
+static ID2D1SolidColorBrush*  g_br_kb_flash = NULL;   // color set per-draw
+static ID2D1SolidColorBrush*  g_br_kb_onacc = NULL;   // label on an accent fill
+static ID2D1SolidColorBrush*  g_br_kb_border = NULL;  // hairline control stroke
+static ID2D1SolidColorBrush*  g_br_kb_dim = NULL;     // placeholder / secondary
+
+static inline D2D1_COLOR_F d2d_clr(COLORREF c, float a = 1.0f) {
+    return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
+                         GetBValue(c) / 255.0f, a);
+}
+
+static inline D2D1_RECT_F to_f(const RECT& r) {
+    return D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
+}
+
+static void d2d_init_process() {
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                      __uuidof(ID2D1Factory1), (void**)&g_d2d_factory);
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                        (IUnknown**)&g_dwrite_factory);
+    if (!g_dwrite_factory) return;
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &g_tf_body);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &g_tf_label);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 15.0f, L"en-us", &g_tf_header);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", &g_tf_key);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 24.0f, L"en-us", &g_tf_title);
+    g_dwrite_factory->CreateTextFormat(L"Segoe UI", NULL,
+        DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"en-us", &g_tf_fly);
+    // Windows ships the icons this app needs, so it draws them as text
+    // rather than as hand-built geometry: they are properly designed, they
+    // match the rest of the system, and they stay sharp at any size.
+    // "Segoe Fluent Icons" is Windows 11's set; Windows 10 has the older
+    // "Segoe MDL2 Assets", which carries the same code points for
+    // everything used here.
+    const wchar_t* icon_face = L"Segoe Fluent Icons";
+    {
+        IDWriteFontCollection* fc = NULL;
+        UINT32 idx = 0;
+        BOOL found = FALSE;
+        if (SUCCEEDED(g_dwrite_factory->GetSystemFontCollection(&fc)) && fc) {
+            fc->FindFamilyName(icon_face, &idx, &found);
+            fc->Release();
+        }
+        if (!found) icon_face = L"Segoe MDL2 Assets";
+    }
+    g_dwrite_factory->CreateTextFormat(icon_face, NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 17.0f, L"en-us", &g_tf_ico);
+    g_dwrite_factory->CreateTextFormat(icon_face, NULL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-us", &g_tf_ico_lg);
+    for (int i = 0; i < 2; i++) {
+        IDWriteTextFormat* f = i ? g_tf_ico_lg : g_tf_ico;
+        if (!f) continue;
+        f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    // Long descriptions truncate cleanly rather than running under the control
+    // on the right of the card.
+    IDWriteTextFormat* trim[] = {g_tf_body, g_tf_label};
+    for (int i = 0; i < 2; i++) {
+        if (!trim[i]) continue;
+        DWRITE_TRIMMING t = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        IDWriteInlineObject* sign = NULL;
+        if (SUCCEEDED(g_dwrite_factory->CreateEllipsisTrimmingSign(trim[i],
+                                                                   &sign))) {
+            trim[i]->SetTrimming(&t, sign);
+            sign->Release();
+        }
+    }
+    IDWriteTextFormat* left[] = {g_tf_body, g_tf_label, g_tf_header,
+                                 g_tf_title};
+    for (int i = 0; i < 4; i++) {
+        if (!left[i]) continue;
+        left[i]->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        left[i]->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        left[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    if (g_tf_fly) {
+        g_tf_fly->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_tf_fly->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    if (g_tf_key) {
+        g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_tf_key->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_tf_key->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+}
+
+// grayscale = the correct AA mode for a layered (per-window alpha) popup;
+// ClearType's subpixel weights are wrong once the window is composited
+// translucently, which is what makes GDI text look fringed there today.
+static ID2D1HwndRenderTarget* d2d_create_rt(HWND hwnd, bool grayscale_text) {
+    if (!g_d2d_factory) return NULL;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    ID2D1HwndRenderTarget* rt = NULL;
+    if (FAILED(g_d2d_factory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(),
+            D2D1::HwndRenderTargetProperties(hwnd,
+                D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top)),
+            &rt)))
+        return NULL;
+    rt->SetDpi((float)g_dpi, (float)g_dpi);   // draw in DIPs from here on
+    rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    rt->SetTextAntialiasMode(grayscale_text ? D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+                                            : D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+    return rt;
+}
+
+// Soft glow without ID2D1Effect (which would need a full ID2D1Device): stack
+// a few progressively larger, progressively fainter rounded rects behind the
+// shape. Cheap, and reads as a real blur at these sizes. Only valid over an
+// opaque background - see the note on the keyboard geometry above.
+// One rounded control, Fluent style: a flat fill plus a hairline stroke drawn
+// inside the bounds, so adjacent controls keep an even 1px line between them.
+static void draw_control(ID2D1RenderTarget* rt, D2D1_RECT_F r, float radius,
+                         ID2D1Brush* fill, ID2D1Brush* border) {
+    rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), fill);
+    if (border)
+        rt->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(r.left + 0.5f, r.top + 0.5f,
+                                          r.right - 0.5f, r.bottom - 0.5f),
+                              radius, radius),
+            border, 1.0f);
+}
+
+static void d2d_release_main() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_main_key, &g_br_main_sel, &g_br_main_armed,
+                                   &g_br_main_toggle_off, &g_br_main_text,
+                                   &g_br_main_dim, &g_br_main_white,
+                                   &g_br_main_status, &g_br_main_glow,
+                                   &g_br_main_onacc, &g_br_main_card,
+                                   &g_br_main_panel, &g_br_main_border};
+    for (int i = 0; i < 13; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    if (g_rt_main) { g_rt_main->Release(); g_rt_main = NULL; }
+}
+
+// --- Mica backdrop ----------------------------------------------------------
+// A plain HWND render target always presents opaque, so any window that
+// wants Mica behind it - the settings window, and now the flyout - renders
+// through a composition swap chain hosted on a DirectComposition visual
+// instead, the way WinUI does it: clear to transparent, DWM draws the Mica
+// material behind that, and the content sits on top as translucent layers.
+// Bundled into one struct since more than one window does this now.
+//
+// Every step degrades to the caller's plain opaque render target if it
+// fails, which is what happens on Windows 10, so nothing here is
+// load-bearing.
+struct MicaSurface {
+    ID3D11Device*        d3d = NULL;
+    ID2D1Device*         d2d_dev = NULL;
+    ID2D1DeviceContext*  dc = NULL;
+    IDXGISwapChain1*     swap = NULL;
+    IDCompositionDevice* dcomp = NULL;
+    IDCompositionTarget* dcomp_target = NULL;
+    IDCompositionVisual* dcomp_visual = NULL;
+    bool active = false;
+};
+
+static bool g_mica_capable = false;   // decided at startup; see WinMain
+
+// DWMWA_SYSTEMBACKDROP_TYPE only does anything from the Windows 11 22H2
+// build onward - earlier builds silently ignore or reject it.
+static bool os_supports_mica() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0,
+            KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    wchar_t buf[32] = {};
+    DWORD sz = sizeof(buf), type = 0;
+    bool ok = RegQueryValueExW(k, L"CurrentBuildNumber", NULL, &type,
+                               (BYTE*)buf, &sz) == ERROR_SUCCESS &&
+              type == REG_SZ;
+    RegCloseKey(k);
+    return ok && _wtoi(buf) >= 22621;
+}
+
+static void mica_release(MicaSurface& m) {
+    if (m.dc) m.dc->SetTarget(NULL);
+    if (m.dcomp_visual) { m.dcomp_visual->Release(); m.dcomp_visual = NULL; }
+    if (m.dcomp_target) { m.dcomp_target->Release(); m.dcomp_target = NULL; }
+    if (m.dcomp) { m.dcomp->Release(); m.dcomp = NULL; }
+    if (m.swap) { m.swap->Release(); m.swap = NULL; }
+    if (m.dc) { m.dc->Release(); m.dc = NULL; }
+    if (m.d2d_dev) { m.d2d_dev->Release(); m.d2d_dev = NULL; }
+    if (m.d3d) { m.d3d->Release(); m.d3d = NULL; }
+    m.active = false;
+}
+
+// Point the device context at the swap chain's current back buffer. Needed
+// every frame, not just on create/resize: the flip model rotates which
+// physical buffer GetBuffer(0) hands back on every Present, so a target
+// bound once would draw onto a buffer that isn't the one about to be shown
+// every other frame.
+static bool mica_bind_target(MicaSurface& m) {
+    IDXGISurface* surf = NULL;
+    if (FAILED(m.swap->GetBuffer(0, IID_PPV_ARGS(&surf)))) return false;
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                          D2D1_ALPHA_MODE_PREMULTIPLIED),
+        (float)g_dpi, (float)g_dpi);
+    ID2D1Bitmap1* bmp = NULL;
+    HRESULT hr = m.dc->CreateBitmapFromDxgiSurface(surf, &bp, &bmp);
+    surf->Release();
+    if (FAILED(hr)) return false;
+    m.dc->SetTarget(bmp);
+    bmp->Release();
+    m.dc->SetDpi((float)g_dpi, (float)g_dpi);
+    return true;
+}
+
+// backdrop: DWMSBT_MAINWINDOW (2) for a normal window, DWMSBT_TRANSIENTWINDOW
+// (3) for a popup like the flyout - transient windows get Mica's own
+// drop-shadowed "acrylic-ish" look rather than the flatter main-window one.
+static bool mica_create(MicaSurface& m, HWND hwnd, int backdrop) {
+    if (!g_mica_capable || !g_d2d_factory) return false;
+    // DirectComposition only ships on Windows 8 and later, and the backdrop
+    // attribute only does anything on Windows 11, so both are late-bound.
+    HMODULE dc_dll = LoadLibraryW(L"dcomp.dll");
+    if (!dc_dll) return false;
+    typedef HRESULT(WINAPI * CreateDevFn)(IDXGIDevice*, REFIID, void**);
+    CreateDevFn create_dev =
+        (CreateDevFn)GetProcAddress(dc_dll, "DCompositionCreateDevice");
+    if (!create_dev) return false;
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL got;
+    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags,
+                                 NULL, 0, D3D11_SDK_VERSION, &m.d3d, &got,
+                                 NULL)))
+        return false;
+    IDXGIDevice* dxgi_dev = NULL;
+    if (FAILED(m.d3d->QueryInterface(IID_PPV_ARGS(&dxgi_dev)))) {
+        mica_release(m);
+        return false;
+    }
+
+    bool ok = false;
+    IDXGIAdapter* adapter = NULL;
+    IDXGIFactory2* dxgi_factory = NULL;
+    do {
+        if (FAILED(g_d2d_factory->CreateDevice(dxgi_dev, &m.d2d_dev))) break;
+        if (FAILED(m.d2d_dev->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &m.dc))) break;
+
+        if (FAILED(dxgi_dev->GetAdapter(&adapter))) break;
+        if (FAILED(adapter->GetParent(IID_PPV_ARGS(&dxgi_factory)))) break;
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        DXGI_SWAP_CHAIN_DESC1 sd = {};
+        sd.Width  = (rc.right - rc.left) > 0 ? rc.right - rc.left : 1;
+        sd.Height = (rc.bottom - rc.top) > 0 ? rc.bottom - rc.top : 1;
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;   // the whole point
+        if (FAILED(dxgi_factory->CreateSwapChainForComposition(
+                dxgi_dev, &sd, NULL, &m.swap))) break;
+
+        if (FAILED(create_dev(dxgi_dev, IID_PPV_ARGS(&m.dcomp)))) break;
+        if (FAILED(m.dcomp->CreateTargetForHwnd(hwnd, TRUE, &m.dcomp_target)))
+            break;
+        if (FAILED(m.dcomp->CreateVisual(&m.dcomp_visual))) break;
+        if (FAILED(m.dcomp_visual->SetContent(m.swap))) break;
+        if (FAILED(m.dcomp_target->SetRoot(m.dcomp_visual))) break;
+        if (FAILED(m.dcomp->Commit())) break;
+        if (!mica_bind_target(m)) break;
+        ok = true;
+    } while (0);
+
+    if (dxgi_factory) dxgi_factory->Release();
+    if (adapter) adapter->Release();
+    dxgi_dev->Release();
+    if (!ok) { mica_release(m); return false; }
+
+    // Pre-22H2 builds reject the attribute and would leave us with a
+    // see-through window, so check rather than assume.
+    if (FAILED(DwmSetWindowAttribute(hwnd, 38 /*SYSTEMBACKDROP_TYPE*/,
+                                     &backdrop, sizeof(backdrop)))) {
+        mica_release(m);
+        return false;
+    }
+    m.dc->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    // ClearType has no background to blend against on a transparent target,
+    // so this surface gets grayscale antialiasing.
+    m.dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    m.active = true;
+    return true;
+}
+
+static void mica_resize(MicaSurface& m, UINT px_w, UINT px_h) {
+    if (!m.active || !m.swap) return;
+    m.dc->SetTarget(NULL);
+    if (FAILED(m.swap->ResizeBuffers(0, px_w ? px_w : 1, px_h ? px_h : 1,
+                                     DXGI_FORMAT_UNKNOWN, 0)))
+        return;
+    mica_bind_target(m);
+}
+
+static MicaSurface g_mica_main;
+
+static bool d2d_create_main(HWND hwnd) {
+    if (mica_create(g_mica_main, hwnd, 2 /*DWMSBT_MAINWINDOW*/)) {
+        g_rt_main = g_mica_main.dc;
+    } else {
+        g_rt_main_hwnd = d2d_create_rt(hwnd, false);
+        g_rt_main = g_rt_main_hwnd;
+    }
+    if (!g_rt_main) return false;
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_main_key);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_sel);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_main_armed);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(62, 62, 72)), &g_br_main_toggle_off);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(235, 235, 240)), &g_br_main_text);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(158, 158, 170)), &g_br_main_dim);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(255, 255, 255)), &g_br_main_white);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(240, 110, 110)), &g_br_main_status);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_main_glow);
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_main_onacc);
+    // CardBackgroundFillColorDefault sits just above the page behind it -
+    // as a translucent layer over Mica, as a solid colour without it.
+    g_rt_main->CreateSolidColorBrush(d2d_clr(KB_CLR_BG), &g_br_main_panel);
+    if (g_mica_main.active)
+        g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.0512f),
+                                         &g_br_main_card);
+    else
+        g_rt_main->CreateSolidColorBrush(d2d_clr(RGB(43, 43, 43)),
+                                         &g_br_main_card);
+    g_rt_main->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                     &g_br_main_border);
+    return true;
+}
+
+static void d2d_release_kb() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_kb_bg, &g_br_kb_key, &g_br_kb_sel,
+                                   &g_br_kb_armed, &g_br_kb_text,
+                                   &g_br_kb_flash, &g_br_kb_onacc,
+                                   &g_br_kb_border, &g_br_kb_dim};
+    for (int i = 0; i < 9; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    layered_release(g_surf_kb);
+}
+
+// Brushes only - the render target itself is created lazily by
+// layered_begin(), the first time kb_render() runs.
+static void d2d_create_kb() {
+    ID2D1RenderTarget* rt = g_surf_kb.rt;
+    // Background is partly transparent now, not the old flat fill: it's
+    // what lets the blur-behind material show through.
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_BG, 0.7f), &g_br_kb_bg);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_key);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_kb_sel);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ARMED), &g_br_kb_armed);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_kb_text);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_kb_onacc);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_KEY), &g_br_kb_flash);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                              &g_br_kb_border);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_kb_dim);
+}
+
+static COLORREF lerp_clr(COLORREF a, COLORREF b, double t) {
+    return RGB((int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
+               (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+               (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
+
+static int kb_key_width(const KbKey& k) {
+    return k.units * KB_KU + (k.units - 1) * KB_GAP;
+}
+
+static RECT kb_key_rect(int row, int idx) {
+    int roww = (KB_COUNT[row] - 1) * KB_GAP;
+    for (int i = 0; i < KB_COUNT[row]; i++) roww += kb_key_width(KB_ROWS[row][i]);
+    int x = (KB_W - roww) / 2;
+    for (int i = 0; i < idx; i++) x += kb_key_width(KB_ROWS[row][i]) + KB_GAP;
+    int y = KB_M + kb_y_off() + row * (KB_KU + KB_GAP);
+    RECT r = {x, y, x + kb_key_width(KB_ROWS[row][idx]), y + KB_KU};
+    return r;
+}
+
+static void kb_send_vk(WORD vk, bool shift) {
+    INPUT in[4] = {};
+    int n = 0;
+    if (shift) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SHIFT; n++; }
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = vk; n++;
+    in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = vk; in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+    if (shift) { in[n].type = INPUT_KEYBOARD; in[n].ki.wVk = VK_SHIFT;
+                 in[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
+    SendInput(n, in, sizeof(INPUT));
+}
+
+static void kb_select() {
+    if (g_kb_search && g_kb_in_res) { kb_search_launch(); return; }
+    const KbKey& k = KB_ROWS[g_kb_row][g_kb_col];
+    if (k.vk == VK_SHIFT) {
+        g_kb_shift = !g_kb_shift;   // one-shot: applies to the next key
+        if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+        return;
+    }
+    if (g_kb_search) {
+        // Keys build the query instead of being sent to another window.
+        size_t n = wcslen(g_kb_query);
+        if (k.vk == VK_RETURN) {
+            kb_search_launch();
+            return;
+        }
+        if (k.vk == VK_SPACE) {
+            if (n < 62) { g_kb_query[n] = L' '; g_kb_query[n + 1] = 0; }
+        } else if (n < 62) {
+            wchar_t c = k.label[0];
+            if (!g_kb_shift && c >= L'A' && c <= L'Z') c = (wchar_t)towlower(c);
+            g_kb_query[n] = c;
+            g_kb_query[n + 1] = 0;
+        }
+        g_kb_shift = false;
+        kb_search_update();
+    } else {
+        kb_send_vk(k.vk, g_kb_shift);
+        g_kb_shift = false;
+        if (k.vk == VK_RETURN) {
+            // Whatever was being typed has been submitted, so the keyboard
+            // has nothing left to do and gets out of the way.
+            PostMessageW(g_hwnd, WM_GAMEPAD, GP_KB_TOGGLE, 0);
+            return;
+        }
+    }
+    g_kb_pulse_t0 = GetTickCount64();          // flash the pressed key
+    if (g_kb) SetTimer(g_kb, KB_TIMER, 15, NULL);
+    if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+}
+
+// Circle: backspace in search mode, a real backspace otherwise.
+static void kb_backspace() {
+    if (!g_kb_search) { kb_send_vk(VK_BACK, false); return; }
+    size_t n = wcslen(g_kb_query);
+    if (n) {
+        g_kb_query[n - 1] = 0;
+        kb_search_update();
+        if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+    }
+}
+
+static void kb_nav(int dir) {
+    if (g_kb_search) {
+        if (g_kb_in_res) {
+            // Inside the results: up/down move, down past the end returns to
+            // the keys.
+            if (dir == 0 && g_kb_res_sel > 0) g_kb_res_sel--;
+            else if (dir == 2) {
+                if (g_kb_res_sel + 1 < g_kb_res_count) g_kb_res_sel++;
+                else { g_kb_in_res = false; g_kb_row = 0; }
+            }
+            if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            return;
+        }
+        if (dir == 0 && g_kb_row == 0 && g_kb_res_count) {
+            g_kb_in_res = true;
+            g_kb_res_sel = g_kb_res_count - 1;
+            if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            return;
+        }
+    }
+    if (dir == 0 || dir == 2) {
+        // Move to the key physically nearest the current one, rather than
+        // keeping the column index. Index-based movement clamped into the
+        // three-key bottom row and always landed on Enter; this lands on
+        // whatever is actually under the key you left.
+        int nr = (dir == 0) ? (g_kb_row + KB_NROWS - 1) % KB_NROWS
+                            : (g_kb_row + 1) % KB_NROWS;
+        RECT cur = kb_key_rect(g_kb_row, g_kb_col);
+        int cx = (cur.left + cur.right) / 2;
+        int best = 0, bestd = 1 << 30;
+        for (int i = 0; i < KB_COUNT[nr]; i++) {
+            RECT r = kb_key_rect(nr, i);
+            int d = abs((r.left + r.right) / 2 - cx);
+            if (d < bestd) { bestd = d; best = i; }
+        }
+        g_kb_row = nr;
+        g_kb_col = best;
+    } else if (dir == 1) {
+        g_kb_col = (g_kb_col + 1) % KB_COUNT[g_kb_row];                   // right
+    } else if (dir == 3) {
+        g_kb_col = (g_kb_col + KB_COUNT[g_kb_row] - 1) % KB_COUNT[g_kb_row];
+    }
+    if (g_kb_col >= KB_COUNT[g_kb_row]) g_kb_col = KB_COUNT[g_kb_row] - 1;
+    if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+}
+
+static LRESULT CALLBACK kb_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_TIMER: {
+        // Drives the open/close slide+fade and the key-press flash decay.
+        ULONGLONG now = GetTickCount64();
+        bool active = false;
+        if (g_kb_anim) {
+            double t = (double)(now - g_kb_anim_t0) / KB_ANIM_MS;
+            if (t > 1.0) t = 1.0;
+            double e = 1.0 - pow(1.0 - t, 3);                  // ease-out cubic
+            double a = (g_kb_anim == 1) ? e : 1.0 - e;         // opening / closing
+            g_kb_alpha = (float)a;
+            layered_present_alpha(g_surf_kb, hwnd, (BYTE)(255 * a));
+            SetWindowPos(hwnd, NULL, g_kb_x,
+                         g_kb_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            if (t >= 1.0) {
+                if (g_kb_anim == 2) ShowWindow(hwnd, SW_HIDE);
+                g_kb_anim = 0;
+            } else {
+                active = true;
+            }
+        }
+        if (g_kb_pulse_t0) {
+            if (now - g_kb_pulse_t0 < KB_PULSE_MS) active = true;
+            else g_kb_pulse_t0 = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        // Other topmost windows appearing after ours will sit above it, so
+        // while the keyboard is up keep pushing it back to the front. This
+        // cannot beat the Start menu, which the shell puts in a higher
+        // z-order band that only a uiAccess process can enter - see kb_ensure.
+        if (g_kb_visible) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!active) SetTimer(hwnd, KB_TIMER, 250, NULL);
+        }
+        if (!active && !g_kb_visible) KillTimer(hwnd, KB_TIMER);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        // No Resize() call needed: layered_begin() recreates the DIB to
+        // match whenever kb_render() next runs, off the window's own
+        // current client size.
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        bool first = !g_surf_kb.rt;
+        if (layered_begin(g_surf_kb, rc.right - rc.left, rc.bottom - rc.top)) {
+            if (first) d2d_create_kb();
+            ID2D1RenderTarget* rt = g_surf_kb.rt;
+            rt->Clear(D2D1::ColorF(0, 0.0f));
+
+            // Flyout surface: translucent base colour over the blur, a
+            // hairline border and the 8px radius Windows uses for menus and
+            // flyouts.
+            {
+                D2D1_SIZE_F sz = rt->GetSize();
+                D2D1_RECT_F cr = D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                             sz.height - 0.5f);
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                    g_br_kb_bg);
+                rt->DrawRoundedRectangle(
+                    D2D1::RoundedRect(cr, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                    g_br_kb_border, 1.0f);
+            }
+
+            // Search field and results, when the keyboard was opened by
+            // holding rather than tapping.
+            if (g_kb_search) {
+                D2D1_RECT_F fr = D2D1::RectF((float)KB_M, (float)KB_M,
+                                             (float)(KB_W - KB_M),
+                                             (float)(KB_M + KB_SEARCH_FIELD - 10));
+                draw_control(rt, fr, KB_RADIUS, g_br_kb_key, g_br_kb_border);
+                if (g_tf_key) {
+                    D2D1_RECT_F tr = D2D1::RectF(fr.left + 14, fr.top,
+                                                 fr.right - 14, fr.bottom);
+                    g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    const wchar_t* q = g_kb_query[0] ? g_kb_query : L"Search";
+                    rt->DrawText(q, (UINT32)wcslen(q), g_tf_key, tr,
+                                g_kb_query[0] ? g_br_kb_text : g_br_kb_dim);
+                    g_tf_key->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                }
+                for (int r = 0; r < g_kb_res_count; r++) {
+                    float y = (float)(KB_M + KB_SEARCH_FIELD + r * KB_RES_H);
+                    D2D1_RECT_F rr = D2D1::RectF((float)KB_M, y,
+                                                 (float)(KB_W - KB_M),
+                                                 y + KB_RES_H - 4);
+                    bool rsel = (g_kb_in_res && r == g_kb_res_sel);
+                    if (rsel)
+                        draw_control(rt, rr, KB_RADIUS, g_br_kb_sel, NULL);
+                    if (g_tf_body) {
+                        const std::wstring& nm = g_index[g_kb_res[r]].name;
+                        D2D1_RECT_F tr = D2D1::RectF(rr.left + 14, rr.top,
+                                                     rr.right - 14, rr.bottom);
+                        rt->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                    g_tf_body, tr,
+                                    rsel ? (ID2D1Brush*)g_br_kb_onacc
+                                         : g_br_kb_text);
+                    }
+                }
+                if (!g_kb_res_count && g_tf_body) {
+                    float y = (float)(KB_M + KB_SEARCH_FIELD);
+                    D2D1_RECT_F tr = D2D1::RectF((float)(KB_M + 14), y,
+                                                 (float)(KB_W - KB_M), y + KB_RES_H);
+                    const wchar_t* msg = g_kb_query[0]
+                        ? L"No matching apps" : L"Type to search your apps";
+                    rt->DrawText(msg, (UINT32)wcslen(msg), g_tf_body, tr,
+                                g_br_kb_dim);
+                }
+            }
+
+            for (int r = 0; r < KB_NROWS; r++) {
+                for (int i = 0; i < KB_COUNT[r]; i++) {
+                    RECT kr = kb_key_rect(r, i);
+                    D2D1_RECT_F kf = D2D1::RectF((float)kr.left, (float)kr.top,
+                                                 (float)kr.right, (float)kr.bottom);
+                    bool sel = (r == g_kb_row && i == g_kb_col);
+                    bool armed = (KB_ROWS[r][i].vk == VK_SHIFT && g_kb_shift);
+
+                    // Selection is an accent-filled control with black text,
+                    // which is how dark-theme Windows shows a default or
+                    // selected button - the dark accent is a light blue, so
+                    // white text on it would fail contrast.
+                    ID2D1Brush* fill = g_br_kb_key;
+                    ID2D1Brush* border = g_br_kb_border;
+                    ID2D1Brush* tb = g_br_kb_text;
+                    if (sel) {
+                        fill = g_br_kb_sel;
+                        border = NULL;
+                        tb = g_br_kb_onacc;
+                        // Press feedback: briefly wash the fill toward white,
+                        // matching the momentary lightening Windows uses.
+                        if (g_kb_pulse_t0) {
+                            double f = 1.0 - (double)(GetTickCount64() - g_kb_pulse_t0)
+                                               / KB_PULSE_MS;
+                            if (f > 0.0) {
+                                g_br_kb_flash->SetColor(d2d_clr(lerp_clr(
+                                    KB_CLR_SEL, RGB(255, 255, 255), f * 0.65)));
+                                fill = g_br_kb_flash;
+                            }
+                        }
+                    } else if (armed) {
+                        fill = g_br_kb_armed;
+                    }
+                    draw_control(rt, kf, KB_RADIUS, fill, border);
+
+                    // Letters follow the Shift state, so the keyboard shows
+                    // what will actually be typed.
+                    const wchar_t* lab = KB_ROWS[r][i].label;
+                    wchar_t lower[2];
+                    if (!g_kb_shift && lab[0] >= L'A' && lab[0] <= L'Z' && !lab[1]) {
+                        lower[0] = (wchar_t)towlower(lab[0]);
+                        lower[1] = 0;
+                        lab = lower;
+                    }
+                    if (g_tf_key)
+                        rt->DrawText(lab, (UINT32)wcslen(lab), g_tf_key, kf, tb);
+                }
+            }
+
+            layered_present(g_surf_kb, hwnd, NULL, (BYTE)(255 * g_kb_alpha));
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        d2d_release_kb();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void kb_ensure() {
+    if (g_kb) return;
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = kb_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = L"ControllerMouseKB";
+    RegisterClassW(&wc);
+
+    DWORD style = WS_POPUP;   // borderless; the dark surface is the chrome
+    DWORD ex = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    // Window size is physical pixels; the layout above is DIPs.
+    RECT r = {0, 0, dip_to_px(KB_W), dip_to_px(KB_H)};
+    AdjustWindowRectEx(&r, style, FALSE, ex);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;   // bottom-centre of screen
+    g_kb_y = wa.bottom - wh - dip_to_px(12);
+
+    g_kb = CreateWindowExW(ex, L"ControllerMouseKB", L"", style,
+                           g_kb_x, g_kb_y, ww, wh, g_hwnd, NULL,
+                           GetModuleHandleW(NULL), NULL);
+
+    // Rounded window corners on Windows 11 (best-effort; harmless elsewhere).
+    if (g_kb) {
+        enable_acrylic(g_kb);
+        DWORD pref = 2;  // DWMWCP_ROUND
+        DwmSetWindowAttribute(g_kb, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/,
+                              &pref, sizeof(pref));
+    }
+}
+
+// Size and re-centre for the current mode; the search area only exists when
+// search mode is on.
+static void kb_relayout() {
+    if (!g_kb) return;
+    int ww = dip_to_px(KB_W), wh = dip_to_px(KB_H + kb_y_off());
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;
+    g_kb_y = wa.bottom - wh - dip_to_px(12);
+    SetWindowPos(g_kb, NULL, g_kb_x, g_kb_y, ww, wh,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+}
+
+static void kb_toggle() {
+    kb_ensure();
+    if (!g_kb) return;
+    ULONGLONG now = GetTickCount64();
+    if (g_kb_visible) {
+        g_kb_visible = false;   // buttons revert to the mouse immediately
+        g_kb_anim = 2;          // fade + slide down, hidden when done
+        g_kb_anim_t0 = now;
+        SetTimer(g_kb, KB_TIMER, 15, NULL);
+    } else {
+        g_kb_shift = false;
+        g_kb_in_res = false;
+        kb_relayout();
+        g_kb_alpha = 0.0f;
+        layered_present_alpha(g_surf_kb, g_kb, 0);
+        SetWindowPos(g_kb, HWND_TOPMOST, g_kb_x, g_kb_y + dip_to_px(KB_SLIDE), 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g_kb_visible = true;
+        g_kb_anim = 1;          // fade in + slide up to rest
+        g_kb_anim_t0 = now;
+        SetTimer(g_kb, KB_TIMER, 15, NULL);
+        InvalidateRect(g_kb, NULL, FALSE);
+    }
+}
+
+// --- App launcher -----------------------------------------------------------
+// A second popup built on the same pattern as the keyboard: non-activating,
+// topmost, D2D-drawn, driven entirely from the pad. Held Options opens it,
+// the D-pad moves between tiles and Cross launches. The last tile is always a
+// "+" placeholder that adds another app, so the grid grows with the list.
+#define LX_TW   132      // tile size and spacing, in DIPs
+#define LX_TH   100
+#define LX_GAP  14
+#define LX_M    22
+#define LX_HDR  38       // room for the title above the grid
+#define LX_COLS 4
+#define LX_MAX_APPS 24
+#define LX_TIMER 2
+
+static HWND        g_lx = NULL;
+static int         g_lx_sel = 0;
+static int         g_lx_anim = 0;          // 0 idle, 1 opening, 2 closing
+static ULONGLONG   g_lx_anim_t0 = 0;
+static int         g_lx_x = 0, g_lx_y = 0;
+static std::wstring g_lx_apps[LX_MAX_APPS];
+static int         g_lx_count = 0;
+// Close prompt: D-pad up on a running app slides its icon out of the tile and
+// a confirmation in from below. Only the selected tile can be in this state.
+static bool        g_lx_close_mode = false;
+static int         g_lx_close_anim = 0;    // 1 sliding in, 2 sliding out
+static ULONGLONG   g_lx_close_t0 = 0;
+
+static LayeredSurface g_surf_lx;
+static float g_lx_alpha = 1.0f;   // whole-window blend for the slide/fade
+static ID2D1SolidColorBrush*  g_br_lx_bg = NULL;      // translucent card fill
+static ID2D1SolidColorBrush*  g_br_lx_text = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_dim = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_onacc = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_face = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_border = NULL;
+static ID2D1SolidColorBrush*  g_br_lx_warn = NULL;   // colour set per-draw
+// Icons are device-dependent, so they live and die with the render target.
+static ID2D1Bitmap*           g_lx_icon[LX_MAX_APPS] = {};
+static IWICImagingFactory*    g_wic = NULL;
+
+// Shell icon -> D2D bitmap. The jumbo list gives a 256px icon where one
+// exists, which matters on a high-DPI display; SHGetFileInfo's 32px icon is
+// the fallback.
+static HICON shell_icon(const wchar_t* path) {
+    SHFILEINFOW fi = {};
+    if (SHGetFileInfoW(path, 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX)) {
+        IImageList* il = NULL;
+        if (SUCCEEDED(SHGetImageList(SHIL_JUMBO, IID_IImageList, (void**)&il)) && il) {
+            HICON h = NULL;
+            il->GetIcon(fi.iIcon, ILD_TRANSPARENT, &h);
+            il->Release();
+            if (h) return h;
+        }
+    }
+    SHFILEINFOW fi2 = {};
+    if (SHGetFileInfoW(path, 0, &fi2, sizeof(fi2), SHGFI_ICON | SHGFI_LARGEICON))
+        return fi2.hIcon;
+    return NULL;
+}
+
+static ID2D1Bitmap* load_icon_bitmap(ID2D1RenderTarget* rt, const wchar_t* path) {
+    if (!rt || !g_wic) return NULL;
+    HICON ico = shell_icon(path);
+    if (!ico) return NULL;
+    IWICBitmap* wb = NULL;
+    ID2D1Bitmap* out = NULL;
+    if (SUCCEEDED(g_wic->CreateBitmapFromHICON(ico, &wb)) && wb) {
+        IWICFormatConverter* fc = NULL;
+        if (SUCCEEDED(g_wic->CreateFormatConverter(&fc)) && fc) {
+            if (SUCCEEDED(fc->Initialize(wb, GUID_WICPixelFormat32bppPBGRA,
+                                         WICBitmapDitherTypeNone, NULL, 0.0,
+                                         WICBitmapPaletteTypeMedianCut)))
+                rt->CreateBitmapFromWicBitmap(fc, NULL, &out);
+            fc->Release();
+        }
+        wb->Release();
+    }
+    DestroyIcon(ico);
+    return out;
+}
+
+static void lx_release_icons() {
+    for (int i = 0; i < LX_MAX_APPS; i++)
+        if (g_lx_icon[i]) { g_lx_icon[i]->Release(); g_lx_icon[i] = NULL; }
+}
+
+// One path per line, next to config.json - trivial to hand-edit, and avoids
+// teaching the minimal JSON writer about arrays.
+static std::wstring apps_path() {
+    std::wstring p = config_path();
+    p.resize(p.find_last_of(L"\\/") + 1);
+    return p + L"apps.txt";
+}
+
+static void lx_load() {
+    lx_release_icons();
+    g_lx_count = 0;
+    FILE* f = _wfopen(apps_path().c_str(), L"rb, ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[MAX_PATH];
+    while (g_lx_count < LX_MAX_APPS && fgetws(line, MAX_PATH, f)) {
+        size_t n = wcslen(line);
+        while (n && (line[n - 1] == L'\n' || line[n - 1] == L'\r')) line[--n] = 0;
+        if (n) g_lx_apps[g_lx_count++] = line;
+    }
+    fclose(f);
+}
+
+static void lx_save() {
+    FILE* f = _wfopen(apps_path().c_str(), L"wb, ccs=UTF-8");
+    if (!f) return;
+    for (int i = 0; i < g_lx_count; i++) fwprintf(f, L"%s\n", g_lx_apps[i].c_str());
+    fclose(f);
+}
+
+// The grid holds the apps plus the "+" tile. Show desktop and Windows
+// Settings are utilities rather than launcher entries, so they sit as small
+// icons on the header line instead of taking grid slots.
+static int lx_tiles() { return g_lx_count + 1; }
+static int lx_add_index()  { return g_lx_count; }
+#define LX_HDR_N 2
+static int lx_hdr_first()  { return lx_tiles(); }          // show desktop
+static int lx_hdr_second() { return lx_tiles() + 1; }      // Windows Settings
+static int lx_total()      { return lx_tiles() + LX_HDR_N; }
+static bool lx_in_header(int sel) { return sel >= lx_tiles(); }
+
+#define LX_HDR_SZ 30
+static RECT lx_hdr_rect(int i) {
+    int right = LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + LX_M;
+    int x = right - (LX_HDR_N - i) * (LX_HDR_SZ + 8) + 8;
+    RECT r = {x, 10, x + LX_HDR_SZ, 10 + LX_HDR_SZ};
+    return r;
+}
+static int lx_rows()  { return (lx_tiles() + LX_COLS - 1) / LX_COLS; }
+static int lx_width() { return LX_COLS * LX_TW + (LX_COLS - 1) * LX_GAP + 2 * LX_M; }
+static int lx_height() {
+    int r = lx_rows();
+    return LX_HDR + r * LX_TH + (r - 1) * LX_GAP + 2 * LX_M;
+}
+
+static RECT lx_tile_rect(int i) {
+    int col = i % LX_COLS, row = i / LX_COLS;
+    int x = LX_M + col * (LX_TW + LX_GAP);
+    int y = LX_M + LX_HDR + row * (LX_TH + LX_GAP);
+    RECT r = {x, y, x + LX_TW, y + LX_TH};
+    return r;
+}
+
+// Display name for a tile: the file name without extension is what people
+// recognise, and the full path rarely fits.
+static std::wstring lx_label(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    std::wstring n = (s == std::wstring::npos) ? path : path.substr(s + 1);
+    size_t d = n.find_last_of(L'.');
+    if (d != std::wstring::npos && d > 0) n = n.substr(0, d);
+    return n;
+}
+
+// A .lnk points at the real executable, and that is what a running process
+// reports, so shortcuts have to be resolved before matching.
+static std::wstring resolve_target(const std::wstring& path) {
+    size_t d = path.find_last_of(L'.');
+    if (d == std::wstring::npos || _wcsicmp(path.c_str() + d, L".lnk") != 0)
+        return path;
+    std::wstring out = path;
+    IShellLinkW* sl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW, (void**)&sl)) && sl) {
+        IPersistFile* pf = NULL;
+        if (SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && pf) {
+            if (SUCCEEDED(pf->Load(path.c_str(), STGM_READ))) {
+                wchar_t buf[MAX_PATH] = L"";
+                if (SUCCEEDED(sl->GetPath(buf, MAX_PATH, NULL, 0)) && buf[0])
+                    out = buf;
+            }
+            pf->Release();
+        }
+        sl->Release();
+    }
+    return out;
+}
+
+struct FindAppCtx { const wchar_t* exe; const wchar_t* base; HWND found; };
+
+static const wchar_t* path_base(const wchar_t* p) {
+    const wchar_t* s = wcsrchr(p, L'\\');
+    return s ? s + 1 : p;
+}
+
+static BOOL CALLBACK find_app_cb(HWND h, LPARAM lp) {
+    FindAppCtx* c = (FindAppCtx*)lp;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    if (!GetWindowTextLengthW(h)) return TRUE;   // skip invisible helper windows
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return TRUE;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return TRUE;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD n = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(ph, 0, img, &n) != 0;
+    CloseHandle(ph);
+    if (!ok) return TRUE;
+    // Full path first; fall back to the file name, since a launcher stub may
+    // live somewhere other than the shortcut points to.
+    if (_wcsicmp(img, c->exe) == 0 || _wcsicmp(path_base(img), c->base) == 0) {
+        c->found = h;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND find_app_window(const std::wstring& path) {
+    std::wstring exe = resolve_target(path);
+    FindAppCtx c = {exe.c_str(), path_base(exe.c_str()), NULL};
+    EnumWindows(find_app_cb, (LPARAM)&c);
+    return c.found;
+}
+
+// Ask politely, then insist. Done on its own thread so the wait does not
+// freeze the UI - an app showing a "save changes?" prompt would otherwise
+// block us for the full timeout.
+static DWORD WINAPI close_proc(LPVOID param) {
+    DWORD pid = (DWORD)(ULONG_PTR)param;
+    HANDLE ph = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+    if (!ph) return 0;
+    if (WaitForSingleObject(ph, 3000) == WAIT_TIMEOUT) TerminateProcess(ph, 0);
+    CloseHandle(ph);
+    return 0;
+}
+
+static void force_close_app(const std::wstring& path) {
+    HWND h = find_app_window(path);
+    if (!h) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    PostMessageW(h, WM_CLOSE, 0, 0);
+    if (pid)
+        CloseHandle(CreateThread(NULL, 0, close_proc,
+                                 (LPVOID)(ULONG_PTR)pid, 0, NULL));
+}
+
+// True if an existing window was brought forward.
+static bool activate_running(const std::wstring& path) {
+    FindAppCtx c = {NULL, NULL, find_app_window(path)};
+    if (!c.found) return false;
+    if (IsIconic(c.found)) ShowWindow(c.found, SW_RESTORE);
+    if (!SetForegroundWindow(c.found)) {
+        // Windows refuses focus changes from a process that is not already in
+        // the foreground. SwitchToThisWindow is what the shell itself uses for
+        // alt-tab style switching; resolved dynamically as it is not in every
+        // SDK header.
+        typedef void(WINAPI * SwitchFn)(HWND, BOOL);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        SwitchFn f = u ? (SwitchFn)GetProcAddress(u, "SwitchToThisWindow") : NULL;
+        if (f) f(c.found, TRUE);
+    }
+    return true;
+}
+
+static void show_desktop() {
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_LWIN;
+    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'D';
+    in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = 'D';
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_LWIN;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+// A monitor: screen plus a stand.
+static void draw_desktop_icon(ID2D1RenderTarget* rt, float cx, float cy,
+                              ID2D1Brush* br) {
+    rt->DrawRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(cx - 9, cy - 7, cx + 9, cy + 4), 2, 2),
+        br, 1.4f);
+    rt->FillRectangle(D2D1::RectF(cx - 1.2f, cy + 4, cx + 1.2f, cy + 7), br);
+    rt->FillRectangle(D2D1::RectF(cx - 6, cy + 7, cx + 6, cy + 8.4f), br);
+}
+
+static void d2d_release_lx() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_lx_bg, &g_br_lx_text, &g_br_lx_dim,
+                                   &g_br_lx_sel, &g_br_lx_face,
+                                   &g_br_lx_border, &g_br_lx_onacc,
+                                   &g_br_lx_warn};
+    for (int i = 0; i < 8; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    lx_release_icons();
+    layered_release(g_surf_lx);
+}
+
+// Brushes only - the render target itself is created lazily by
+// layered_begin(), the first time lx_proc's WM_PAINT runs.
+static void d2d_create_lx() {
+    ID2D1RenderTarget* rt = g_surf_lx.rt;
+    // Background is partly transparent now, not the old flat fill: it's
+    // what lets the blur-behind material show through.
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_BG, 0.7f), &g_br_lx_bg);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_lx_text);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_lx_dim);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_sel);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_ONACC), &g_br_lx_onacc);
+    // CardBackgroundFillColorDefault sits a little above the flyout base.
+    rt->CreateSolidColorBrush(d2d_clr(RGB(45, 45, 45)), &g_br_lx_face);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                              &g_br_lx_border);
+    rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_lx_warn);
+}
+
+static void draw_cog(ID2D1RenderTarget* rt, float cx, float cy, float r,
+                     ID2D1Brush* br) {
+    D2D1_POINT_2F c = D2D1::Point2F(cx, cy);
+    D2D1_MATRIX_3X2_F base;
+    rt->GetTransform(&base);
+    for (int i = 0; i < 8; i++) {
+        rt->SetTransform(D2D1::Matrix3x2F::Rotation(i * 45.0f, c) * base);
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - r * 0.16f, cy - r * 1.18f,
+                                          cx + r * 0.16f, cy - r * 0.62f),
+                              1.5f, 1.5f), br);
+    }
+    rt->SetTransform(base);
+    rt->DrawEllipse(D2D1::Ellipse(c, r * 0.72f, r * 0.72f), br, r * 0.26f);
+    rt->DrawEllipse(D2D1::Ellipse(c, r * 0.30f, r * 0.30f), br, r * 0.16f);
+}
+
+static LRESULT CALLBACK lx_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_TIMER: {
+        ULONGLONG now = GetTickCount64();
+        bool active = false;
+        if (g_lx_anim) {
+            double t = (double)(now - g_lx_anim_t0) / KB_ANIM_MS;
+            if (t > 1.0) t = 1.0;
+            double e = 1.0 - pow(1.0 - t, 3);
+            double a = (g_lx_anim == 1) ? e : 1.0 - e;
+            g_lx_alpha = (float)a;
+            layered_present_alpha(g_surf_lx, hwnd, (BYTE)(255 * a));
+            SetWindowPos(hwnd, NULL, g_lx_x,
+                         g_lx_y + (int)(dip_to_px(KB_SLIDE) * (1.0 - a)), 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            if (t >= 1.0) {
+                if (g_lx_anim == 2) ShowWindow(hwnd, SW_HIDE);
+                g_lx_anim = 0;
+            } else {
+                active = true;
+            }
+        }
+        if (g_lx_close_anim) {
+            if (now - g_lx_close_t0 >= KB_ANIM_MS) g_lx_close_anim = 0;
+            else active = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if (g_lx_visible) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!active) SetTimer(hwnd, LX_TIMER, 250, NULL);
+        }
+        if (!active && !g_lx_visible) KillTimer(hwnd, LX_TIMER);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        // No Resize() call needed: layered_begin() recreates the DIB to
+        // match whenever the next paint runs, off the window's own current
+        // client size.
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        bool first = !g_surf_lx.rt;
+        if (layered_begin(g_surf_lx, rc.right - rc.left, rc.bottom - rc.top)) {
+            if (first) d2d_create_lx();
+            ID2D1RenderTarget* rt = g_surf_lx.rt;
+            rt->Clear(D2D1::ColorF(0, 0.0f));
+            D2D1_SIZE_F sz = rt->GetSize();
+            D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, sz.width - 0.5f,
+                                           sz.height - 0.5f);
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(card, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                g_br_lx_bg);
+            rt->DrawRoundedRectangle(
+                D2D1::RoundedRect(card, KB_CARD_RADIUS, KB_CARD_RADIUS),
+                g_br_lx_border, 1.0f);
+            if (g_tf_header) {
+                D2D1_RECT_F hr = D2D1::RectF((float)LX_M, 14.0f,
+                                             sz.width - LX_M, 14.0f + 24.0f);
+                rt->DrawText(L"Apps", 4, g_tf_header, hr, g_br_lx_dim);
+            }
+
+            // Controller battery, left of the header icons. Only shown once a
+            // report has actually carried it - a pad on the short Bluetooth
+            // report never sends one.
+            if (g_pad_batt >= 0 && g_tf_body) {
+                RECT first = lx_hdr_rect(0);
+                float bx = (float)first.left - 78;
+                float by = (float)first.top + 8;
+                D2D1_RECT_F shell = D2D1::RectF(bx + 34, by, bx + 60, by + 14);
+                rt->DrawRoundedRectangle(D2D1::RoundedRect(shell, 3, 3),
+                                              g_br_lx_dim, 1.2f);
+                rt->FillRectangle(
+                    D2D1::RectF(shell.right + 1.5f, by + 4, shell.right + 4, by + 10),
+                    g_br_lx_dim);
+                float fillw = (shell.right - shell.left - 4) * (g_pad_batt / 100.0f);
+                rt->FillRectangle(
+                    D2D1::RectF(shell.left + 2, by + 2, shell.left + 2 + fillw,
+                                by + 12),
+                    g_pad_batt <= 20 ? g_br_lx_warn : g_br_lx_dim);
+                wchar_t bt[16];
+                swprintf(bt, 16, L"%d%%%s", (int)g_pad_batt,
+                         g_pad_charging ? L"+" : L"");
+                D2D1_RECT_F tr = D2D1::RectF(bx - 8, by - 4, bx + 30, by + 18);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                rt->DrawText(bt, (UINT32)wcslen(bt), g_tf_body, tr,
+                                  g_br_lx_dim);
+                g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+
+            for (int i = 0; i < LX_HDR_N; i++) {
+                RECT hr = lx_hdr_rect(i);
+                bool hsel = (g_lx_sel == lx_tiles() + i);
+                if (hsel)
+                    draw_control(rt, to_f(hr), 6.0f, g_br_lx_sel, NULL);
+                ID2D1Brush* hb = hsel ? (ID2D1Brush*)g_br_lx_onacc : g_br_lx_dim;
+                float hx = (float)((hr.left + hr.right) / 2);
+                float hy = (float)((hr.top + hr.bottom) / 2);
+                if (i == 0) draw_desktop_icon(rt, hx, hy, hb);
+                else        draw_cog(rt, hx, hy, 10.0f, hb);
+            }
+
+            for (int i = 0; i < lx_tiles(); i++) {
+                RECT tr = lx_tile_rect(i);
+                D2D1_RECT_F tf = to_f(tr);
+                bool sel = (i == g_lx_sel);
+
+                // How far this tile is through the close prompt: 0 shows the
+                // app, 1 shows the confirmation.
+                float cp = 0.0f;
+                if (sel) {
+                    if (g_lx_close_anim) {
+                        double t = (double)(GetTickCount64() - g_lx_close_t0)
+                                   / KB_ANIM_MS;
+                        if (t > 1.0) t = 1.0;
+                        double e = 1.0 - pow(1.0 - t, 3);
+                        cp = (g_lx_close_anim == 1) ? (float)e : (float)(1.0 - e);
+                    } else if (g_lx_close_mode) {
+                        cp = 1.0f;
+                    }
+                }
+
+                // The tile washes from accent to the close red as the prompt
+                // arrives, so the destructive state is obvious before reading
+                // any text. Black label on accent, white on red.
+                ID2D1Brush* fill = g_br_lx_face;
+                ID2D1Brush* tb = g_br_lx_text;
+                if (sel) {
+                    if (cp > 0.0f) {
+                        g_br_lx_warn->SetColor(d2d_clr(
+                            lerp_clr(KB_CLR_SEL, RGB(196, 43, 28), cp)));
+                        fill = g_br_lx_warn;
+                        tb = (cp >= 0.5f) ? (ID2D1Brush*)g_br_lx_text
+                                          : (ID2D1Brush*)g_br_lx_onacc;
+                    } else {
+                        fill = g_br_lx_sel;
+                        tb = g_br_lx_onacc;
+                    }
+                }
+                draw_control(rt, tf, KB_CARD_RADIUS, fill,
+                             sel ? NULL : (ID2D1Brush*)g_br_lx_border);
+
+                float th = tf.bottom - tf.top;
+                if (cp > 0.0f)
+                    rt->PushAxisAlignedClip(tf, D2D1_ANTIALIAS_MODE_ALIASED);
+
+                if (i == lx_add_index()) {
+                    if (g_tf_key)
+                        rt->DrawText(L"+", 1, g_tf_key, tf, tb);
+                } else if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+                    float dy = -cp * th;   // app content slides up and out
+                    if (!g_lx_icon[i])
+                        g_lx_icon[i] = load_icon_bitmap(rt, g_lx_apps[i].c_str());
+                    if (g_lx_icon[i]) {
+                        float cx = (tf.left + tf.right) / 2;
+                        D2D1_RECT_F ir = D2D1::RectF(cx - 22, tf.top + 12 + dy,
+                                                     cx + 22, tf.top + 56 + dy);
+                        rt->DrawBitmap(g_lx_icon[i], ir, 1.0f,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    }
+                    std::wstring nm = lx_label(g_lx_apps[i]);
+                    D2D1_RECT_F lr = g_lx_icon[i]
+                        ? D2D1::RectF(tf.left + 8, tf.top + 60 + dy, tf.right - 8,
+                                      tf.bottom - 6 + dy)
+                        : D2D1::RectF(tf.left + 10, tf.top + 10 + dy, tf.right - 10,
+                                      tf.bottom - 10 + dy);
+                    rt->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                      g_tf_body, lr, tb);
+
+                    // Confirmation rises from the bottom edge as the app leaves.
+                    if (cp > 0.0f) {
+                        float uy = (1.0f - cp) * th;
+                        if (g_tf_key) {
+                            D2D1_RECT_F xr = D2D1::RectF(tf.left, tf.top + 10 + uy,
+                                                         tf.right, tf.top + 58 + uy);
+                            // U+2715 as an escape: a literal here would depend
+                            // on the compiler's source codepage.
+                            rt->DrawText(L"\x2715", 1, g_tf_key, xr, tb);
+                        }
+                        D2D1_RECT_F qr = D2D1::RectF(tf.left + 8, tf.top + 60 + uy,
+                                                     tf.right - 8, tf.bottom - 6 + uy);
+                        rt->DrawText(L"Close?", 6, g_tf_body, qr, tb);
+                    }
+                    g_tf_body->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (cp > 0.0f) rt->PopAxisAlignedClip();
+            }
+
+            layered_present(g_surf_lx, hwnd, NULL, (BYTE)(255 * g_lx_alpha));
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        d2d_release_lx();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void lx_ensure() {
+    if (g_lx) return;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = lx_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = L"ControllerMouseLauncher";
+    RegisterClassW(&wc);
+    DWORD style = WS_POPUP;
+    DWORD ex = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    g_lx = CreateWindowExW(ex, L"ControllerMouseLauncher", L"", style,
+                           0, 0, dip_to_px(lx_width()), dip_to_px(lx_height()),
+                           g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (g_lx) {
+        enable_acrylic(g_lx);
+        DWORD pref = 2;  // DWMWCP_ROUND
+        DwmSetWindowAttribute(g_lx, 33, &pref, sizeof(pref));
+    }
+}
+
+// Re-centre and resize: the grid grows a row at a time as apps are added.
+static void lx_relayout() {
+    if (!g_lx) return;
+    int ww = dip_to_px(lx_width()), wh = dip_to_px(lx_height());
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_lx_x = wa.left + (wa.right - wa.left - ww) / 2;
+    g_lx_y = wa.top + (wa.bottom - wa.top - wh) / 2;
+    SetWindowPos(g_lx, NULL, g_lx_x, g_lx_y, ww, wh,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+}
+
+static void lx_toggle() {
+    lx_ensure();
+    if (!g_lx) return;
+    ULONGLONG now = GetTickCount64();
+    if (g_lx_visible) {
+        g_lx_visible = false;
+        g_lx_anim = 2;
+        g_lx_anim_t0 = now;
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+    } else {
+        lx_load();
+        g_lx_close_mode = false;
+        g_lx_close_anim = 0;
+        if (g_lx_sel >= lx_total()) g_lx_sel = 0;
+        lx_relayout();
+        g_lx_alpha = 0.0f;
+        layered_present_alpha(g_surf_lx, g_lx, 0);
+        SetWindowPos(g_lx, HWND_TOPMOST, g_lx_x, g_lx_y + dip_to_px(KB_SLIDE),
+                     0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g_lx_visible = true;
+        g_lx_anim = 1;
+        g_lx_anim_t0 = now;
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+        InvalidateRect(g_lx, NULL, FALSE);
+    }
+}
+
+static void lx_set_close_mode(bool on) {
+    if (g_lx_close_mode == on) return;
+    g_lx_close_mode = on;
+    g_lx_close_anim = on ? 1 : 2;
+    g_lx_close_t0 = GetTickCount64();
+    if (g_lx) {
+        SetTimer(g_lx, LX_TIMER, 15, NULL);
+        InvalidateRect(g_lx, NULL, FALSE);
+    }
+}
+
+static void lx_nav(int dir) {
+    int n = lx_tiles();
+    if (n <= 0) return;
+    if (g_lx_close_mode) {
+        lx_set_close_mode(false);
+        // Up again carries on upward rather than just dismissing, so the
+        // header icons stay reachable from a tile whose app is running.
+        if (dir == 0) {
+            if (g_lx_sel < LX_COLS) g_lx_sel = lx_hdr_first();
+            else                    g_lx_sel -= LX_COLS;
+            if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+        }
+        return;
+    }
+    if (lx_in_header(g_lx_sel)) {
+        int h = g_lx_sel - n;
+        if (dir == 1 && h + 1 < LX_HDR_N)      g_lx_sel = n + h + 1;
+        else if (dir == 3 && h > 0)            g_lx_sel = n + h - 1;
+        else if (dir == 3)                     g_lx_sel = n - 1;  // back to the tiles
+        else if (dir == 2)                     g_lx_sel = 0;      // back to the grid
+        if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+        return;
+    }
+    // Up on a running app asks whether to close it, instead of moving a row.
+    if (dir == 0 && g_lx_sel < g_lx_count &&
+        find_app_window(g_lx_apps[g_lx_sel])) {
+        lx_set_close_mode(true);
+        return;
+    }
+    if (dir == 0) {
+        // From the top row, up reaches the header icons.
+        if (g_lx_sel < LX_COLS) g_lx_sel = lx_hdr_first();
+        else                    g_lx_sel -= LX_COLS;
+    } else if (dir == 1) {
+        // Past the last tile, right continues into the header rather than
+        // wrapping onto the next row.
+        if (g_lx_sel + 1 >= n) g_lx_sel = lx_hdr_second();
+        else                   g_lx_sel++;
+    } else if (dir == 3) {
+        g_lx_sel = (g_lx_sel + n - 1) % n;
+    } else if (dir == 2) {
+        g_lx_sel = (g_lx_sel + LX_COLS < n) ? g_lx_sel + LX_COLS
+                                            : g_lx_sel % LX_COLS;
+    }
+    if (g_lx) InvalidateRect(g_lx, NULL, FALSE);
+}
+
+
+// --- Now playing ------------------------------------------------------------
+// The seek bar needs to know where the track actually is, which the system
+// media session knows and the arrow keys we send do not. That lives behind
+// WinRT, whose calls block, so they happen on a thread of their own rather
+// than on the UI thread - which is an STA, where blocking on an async is a
+// deadlock waiting to happen. The thread runs only while the media flyout is
+// up, and everything it learns is published through the lock below.
+static CRITICAL_SECTION g_med_cs;
+static HANDLE   g_med_thread = NULL;
+static volatile bool g_med_poll = false;   // the flyout wants updates
+static volatile bool g_med_run = true;     // the thread itself should live
+static bool     g_med_have = false;        // there is a session at all
+static double   g_med_pos = 0.0;           // seconds, when last sampled
+static double   g_med_dur = 0.0;
+static bool     g_med_playing = false;
+static ULONGLONG g_med_stamp = 0;          // tick when pos was sampled
+
+static DWORD WINAPI med_poll_proc(LPVOID) {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    winrt::Windows::Media::Control::
+        GlobalSystemMediaTransportControlsSessionManager mgr{nullptr};
+    // One thread for the life of the app, idling when nothing is asking.
+    // Starting and stopping one per flyout raced: closing and reopening
+    // quickly set the flag back before the old thread had noticed it clear,
+    // and left two of them polling.
+    while (g_med_run) {
+        if (!g_med_poll) { Sleep(100); continue; }
+        bool have = false, playing = false;
+        double pos = 0.0, dur = 0.0;
+        try {
+            using namespace winrt::Windows::Media::Control;
+            // Requested once: the manager tracks whichever session is
+            // current, so asking again every poll only costs time.
+            if (!mgr)
+                mgr = GlobalSystemMediaTransportControlsSessionManager::
+                          RequestAsync().get();
+            auto s = mgr.GetCurrentSession();
+            if (s) {
+                auto tl = s.GetTimelineProperties();
+                auto pb = s.GetPlaybackInfo();
+                auto to_s = [](winrt::Windows::Foundation::TimeSpan t) {
+                    return (double)t.count() / 10000000.0;   // 100ns units
+                };
+                pos = to_s(tl.Position()) - to_s(tl.StartTime());
+                dur = to_s(tl.EndTime()) - to_s(tl.StartTime());
+                // The session also says when the app last pushed that
+                // position, which is the whole answer to a player that only
+                // reports one when something happens to it: the real
+                // position is what it said plus however long ago it said it.
+                // Exact, and it needs no history of our own - which is what
+                // the previous guesswork was standing in for.
+                double age = (double)std::chrono::duration_cast<
+                                 std::chrono::milliseconds>(
+                                 winrt::clock::now() - tl.LastUpdatedTime())
+                                 .count() / 1000.0;
+                if (age < 0.0 || age > 86400.0) age = 0.0;   // no timestamp
+                playing = pb.PlaybackStatus() ==
+                          GlobalSystemMediaTransportControlsSessionPlaybackStatus::
+                              Playing;
+                if (playing) pos += age;
+                have = dur > 0.5;    // a live stream reports no length
+            }
+        } catch (...) {
+            have = false;            // no session, or the app went away
+            mgr = nullptr;           // ask for a fresh one next time round
+        }
+        // Every reading is already correct for the moment it was taken, so
+        // it simply replaces the last one. Between polls the clock below
+        // carries it forward, which is only for smoothness.
+        EnterCriticalSection(&g_med_cs);
+        g_med_have = have;
+        g_med_pos = pos;
+        g_med_dur = dur;
+        g_med_playing = playing;
+        g_med_stamp = GetTickCount64();
+        LeaveCriticalSection(&g_med_cs);
+        for (int i = 0; i < 8 && g_med_poll && g_med_run; i++) Sleep(50);
+    }
+    winrt::uninit_apartment();
+    return 0;
+}
+
+static void med_poll_start() {
+    g_med_poll = true;
+    if (!g_med_thread)
+        g_med_thread = CreateThread(NULL, 0, med_poll_proc, NULL, 0, NULL);
+}
+
+static void med_poll_stop() {
+    g_med_poll = false;
+    // Forget the track as well: reopening on a different one would
+    // otherwise show the old position until the first sample lands.
+    EnterCriticalSection(&g_med_cs);
+    g_med_have = false;
+    LeaveCriticalSection(&g_med_cs);
+}
+
+// Where the track is now: the last sample, plus however long ago that was if
+// it is still playing, so the bar creeps rather than stepping every poll.
+static bool med_now(double& pos, double& dur, bool& playing) {
+    EnterCriticalSection(&g_med_cs);
+    bool have = g_med_have;
+    pos = g_med_pos;
+    dur = g_med_dur;
+    playing = g_med_playing;
+    ULONGLONG stamp = g_med_stamp;
+    LeaveCriticalSection(&g_med_cs);
+    if (have && playing && stamp)
+        pos += (double)(GetTickCount64() - stamp) / 1000.0;
+    if (pos < 0) pos = 0;
+    if (have && pos > dur) pos = dur;
+    return have;
+}
+
+static void med_time_str(double secs, wchar_t* out, size_t n) {
+    if (secs < 0) secs = 0;
+    int t = (int)(secs + 0.5);
+    int h = t / 3600, m = (t / 60) % 60, s = t % 60;
+    if (h) swprintf(out, n, L"%d:%02d:%02d", h, m, s);
+    else   swprintf(out, n, L"%d:%02d", m, s);
+}
+
+// --- Fullscreen flyout ------------------------------------------------------
+// Shaped like one of Windows' own flyouts - a small rounded card near the
+// bottom of the screen - rather than a menu that takes over the middle. It is
+// only up while the button is held: the left stick slides the underline
+// between the options and letting go sends the one under it.
+#define FLY_W    310
+#define FLY_H     64            // the controls row on its own
+#define FLY_SEEK  52            // the seek row under it, media mode only
+#define FLY_PAD   12
+// Mode 0 is the fullscreen shortcuts, mode 1 the media controls; they differ
+// only in how many items there are and whether each is drawn as a word or an
+// icon, so one window does both.
+static int g_rad_mode = 0;
+static int g_rad_row = 0;       // 0 the controls, 1 the seek bar
+static int rad_count() { return g_rad_mode ? NMEDIA : NRADIAL; }
+static int fly_h() { return g_rad_mode ? FLY_H + FLY_SEEK : FLY_H; }
+
+// The bar, and the timestamp sitting at the end of it.
+// The bar takes the full width and the time sits under it, rather than the
+// two sharing a line and colliding once the track runs past an hour.
+static D2D1_RECT_F seek_track() {
+    return D2D1::RectF((float)FLY_PAD, FLY_H + 11.0f,
+                       (float)(FLY_W - FLY_PAD), FLY_H + 17.0f);
+}
+#define FLY_ITEMW (float)((FLY_W - FLY_PAD * 2) / rad_count())
+#define FLY_ANIM  140      // underline glide, ms
+#define FLY_IN    250      // slide-and-fade in, ms
+#define FLY_RISE  36       // how far it travels on the way in, DIPs
+
+static HWND g_rad = NULL;
+static int  g_rad_sel = 0;
+static int  g_rad_prev_sel = 0;
+static ULONGLONG g_rad_move_t0 = 0;
+static ULONGLONG g_rad_in_t0 = 0;
+static LayeredSurface g_surf_rad;
+static ID2D1SolidColorBrush*  g_br_rad_card = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_sel = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_text = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_dim = NULL;
+static ID2D1SolidColorBrush*  g_br_rad_border = NULL;
+
+#define FLY_TIMER 3
+
+
+static float fly_item_cx(int i) {
+    return FLY_PAD + FLY_ITEMW * (i + 0.5f);
+}
+
+// The media icons, from the same system font the rest of the app uses. The
+// middle one shows what pressing it will do rather than what is happening:
+// pause while it plays, play while it is paused.
+static void draw_media_glyph(ID2D1RenderTarget* rt, float cx, float cy,
+                             int item, bool playing, ID2D1Brush* br) {
+    if (!g_tf_ico_lg) return;
+    const wchar_t* g;
+    switch (item) {
+    case 0:        g = L"\uE892"; break;              // previous track
+    case 1:        g = L"\uE993"; break;              // volume, quieter
+    case MED_PLAY: g = playing ? L"\uE769" : L"\uE768"; break;
+    case 3:        g = L"\uE995"; break;              // volume, louder
+    default:       g = L"\uE893"; break;              // next track
+    }
+    rt->DrawText(g, (UINT32)wcslen(g), g_tf_ico_lg,
+                 D2D1::RectF(cx - 20, cy - 16, cx + 20, cy + 16), br);
+}
+
+static float ease_out(ULONGLONG t0, int ms) {
+    if (!t0) return 1.0f;
+    double e = (double)(GetTickCount64() - t0) / ms;
+    if (e >= 1.0) return 1.0f;
+    return (float)(1.0 - pow(1.0 - e, 3));
+}
+
+static void d2d_release_rad() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_rad_card, &g_br_rad_sel, &g_br_rad_text,
+                                   &g_br_rad_dim, &g_br_rad_border};
+    for (int i = 0; i < 5; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    layered_release(g_surf_rad);
+}
+
+static void rad_render() {
+    if (!g_rad) return;
+    int w = dip_to_px(FLY_W), h = dip_to_px(fly_h());
+    bool first = !g_surf_rad.rt;
+    if (!layered_begin(g_surf_rad, w, h)) return;
+    if (first) {
+        // Brushes need creating once, on the same render target instance.
+        ID2D1RenderTarget* rt = g_surf_rad.rt;
+        rt->CreateSolidColorBrush(
+            D2D1::ColorF(32.0f / 255, 32.0f / 255, 36.0f / 255, 0.6f),
+            &g_br_rad_card);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_rad_sel);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_rad_text);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_rad_dim);
+        rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                  &g_br_rad_border);
+    }
+    ID2D1RenderTarget* rt = g_surf_rad.rt;
+    rt->Clear(D2D1::ColorF(0, 0.0f));   // everything outside the card
+
+    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, FLY_W - 0.5f,
+                                   fly_h() - 0.5f);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f), g_br_rad_card);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                             g_br_rad_border, 1.0f);
+
+    if (g_rad_mode) {
+        // The seek bar, and the time under it. Position comes from the
+        // system's own media session - the arrow keys we send to seek have
+        // no idea where the track is - and so does whether it is playing,
+        // which is what the middle button shows.
+        double pos = 0, dur = 0;
+        bool playing = false;
+        bool have = med_now(pos, dur, playing);
+
+        for (int i = 0; i < NMEDIA; i++)
+            draw_media_glyph(rt, fly_item_cx(i), 27.0f, i, playing,
+                             (i == g_rad_sel && g_rad_row == 0)
+                                 ? (ID2D1Brush*)g_br_rad_text
+                                 : g_br_rad_dim);
+        D2D1_RECT_F tr = seek_track();
+        float mid = (tr.top + tr.bottom) / 2;
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(tr.left, mid - 2, tr.right, mid + 2),
+                              2.0f, 2.0f), g_br_rad_dim);
+        if (have && dur > 0) {
+            float frac = (float)(pos / dur);
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            float x = tr.left + (tr.right - tr.left) * frac;
+            if (x > tr.left + 1)
+                rt->FillRoundedRectangle(
+                    D2D1::RoundedRect(D2D1::RectF(tr.left, mid - 2, x, mid + 2),
+                                      2.0f, 2.0f), g_br_rad_sel);
+            // The handle only appears once the row has focus, which is also
+            // the only time it can be moved.
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, mid),
+                                          g_rad_row == 1 ? 6.0f : 4.0f,
+                                          g_rad_row == 1 ? 6.0f : 4.0f),
+                            g_rad_row == 1 ? (ID2D1Brush*)g_br_rad_text
+                                           : g_br_rad_sel);
+        }
+        if (g_tf_fly) {
+            wchar_t ts[48];
+            if (have) {
+                wchar_t a[24], b[24];
+                med_time_str(pos, a, 24);
+                med_time_str(dur, b, 24);
+                swprintf(ts, 48, L"%s / %s", a, b);
+            } else {
+                wcscpy(ts, L"--:--");
+            }
+            D2D1_RECT_F txt = D2D1::RectF((float)FLY_PAD, tr.bottom + 6,
+                                          (float)(FLY_W - FLY_PAD),
+                                          tr.bottom + 26);
+            g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            rt->DrawText(ts, (UINT32)wcslen(ts), g_tf_fly, txt,
+                         g_rad_row == 1 ? (ID2D1Brush*)g_br_rad_text
+                                        : g_br_rad_dim);
+            g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+    } else if (g_tf_fly) {
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        for (int i = 0; i < NRADIAL; i++) {
+            D2D1_RECT_F ir = D2D1::RectF(FLY_PAD + FLY_ITEMW * i, 14,
+                                         FLY_PAD + FLY_ITEMW * (i + 1), 40);
+            rt->DrawText(kRadName[i], (UINT32)wcslen(kRadName[i]),
+                        g_tf_fly, ir,
+                        i == g_rad_sel ? (ID2D1Brush*)g_br_rad_text
+                                       : g_br_rad_dim);
+        }
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
+    // The underline glides to the new option rather than jumping, which is
+    // the part that makes it feel like a system flyout.
+    float t = ease_out(g_rad_move_t0, FLY_ANIM);
+    float from = fly_item_cx(g_rad_prev_sel), to = fly_item_cx(g_rad_sel);
+    float cx = from + (to - from) * t;
+    float halfw = FLY_ITEMW * 0.30f;
+    if (g_rad_row == 0)
+        rt->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx - halfw, 46, cx + halfw, 49.5f),
+                              1.8f, 1.8f),
+            g_br_rad_sel);
+
+    float in = ease_out(g_rad_in_t0, FLY_IN);
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    POINT pos2 = {wa.left + (wa.right - wa.left - w) / 2,
+                  wa.bottom - h - dip_to_px(72) +
+                      (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
+    layered_present(g_surf_rad, g_rad, &pos2, (BYTE)(255 * in));
+}
+
+static LRESULT CALLBACK rad_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TIMER) {
+        // Only runs while the underline is moving or the flyout is fading in.
+        rad_render();
+        ULONGLONG now = GetTickCount64();
+        bool moving = g_rad_move_t0 && now - g_rad_move_t0 < FLY_ANIM;
+        bool entering = g_rad_in_t0 && now - g_rad_in_t0 < FLY_IN;
+        if (!moving) { g_rad_move_t0 = 0; g_rad_prev_sel = g_rad_sel; }
+        if (!entering) g_rad_in_t0 = 0;
+        // The media flyout keeps ticking regardless, so the seek bar moves
+        // with the track rather than only when something is pressed.
+        if (!moving && !entering && !(g_rad_mode && g_rad_visible))
+            KillTimer(hwnd, FLY_TIMER);
+        return 0;
+    }
+    if (msg == WM_DESTROY) { d2d_release_rad(); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void rad_show(bool on) {
+    if (!on) {
+        if (g_rad) { KillTimer(g_rad, FLY_TIMER); ShowWindow(g_rad, SW_HIDE); }
+        g_rad_visible = false;
+        return;
+    }
+    if (!g_rad) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = rad_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"ControllerMouseFlyout";
+        RegisterClassW(&wc);
+        g_rad = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            L"ControllerMouseFlyout", L"", WS_POPUP, 0, 0,
+            dip_to_px(FLY_W), dip_to_px(fly_h()), g_hwnd, NULL,
+            GetModuleHandleW(NULL), NULL);
+        if (g_rad) {
+            enable_acrylic(g_rad);
+            // Without this the blur behind keeps the window's square corners
+            // and shows past the rounded card drawn on top of it.
+            DWORD pref = 2;  // DWMWCP_ROUND
+            DwmSetWindowAttribute(g_rad, 33, &pref, sizeof(pref));
+        }
+    }
+    if (!g_rad) return;
+    g_rad_prev_sel = g_rad_sel;
+    g_rad_move_t0 = 0;
+    g_rad_in_t0 = GetTickCount64();
+    rad_render();                     // positions and sizes the window too
+    ShowWindow(g_rad, SW_SHOWNOACTIVATE);
+    SetTimer(g_rad, FLY_TIMER, 15, NULL);
+    SetWindowPos(g_rad, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    g_rad_visible = true;
+}
+
+// Start the underline gliding to a newly chosen option.
+static void rad_select(int i) {
+    if (i == g_rad_sel || i < 0 || i >= rad_count()) return;
+    g_rad_prev_sel = g_rad_sel;
+    g_rad_sel = i;
+    g_rad_move_t0 = GetTickCount64();
+    if (g_rad_visible && g_rad) {
+        SetTimer(g_rad, FLY_TIMER, 15, NULL);
+        rad_render();
+    }
+}
+
+// --- Status flyout ----------------------------------------------------------
+// Shown whenever the mapping is switched on or off, so the toggle button says
+// what it did without needing the settings window open. Same shape and motion
+// as the fullscreen flyout: the name, underlined in the accent while the
+// mapping is on, and dimmed with it while it is off.
+#define ST_W    190
+#define ST_H     64
+#define ST_HOLD 1400            // how long it stays up, ms
+#define ST_TIMER 4
+
+static HWND g_st = NULL;
+static bool g_st_on = true;             // what the flyout is currently saying
+static ULONGLONG g_st_t0 = 0;           // when it appeared
+static LayeredSurface g_surf_st;
+static ID2D1SolidColorBrush* g_br_st_card = NULL;
+static ID2D1SolidColorBrush* g_br_st_text = NULL;
+static ID2D1SolidColorBrush* g_br_st_dim = NULL;
+static ID2D1SolidColorBrush* g_br_st_sel = NULL;
+static ID2D1SolidColorBrush* g_br_st_border = NULL;
+
+static void d2d_release_st() {
+    ID2D1SolidColorBrush** bs[] = {&g_br_st_card, &g_br_st_text, &g_br_st_dim,
+                                   &g_br_st_sel, &g_br_st_border};
+    for (int i = 0; i < 5; i++)
+        if (*bs[i]) { (*bs[i])->Release(); *bs[i] = NULL; }
+    layered_release(g_surf_st);
+}
+
+static void st_render() {
+    if (!g_st) return;
+    int w = dip_to_px(ST_W), h = dip_to_px(ST_H);
+    bool first = !g_surf_st.rt;
+    if (!layered_begin(g_surf_st, w, h)) return;
+    ID2D1RenderTarget* rt = g_surf_st.rt;
+    if (first) {
+        rt->CreateSolidColorBrush(
+            D2D1::ColorF(32.0f / 255, 32.0f / 255, 36.0f / 255, 0.6f),
+            &g_br_st_card);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT), &g_br_st_text);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_TEXT2), &g_br_st_dim);
+        rt->CreateSolidColorBrush(d2d_clr(KB_CLR_SEL), &g_br_st_sel);
+        rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, KB_BORDER_A),
+                                  &g_br_st_border);
+    }
+
+    // Fades out over the last stretch rather than vanishing.
+    float in = ease_out(g_st_t0, FLY_IN);
+    float out = 1.0f;
+    if (g_st_t0) {
+        ULONGLONG age = GetTickCount64() - g_st_t0;
+        if (age > ST_HOLD) {
+            double e = (double)(age - ST_HOLD) / FLY_IN;
+            out = (e >= 1.0) ? 0.0f : (float)(1.0 - e);
+        }
+    }
+
+    rt->Clear(D2D1::ColorF(0, 0.0f));
+    D2D1_RECT_F card = D2D1::RectF(0.5f, 0.5f, ST_W - 0.5f, ST_H - 0.5f);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f), g_br_st_card);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f, 8.0f),
+                             g_br_st_border, 1.0f);
+
+    // Off is the same layout with the life taken out of it, so the two states
+    // read as the same thing in two conditions rather than two messages.
+    ID2D1Brush* tb = g_st_on ? (ID2D1Brush*)g_br_st_text : g_br_st_dim;
+    ID2D1Brush* ub = g_st_on ? (ID2D1Brush*)g_br_st_sel : g_br_st_dim;
+    if (!g_st_on && g_br_st_dim) g_br_st_dim->SetOpacity(0.45f);
+    if (g_tf_fly) {
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        D2D1_RECT_F t = D2D1::RectF(0, 16, ST_W, 40);
+        rt->DrawText(L"ctrlmouse", 9, g_tf_fly, t, tb);
+        g_tf_fly->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    rt->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(ST_W / 2 - 34.0f, 44, ST_W / 2 + 34.0f,
+                                      47.5f), 1.8f, 1.8f), ub);
+    if (!g_st_on && g_br_st_dim) g_br_st_dim->SetOpacity(1.0f);
+
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    POINT pos = {wa.left + (wa.right - wa.left - w) / 2,
+                 wa.bottom - h - dip_to_px(72) +
+                     (int)(dip_to_px(FLY_RISE) * (1.0f - in))};
+    layered_present(g_surf_st, g_st, &pos, (BYTE)(255 * in * out));
+}
+
+static LRESULT CALLBACK st_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TIMER) {
+        st_render();
+        if (g_st_t0 && GetTickCount64() - g_st_t0 >= (ULONGLONG)ST_HOLD + FLY_IN) {
+            KillTimer(hwnd, ST_TIMER);
+            ShowWindow(hwnd, SW_HIDE);
+            g_st_t0 = 0;
+        }
+        return 0;
+    }
+    if (msg == WM_DESTROY) { d2d_release_st(); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Called whenever the mapping is switched, from wherever.
+static void st_show(bool on) {
+    if (!g_st) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = st_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.lpszClassName = L"ControllerMouseStatus";
+        RegisterClassW(&wc);
+        g_st = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            L"ControllerMouseStatus", L"", WS_POPUP, 0, 0,
+            dip_to_px(ST_W), dip_to_px(ST_H), g_hwnd, NULL,
+            GetModuleHandleW(NULL), NULL);
+        if (g_st) {
+            enable_acrylic(g_st);
+            DWORD pref = 2;  // DWMWCP_ROUND
+            DwmSetWindowAttribute(g_st, 33, &pref, sizeof(pref));
+        }
+    }
+    if (!g_st) return;
+    g_st_on = on;
+    g_st_t0 = GetTickCount64();
+    st_render();
+    ShowWindow(g_st, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_st, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetTimer(g_st, ST_TIMER, 15, NULL);
+}
+
+// --- System tray -----------------------------------------------------------
+#define WM_TRAYICON   (WM_APP + 1)
+#define ID_TRAY_SHOW  2001
+#define ID_TRAY_QUIT  2002
+
+static void add_tray_icon(HWND hwnd) {
+    g_nid = {};
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1),
+                                    IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), 0);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wcscpy(g_nid.szTip, L"ControllerMouse");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+static void remove_tray_icon() {
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+static void hide_to_tray(HWND hwnd) {
+    ShowWindow(hwnd, SW_HIDE);
+    add_tray_icon(hwnd);
+}
+
+static void restore_from_tray(HWND hwnd) {
+    remove_tray_icon();
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
+
+// --- Window ----------------------------------------------------------------
+#define ID_TIMER     1
+
+// Trackbar indices (mouse sensitivity / scroll sensitivity / deadzone).
+enum { TRK_MOUSE = 0, TRK_SCROLL = 1, TRK_DEADZONE = 2, TRK_CURVE = 3 };
+#define NTRACKS 4
+static const int kTrackLo[NTRACKS] = {1, 1, 0, 10};
+static const int kTrackHi[NTRACKS] = {60, 50, 50, 30};
+
+// Client size, and the whole layout below, in DIPs. Nothing here is a native
+// child control any more - every label, slider, toggle and button is drawn by
+// Direct2D in WM_PAINT and hit-tested by hand, so all of it scales cleanly to
+// whatever DPI the monitor reports.
+// Settings window layout, in DIPs.
+//
+// Wider than it needs to be for the controls alone, because every setting
+// carries a line of plain English underneath saying what it does - the list of
+// names on its own was not enough to work out what anything did. The controls
+// list is collapsible, since it is much the longest section and is only needed
+// while rebinding.
+// The window is resizable. Content stretches with it up to a comfortable
+// reading width and then centres, the way the app this borrows from does -
+// a settings list stretched across a very wide window is hard to scan.
+#define WIN_W     1180             // starting width: enough for the longest
+                                  // description without truncating it
+#define WIN_MIN_W 760
+#define WIN_MIN_H 560
+#define PAD       32
+#define MAXW      1040             // widest the content ever gets
+
+static int g_cw = WIN_W;          // client size, DIPs
+static int g_ch = 700;
+static int g_scroll = 0;          // vertical scroll offset, DIPs
+
+static int rail_w() { return g_cw < 1000 ? 76 : 216; }
+static int content_w() {
+    int w = g_cw - rail_w() - PAD * 2;
+    if (w > MAXW) w = MAXW;
+    if (w < 240) w = 240;
+    return w;
+}
+static int content_x() { return rail_w() + (g_cw - rail_w() - content_w()) / 2; }
+#define CONTENT content_w()
+// WinUI SettingsCard proportions: a rounded panel per setting, icon on the
+// left, title over description, the control on the right.
+#define CARD_R    14.0f
+#define CARD_H    76
+#define CARD_GAP  10
+#define CARD_ICON 54              // icon column inside a card
+#define CARD_CTRL 200             // control column on the right
+
+static RECT status_rect() { RECT r = {content_x()+24, 124, content_x()+content_w()-180, 151}; return r; }
+static RECT title_rect() { RECT r = {content_x(), 22, content_x()+content_w()-96, 62}; return r; }
+static RECT hide_rect() { RECT r = {content_x()+24, 157, content_x()+content_w()-280, 180}; return r; }
+static RECT hid_btn_rect() { int rx = content_x()+content_w(); RECT r = {rx-266, 155, rx-174, 185}; return r; }
+
+#define SEC1_Y 232
+#define SLIDE_Y0 266
+#define SLIDE_STEP 144
+static const wchar_t* kTrackLabel[NTRACKS] = {L"Pointer speed", L"Scroll speed", L"Dead zone", L"Fine control"};
+static const wchar_t* kTrackDesc[NTRACKS] = {
+    L"Cursor speed at full stick travel.",
+    L"Right-stick scrolling. Up scrolls down.",
+    L"Ignore small movements around the centre.",
+    L"Higher values give more precision near centre."};
+static RECT card_rect(int y) { RECT r = {content_x(), y, content_x()+content_w(), y+CARD_H}; return r; }
+static RECT slide_card(int i) {
+    int w=(content_w()-16)/2, x=content_x()+(i%2)*(w+16), y=SLIDE_Y0+(i/2)*SLIDE_STEP;
+    RECT r={x,y,x+w,y+SLIDE_STEP-16}; return r;
+}
+static RECT slide_label(int i) { RECT r=slide_card(i); r.left+=50; r.top+=18; r.right-=64; r.bottom=r.top+22; return r; }
+static RECT slide_desc(int i) { RECT r=slide_card(i); r.left+=20; r.top+=50; r.right-=16; r.bottom=r.top+20; return r; }
+static RECT slide_track(int i) { RECT r=slide_card(i); r.left+=24; r.right-=24; r.top+=85; r.bottom=r.top+26; return r; }
+static RECT slide_value(int i) { RECT r=slide_card(i); r.left=r.right-65; r.right-=20; r.top+=18; r.bottom=r.top+24; return r; }
+
+// --- Behaviour section ------------------------------------------------------
+#define SEC2_Y  (SLIDE_Y0 + 2 * SLIDE_STEP + 16)
+#define TOG_Y0  (SEC2_Y + 28)
+#define TOG_STEP (CARD_H + CARD_GAP)
+#define NTOGGLES 3
+static const wchar_t* kToggleText[NTOGGLES] = {
+    L"Mapping enabled", L"Pause while a game is running",
+    L"Start with Windows"};
+static const wchar_t* kToggleDesc[NTOGGLES] = {
+    L"Turn the controller-to-mouse mapping on or off.",
+    L"Stops the sticks fighting a fullscreen game. The toggle button overrides "
+    L"it while a game is open.",
+    L"Launches minimised to the notification area when you sign in."};
+
+static RECT toggle_card(int i) { return card_rect(TOG_Y0 + i * TOG_STEP); }
+static RECT toggle_rect(int i) {
+    int y = TOG_Y0 + i * TOG_STEP;
+    int rx = content_x() + content_w();
+    RECT r = {rx - 62, y + 20, rx - 16, y + 42};
+    return r;
+}
+static RECT toggle_label(int i) {
+    int y = TOG_Y0 + i * TOG_STEP;
+    RECT r = {content_x() + CARD_ICON, y + 11,
+              content_x() + content_w() - 80, y + 29};
+    return r;
+}
+static RECT toggle_desc(int i) {
+    int y = TOG_Y0 + i * TOG_STEP;
+    RECT r = {content_x() + CARD_ICON, y + 30,
+              content_x() + content_w() - 80, y + 48};
+    return r;
+}
+
+// Search: built-in list, or hand off to a launcher you already use.
+#define SEARCH_Y (TOG_Y0 + NTOGGLES * TOG_STEP)
+#define NSEARCH 2
+static const wchar_t* kSearchName[NSEARCH] = {L"Built-in", L"Third party"};
+static RECT search_card() { RECT r=card_rect(SEARCH_Y); r.bottom+=40; return r; }
+#define SEARCH_CTRL 300           // wider than CARD_CTRL: two segments and
+                                  // the hotkey have to share it
+static RECT search_seg(int i) {
+    int x = content_x() + content_w() - SEARCH_CTRL + i * 86;
+    RECT r = {x, SEARCH_Y + 70, x + 80, SEARCH_Y + 102};
+    return r;
+}
+static RECT search_key_rect() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 118, SEARCH_Y + 70, rx - 18, SEARCH_Y + 102};
+    return r;
+}
+
+// --- Button layout page -----------------------------------------------------
+// Page 1 of the settings window. Rather than a picture of one particular pad -
+// which only ever matched the controller it was drawn from - it listens: press
+// a button and it says which one, then everything below applies to that
+// button. Works with whatever is plugged in, however many buttons it has.
+enum { IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+       IC_LAUNCHER, IC_POWER, IC_VOLUME, IC_SCRUB, IC_BACK, IC_FORWARD,
+       IC_KEYS, IC_CURSOR, IC_UPDOWN, IC_TUNE, IC_GEAR, IC_PAD, IC_SEARCH,
+       IC_BOLT };
+
+static int g_page = 0;          // 0 settings, 1 button layout, 2 apps
+static volatile int g_bind_btn = -1;   // button last pressed, -1 none yet
+static bool g_sc_capture = false;      // recording a keyboard shortcut
+// Which layout the button page is editing: -1 the base one, otherwise the
+// index of the app whose profile it is.
+static int g_bind_target = -1;
+
+static RECT back_btn_rect() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 84, 28, rx, 58};
+    return r;
+}
+
+#define BIND_HINT_Y   76
+#define BIND_CARD_Y   112                        // "you pressed ..."
+#define BIND_SEC1_Y   (BIND_CARD_Y + CARD_H + 20)
+#define BIND_ROW_Y0   (BIND_SEC1_Y + 26)
+#define BIND_ROW_STEP 54
+#define BIND_SEC2_Y   (BIND_ROW_Y0 + ((F_COUNT+1)/2) * BIND_ROW_STEP + 16)
+#define BIND_SC_Y     (BIND_SEC2_Y + 26)
+
+static RECT bind_card()    { return card_rect(BIND_CARD_Y); }
+static RECT bind_sc_card() { return card_rect(BIND_SC_Y); }
+
+static RECT bind_row(int i) {
+    int y = BIND_ROW_Y0 + (i/2) * BIND_ROW_STEP;
+    int w=(content_w()-16)/2, x=content_x()+(i%2)*(w+16);
+    RECT r = {x, y, x+w, y+BIND_ROW_STEP-6};
+    return r;
+}
+static RECT bind_sc_btn() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 116, BIND_SC_Y + 18, rx - 14, BIND_SC_Y + 44};
+    return r;
+}
+// Clearing the shortcut sits beside setting one, and only when there is one.
+static RECT bind_sc_clear() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 158, BIND_SC_Y + 18, rx - 124, BIND_SC_Y + 44};
+    return r;
+}
+
+static const wchar_t* kFeatName[F_COUNT] = {
+    L"Left click", L"Right click", L"On-screen keyboard", L"Play / pause",
+    L"Fullscreen", L"App launcher", L"Turn mapping on / off",
+    L"Forward", L"Back",
+    L"Volume up", L"Volume down", L"Seek forward", L"Seek back",
+    L"Media controls"};
+// Which of them are holds, so the list says so rather than leaving it to be
+// discovered.
+static const wchar_t* kFeatHint[F_COUNT] = {
+    L"", L"", L"tap / hold", L"tap", L"hold", L"", L"", L"", L"",
+    L"repeats", L"repeats", L"repeats", L"repeats", L"hold"};
+static const int kFeatIcon[F_COUNT] = {
+    IC_LCLICK, IC_RCLICK, IC_KEYBOARD, IC_PLAY, IC_FULLSCREEN,
+    IC_LAUNCHER, IC_POWER, IC_FORWARD, IC_BACK,
+    IC_VOLUME, IC_VOLUME, IC_SCRUB, IC_SCRUB, IC_PLAY};
+
+// Which slot holds this button's shortcut, or -1.
+static int sc_slot_for(const Config& c, int btn) {
+    if (btn < 0) return -1;
+    for (int i = 0; i < NSC; i++)
+        if (c.sc_btn[i] == btn) return i;
+    return -1;
+}
+
+// --- Apps page --------------------------------------------------------------
+// Page 2: the per-app rules. Each row is one app, with the two things a rule
+// can say about it and a way to drop it.
+#define APP_HINT_Y   76
+#define APP_BTN_Y    116
+#define APP_ROW_Y0   (APP_BTN_Y + 40)
+#define APP_ROW_STEP 76
+
+static RECT app_add_file_btn() {
+    RECT r = {content_x(), APP_BTN_Y, content_x() + 150, APP_BTN_Y + 28};
+    return r;
+}
+static RECT app_add_win_btn() {
+    RECT r = {content_x() + 158, APP_BTN_Y, content_x() + 328, APP_BTN_Y + 28};
+    return r;
+}
+static RECT app_row(int i) {
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {content_x(), y, content_x() + content_w(), y + APP_ROW_STEP - 8};
+    return r;
+}
+// Three controls on the right of each row: the two switches and remove.
+static RECT app_row_pause(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 292, y + 24, rx - 246, y + 46};
+    return r;
+}
+static RECT app_row_prof(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 168, y + 24, rx - 122, y + 46};
+    return r;
+}
+static RECT app_row_edit(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 104, y + 14, rx - 46, y + 40};
+    return r;
+}
+static RECT app_row_del(int i) {
+    int rx = content_x() + content_w();
+    int y = APP_ROW_Y0 + i * APP_ROW_STEP;
+    RECT r = {rx - 38, y + 14, rx - 8, y + 40};
+    return r;
+}
+
+// Picking one of the windows that happen to be open right now. The rule that
+// comes out of it is keyed on the executable, so it outlives the window.
+#define NOPENWIN 40
+struct OpenWin { std::wstring exe; std::wstring title; };
+static OpenWin g_openwin[NOPENWIN];
+static int     g_openwin_count = 0;
+static bool    g_win_picker = false;      // the picker is up
+
+static BOOL CALLBACK collect_openwin_cb(HWND h, LPARAM) {
+    if (g_openwin_count >= NOPENWIN) return FALSE;
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    if (!GetWindowTextLengthW(h)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return TRUE;
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!ph) return TRUE;
+    wchar_t img[MAX_PATH] = L"";
+    DWORD n = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(ph, 0, img, &n) != 0;
+    CloseHandle(ph);
+    if (!ok) return TRUE;
+    const wchar_t* exe = base_name(img);
+    for (int i = 0; i < g_openwin_count; i++)      // one row per program
+        if (_wcsicmp(g_openwin[i].exe.c_str(), exe) == 0) return TRUE;
+    wchar_t title[128] = L"";
+    GetWindowTextW(h, title, 128);
+    g_openwin[g_openwin_count].exe = exe;
+    g_openwin[g_openwin_count].title = title;
+    g_openwin_count++;
+    return TRUE;
+}
+
+static void collect_open_windows() {
+    g_openwin_count = 0;
+    EnumWindows(collect_openwin_cb, 0);
+}
+
+#define WP_W   380
+#define WP_ROW 34
+#define WP_TOP 38
+static int wp_height() {
+    int n = g_openwin_count > 10 ? 10 : g_openwin_count;
+    return WP_TOP + n * WP_ROW + 10;
+}
+static RECT wp_rect() {
+    int x = content_x() + (content_w() - WP_W) / 2;
+    RECT r = {x, APP_BTN_Y + 36, x + WP_W, APP_BTN_Y + 36 + wp_height()};
+    return r;
+}
+static RECT wp_row(int i) {
+    RECT p = wp_rect();
+    RECT r = {p.left + 6, p.top + WP_TOP + i * WP_ROW, p.right - 6,
+              p.top + WP_TOP + i * WP_ROW + WP_ROW - 2};
+    return r;
+}
+
+// A live readout of the pad, on the setup page. Which backend is talking to
+// it, which axes its descriptor declared, and what they currently read - the
+// difference between "the stick reports nothing" and "the stick is being read
+// from the wrong axis" is invisible without it.
+static void pad_axis_summary(wchar_t* out, size_t n) {
+    if (g_hid == INVALID_HANDLE_VALUE) {
+        swprintf(out, n, L"DirectInput - the descriptor is not read here");
+        return;
+    }
+    if (!g_hid_generic) {
+        swprintf(out, n, L"DualSense, fixed layout");
+        return;
+    }
+    wchar_t buf[256] = L"";
+    const wchar_t* nm[6] = {L"X", L"Y", L"Z", L"Rx", L"Ry", L"Rz"};
+    const HidVal* v[6] = {&g_hv_lx, &g_hv_ly, &g_hv_lt, &g_hv_rx, &g_hv_ry,
+                          &g_hv_rt};
+    // Printed as the roles they were given, since that is what is in doubt.
+    const wchar_t* role[6] = {L"lx", L"ly", L"trig", L"rx", L"ry", L"trig2"};
+    for (int i = 0; i < 6; i++) {
+        if (!v[i]->present) continue;
+        // The range actually used, which is what matters when a descriptor
+        // declares one that cannot be taken at face value.
+        LONG lo = 0, hi = 0;
+        hid_range(*v[i], lo, hi);
+        wchar_t one[64];
+        swprintf(one, 64, L"%s=%s(%ld..%ld) ", role[i], nm[v[i]->usage - 0x30],
+                 (long)lo, (long)hi);
+        if (wcslen(buf) + wcslen(one) < 250) wcscat(buf, one);
+    }
+    swprintf(out, n, L"HID: %s%s, %u buttons declared", buf,
+             g_hv_hat.present ? L"hat" : L"no hat",
+             (unsigned)g_hv_btn_max);
+}
+
+// --- Controller setup page --------------------------------------------------
+// Page 3: naming a pad's buttons. Press one, type what it is, Enter. The pad
+// itself only says how many buttons it has, so this is the only way anything
+// beyond the face buttons gets a name worth showing.
+#define SET_HINT_Y   76
+#define SET_CARD_Y   112
+#define SET_LIST_Y   (SET_CARD_Y + CARD_H + 180)
+#define SET_ROW_STEP 36
+#define SET_ROWS_MAX 14
+
+// Both listening pages take the pad over: a press is reported and nothing it
+// is bound to runs. Reach one from the sofa and there is no way back - the
+// buttons that would leave the page do nothing either. So a press starts a
+// countdown. Anything the user does holds it off, three seconds of nothing
+// starts it again, and when it runs out the selection is dropped and the pad
+// goes back to working.
+#define LOCK_HOLD_MS 5000
+#define LOCK_IDLE_MS 3000
+static ULONGLONG g_lock_t0 = 0;       // countdown start, 0 = held off
+static ULONGLONG g_lock_input = 0;    // when the user last did something
+static bool      g_lock_armed = false;
+
+static bool    g_setup_editing = false;      // typing a name for g_bind_btn
+static wchar_t g_setup_text[40] = L"";
+
+static void lock_arm()   { g_lock_armed = true; g_lock_t0 = GetTickCount64();
+                           g_lock_input = 0; }
+static void lock_clear() { g_lock_armed = false; g_lock_t0 = 0;
+                           g_lock_input = 0; }
+// Typing, pointer movement, a click: someone is there, so stop counting.
+static void lock_input() {
+    if (!g_lock_armed) return;
+    g_lock_t0 = 0;
+    g_lock_input = GetTickCount64();
+}
+// Seconds still to run, 0 when it is not counting - the page shows this so
+// the release is not a surprise.
+static int lock_left() {
+    if (!g_lock_armed || !g_lock_t0) return 0;
+    ULONGLONG e = GetTickCount64() - g_lock_t0;
+    if (e >= LOCK_HOLD_MS) return 0;
+    return (int)((LOCK_HOLD_MS - e + 999) / 1000);
+}
+static void lock_release(HWND hwnd) {
+    lock_clear();
+    g_bind_btn = -1;
+    g_setup_editing = false;
+    g_setup_text[0] = 0;
+    g_listen = false;              // whatever is on the pad works again
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static RECT setup_card()  { return card_rect(SET_CARD_Y); }
+static RECT setup_done_btn() {
+    int rx = content_x() + content_w();
+    RECT r = {rx - 96, SET_CARD_Y + 18, rx - 14, SET_CARD_Y + 44};
+    return r;
+}
+static RECT setup_row(int i) {
+    int y = SET_LIST_Y + i * SET_ROW_STEP;
+    RECT r = {content_x(), y, content_x() + content_w(), y + SET_ROW_STEP - 4};
+    return r;
+}
+
+// How many buttons this pad has been given names for, and which they are.
+static int setup_named(int* idx, int max) {
+    int n = 0;
+    EnterCriticalSection(&g_cs);
+    int pr = g_pad_prof;
+    if (pr >= 0 && pr < g_padprof_count)
+        for (int b = 0; b < NPADBTNNAME && n < max; b++)
+            if (!g_padprof[pr].name[b].empty()) idx[n++] = b;
+    LeaveCriticalSection(&g_cs);
+    return n;
+}
+
+static int win_height() {
+    if (g_page == 3) {
+        int idx[SET_ROWS_MAX];
+        int n = setup_named(idx, SET_ROWS_MAX);
+        return SET_LIST_Y + (n ? n : 1) * SET_ROW_STEP + 40;
+    }
+    if (g_page == 1)
+        return (g_bind_target < 0 ? BIND_SC_Y + CARD_H : BIND_SEC2_Y) + 46;
+    if (g_page == 2) {
+        int rows = g_app_count > 0 ? g_app_count : 1;
+        int h = APP_ROW_Y0 + rows * APP_ROW_STEP + 40;
+        if (g_win_picker) {
+            int p = wp_rect().bottom + 24;
+            if (p > h) h = p;
+        }
+        return h;
+    }
+    return SEARCH_Y + CARD_H + 100;
+}
+
+static const wchar_t* kFooterText =
+    L"Closing this window leaves ctrlmouse running in the notification area.";
+static RECT footer_rect() {
+    int y = win_height();
+    if (g_scroll + g_ch > y) y = g_scroll + g_ch;
+    RECT r = {content_x(), y - 30, content_x() + content_w(), y - 12};
+    return r;
+}
+
+// One line on whether the pad is being kept to ourselves, and what to do if
+// it is not. HidHide is the only way to stop other apps seeing the controller.
+static const wchar_t* hide_status_text() {
+    if (g_hh == INVALID_HANDLE_VALUE)
+        return L"Other apps can also see this controller. Install HidHide to stop that.";
+    if (!g_hh_whitelisted)
+        return L"HidHide is installed but needs admin once - restart ctrlmouse as administrator.";
+    if (!g_pad_inst_count)
+        return L"HidHide is ready, but no controller was found to hide.";
+    if (g_hid == INVALID_HANDLE_VALUE)
+        return L"This controller is read through DirectInput, which cannot see "
+               L"a hidden device - so it is left visible to other apps.";
+    // Hiding covers the HID interfaces, which is every app that reads a pad
+    // as a HID device. A controller in XInput mode is also presented through
+    // the XUSB driver, and XInput reads go there instead - past anything
+    // HidHide can filter. Nothing here can close that; switching the pad to
+    // its DirectInput mode removes the XUSB side altogether.
+    if (g_hh_hiding && g_pad_layout == PADL_XINPUT)
+        return L"Hidden from apps reading it as a controller, but this pad is "
+               L"in XInput mode and games using XInput can still see it. Its "
+               L"DirectInput mode can be hidden completely.";
+    return g_hh_hiding
+        ? L"This controller is hidden from other apps while the mapping is on."
+        : L"HidHide is ready. The controller is hidden while the mapping is on.";
+}
+
+static bool g_hotkey_capture = false;   // next key press becomes the hotkey
+static int g_drag_track = -1;  // trackbar index being dragged by the mouse, -1 = none
+
+// --- Feature icons ----------------------------------------------------------
+// Drawn rather than shipped as bitmaps or taken from an icon font: they stay
+
+// One glyph per thing the app can do, from the system icon font. Kept as a
+// table so the settings list, the button page and the flyout all name the
+// same picture for the same action.
+static const wchar_t* kIconGlyph[] = {
+    L"\uE962",   // IC_LCLICK    mouse
+    L"\uE962",   // IC_RCLICK    mouse
+    L"\uE765",   // IC_KEYBOARD  keyboard
+    L"\uE768",   // IC_PLAY      play
+    L"\uE740",   // IC_FULLSCREEN
+    L"\uECAA",   // IC_LAUNCHER  app grid
+    L"\uE7E8",   // IC_POWER
+    L"\uE995",   // IC_VOLUME    speaker
+    L"\uEB9D",   // IC_SCRUB     fast forward
+    L"\uE72B",   // IC_BACK
+    L"\uE72A",   // IC_FORWARD
+    L"\uE92E",   // IC_KEYS      keyboard, for a shortcut
+    L"\uE8B0",   // IC_CURSOR    pointer speed
+    L"\uE8CB",   // IC_UPDOWN    scroll speed
+    L"\uE9E9",   // IC_TUNE      dead zone
+    L"\uE713",   // IC_GEAR      fine control
+    L"\uE7FC",   // IC_PAD       the controller itself
+    L"\uE721",   // IC_SEARCH
+    L"\uE945",   // IC_BOLT      start with Windows
+};
+
+static void draw_feature_icon(ID2D1RenderTarget* rt, float cx, float cy,
+                              int kind, ID2D1Brush* br) {
+    if (!g_tf_ico || kind < 0 ||
+        kind >= (int)(sizeof(kIconGlyph) / sizeof(kIconGlyph[0])))
+        return;
+    const wchar_t* g = kIconGlyph[kind];
+    rt->DrawText(g, (UINT32)wcslen(g), g_tf_ico,
+                 D2D1::RectF(cx - 16, cy - 14, cx + 16, cy + 14), br);
+}
+
+// Mouse messages arrive in physical pixels; the layout is in DIPs.
+// Layout coordinates are in unscrolled document space, so a click has to be
+// pushed back down by however far the list has been scrolled.
+static POINT lparam_to_dip(LPARAM lp) {
+    POINT pt = {px_to_dip((int)(short)LOWORD(lp)),
+                px_to_dip((int)(short)HIWORD(lp)) + g_scroll};
+    return pt;
+}
+
+static void clamp_scroll() {
+    int max = win_height() - g_ch;
+    if (max < 0) max = 0;
+    if (g_scroll > max) g_scroll = max;
+    if (g_scroll < 0) g_scroll = 0;
+}
+
+static void update_value(int idx) {
+    Config c = get_cfg();
+    if (idx == TRK_MOUSE) {
+        swprintf(g_mouse_val_txt, 32, L"%d", (int)std::lround(c.mouse_sensitivity));
+    } else if (idx == TRK_SCROLL) {
+        swprintf(g_scroll_val_txt, 32, L"%.1f", c.scroll_sensitivity);
+    } else if (idx == TRK_DEADZONE) {
+        swprintf(g_dz_val_txt, 32, L"%d%%", (int)std::lround(c.deadzone * 100));
+    } else if (idx == TRK_CURVE) {
+        if (c.mouse_curve <= 1.02) wcscpy(g_curve_val_txt, L"Linear");
+        else swprintf(g_curve_val_txt, 32, L"%.1f", c.mouse_curve);
+    }
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// DualSense / DualShock DirectInput button names for the common indices.
+static void button_name(int b, wchar_t* out, size_t n) {
+    // Named for the pad that is actually plugged in. Calling an 8BitDo's
+    // Select button "L2" because a DualSense has L2 there is worse than not
+    // naming it at all.
+    static const wchar_t* ps[] = {
+        L"Square", L"Cross", L"Circle", L"Triangle", L"L1", L"R1", L"L2",
+        L"R2", L"Create", L"Options", L"L3", L"R3", L"PS", L"Touchpad"};
+    static const wchar_t* xb[] = {
+        L"A", L"B", L"X", L"Y", L"LB", L"RB", L"Back", L"Start",
+        L"Left stick", L"Right stick"};
+    static const wchar_t* dpad[] = {
+        L"D-pad Up", L"D-pad Right", L"D-pad Down", L"D-pad Left"};
+    int layout = g_pad_layout;
+    if (b < 0) { swprintf(out, n, L"Unbound"); return; }
+    // Whatever this pad was set up as beats anything worked out from its
+    // shape - it is the only source here that actually knows.
+    if (b < NPADBTNNAME) {
+        EnterCriticalSection(&g_cs);
+        int pr = g_pad_prof;
+        std::wstring given = (pr >= 0 && pr < g_padprof_count)
+                                 ? g_padprof[pr].name[b] : std::wstring();
+        LeaveCriticalSection(&g_cs);
+        if (!given.empty()) {
+            swprintf(out, n, L"%s", given.c_str());
+            return;
+        }
+    }
+    if (b >= BTN_DPAD_UP && b <= BTN_DPAD_LEFT) {
+        swprintf(out, n, L"%s", dpad[b - BTN_DPAD_UP]);
+    } else if (b == BTN_LTRIG) {
+        swprintf(out, n, L"Left trigger");
+    } else if (b == BTN_RTRIG) {
+        swprintf(out, n, L"Right trigger");
+    } else if (b >= BTN_EXTRA_BASE && b < BTN_EXTRA_BASE + BTN_EXTRA_N) {
+        swprintf(out, n, L"Button %d", b - BTN_EXTRA_BASE + 17);
+    } else if (layout == PADL_PS && b < 14) {
+        swprintf(out, n, L"%s", ps[b]);
+    } else if (layout == PADL_XINPUT && b < 10) {
+        swprintf(out, n, L"%s", xb[b]);
+    } else {
+        swprintf(out, n, L"Button %d", b + 1);   // as every other tool counts
+    }
+}
+
+// Current trackbar position (in the same integer units the old TBM_* range
+// used) derived straight from config, so painting and hit-testing agree.
+static int track_current_pos(int idx) {
+    Config c = get_cfg();
+    if (idx == TRK_MOUSE) return (int)std::lround(c.mouse_sensitivity);
+    if (idx == TRK_SCROLL) return (int)std::lround(c.scroll_sensitivity * 10);
+    if (idx == TRK_CURVE) return (int)std::lround(c.mouse_curve * 10);
+    return (int)std::lround(c.deadzone * 100);
+}
+
+static int track_pos_from_x(int idx, int x) {
+    RECT r = slide_track(idx);
+    double frac = (double)(x - r.left) / (double)(r.right - r.left);
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    return kTrackLo[idx] + (int)std::lround(frac * (kTrackHi[idx] - kTrackLo[idx]));
+}
+
+static void apply_track_pos(int idx, int pos) {
+    EnterCriticalSection(&g_cs);
+    if (idx == TRK_MOUSE) g_cfg.mouse_sensitivity = pos;
+    else if (idx == TRK_SCROLL) g_cfg.scroll_sensitivity = pos / 10.0;
+    else if (idx == TRK_DEADZONE) g_cfg.deadzone = pos / 100.0;
+    else if (idx == TRK_CURVE) g_cfg.mouse_curve = pos / 10.0;
+    Config c = g_cfg;
+    LeaveCriticalSection(&g_cs);
+    save_config(c);
+    update_value(idx);
+}
+
+static int hit_test_track(POINT pt) {
+    for (int i = 0; i < NTRACKS; i++)
+        { RECT t = slide_track(i); if (PtInRect(&t, pt)) return i; }
+    return -1;
+}
+
+#include "ui_shell.h"
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        d2d_create_main(hwnd);
+        update_value(TRK_MOUSE);
+        update_value(TRK_SCROLL);
+        update_value(TRK_DEADZONE);
+        update_value(TRK_CURVE);
+        SetTimer(hwnd, ID_TIMER, 500, NULL);
+        return 0;
+    }
+    case WM_SIZE:
+        if (g_mica_main.active) mica_resize(g_mica_main, LOWORD(lp), HIWORD(lp));
+        else if (g_rt_main_hwnd)
+            g_rt_main_hwnd->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
+        g_cw = px_to_dip(LOWORD(lp));
+        g_ch = px_to_dip(HIWORD(lp));
+        clamp_scroll();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_GETMINMAXINFO: {
+        // Narrower than this and the descriptions have nowhere to go.
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        RECT r = {0, 0, dip_to_px(WIN_MIN_W), dip_to_px(WIN_MIN_H)};
+        AdjustWindowRect(&r, (DWORD)GetWindowLongW(hwnd, GWL_STYLE), FALSE);
+        mmi->ptMinTrackSize.x = r.right - r.left;
+        mmi->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * 50 / WHEEL_DELTA;
+        clamp_scroll();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;   // WM_PAINT clears the whole client area itself
+    case WM_CHAR:
+        lock_input();
+        // The setup page is the only thing here that takes typed text.
+        if (g_page == 3 && g_setup_editing) {
+            wchar_t ch = (wchar_t)wp;
+            size_t n = wcslen(g_setup_text);
+            if (ch == VK_BACK) {
+                if (n) g_setup_text[n - 1] = 0;
+            } else if (ch >= L' ' && n + 1 < 40) {
+                g_setup_text[n] = ch;
+                g_setup_text[n + 1] = 0;
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        lock_input();
+        if (g_page == 3 && g_setup_editing &&
+            (msg == WM_KEYDOWN) && (wp == VK_RETURN || wp == VK_ESCAPE)) {
+            int btn = g_bind_btn;
+            if (wp == VK_RETURN && btn >= 0 && btn < NPADBTNNAME &&
+                g_setup_text[0]) {
+                EnterCriticalSection(&g_cs);
+                int pr = g_pad_prof;
+                if (pr >= 0 && pr < g_padprof_count) {
+                    g_padprof[pr].name[btn] = g_setup_text;
+                    padprof_save();
+                }
+                LeaveCriticalSection(&g_cs);
+            }
+            g_setup_editing = false;
+            g_setup_text[0] = 0;
+            g_bind_btn = -1;         // ready for the next one
+            clamp_scroll();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        // Recording a launcher hotkey. Alt combinations arrive as SYSKEYDOWN,
+        // hence both messages; bare modifiers are ignored so the combination
+        // can be built up before the real key lands.
+        if (!g_hotkey_capture && !g_sc_capture) break;
+        UINT vk = (UINT)wp;
+        if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
+            vk == VK_LWIN || vk == VK_RWIN)
+            return 0;
+        unsigned mods = 0;
+        if (GetKeyState(VK_CONTROL) < 0) mods |= MOD_CONTROL;
+        if (GetKeyState(VK_MENU) < 0)    mods |= MOD_ALT;
+        if (GetKeyState(VK_SHIFT) < 0)   mods |= MOD_SHIFT;
+        if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mods |= MOD_WIN;
+        EnterCriticalSection(&g_cs);
+        if (vk == VK_ESCAPE) {
+            // Escape backs out of recording without setting anything.
+        } else if (g_sc_capture) {
+            int btn = g_bind_btn;
+            int slot = -1;
+            for (int i = 0; i < NSC && btn >= 0; i++)
+                if (g_cfg.sc_btn[i] == btn) slot = i;
+            for (int i = 0; i < NSC && slot < 0; i++)
+                if (g_cfg.sc_btn[i] < 0) slot = i;
+            if (slot >= 0 && btn >= 0) {
+                g_cfg.sc_btn[slot] = btn;
+                g_cfg.sc_mods[slot] = mods;
+                g_cfg.sc_vk[slot] = vk;
+            }
+        } else {
+            g_cfg.search_mods = mods;
+            g_cfg.search_vk = vk;
+        }
+        Config nc = g_cfg;
+        LeaveCriticalSection(&g_cs);
+        save_config(nc);
+        g_hotkey_capture = false;
+        g_sc_capture = false;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt = lparam_to_dip(lp);
+        lock_input();
+        ui_animate(hwnd);
+        POINT screen=pt; screen.y-=g_scroll;
+        if (screen.x<rail_w()) {
+            // A modal picker or shortcut capture keeps its normal ownership.
+            if (g_win_picker || g_sc_capture || g_hotkey_capture || g_setup_editing) return 0;
+            for (int i=0;i<4;i++) {
+                RECT nr=ui_nav_rect(i);
+                if (!PtInRect(&nr,screen)) continue;
+                if (g_page==i && g_bind_target<0) return 0;
+                g_page=i; g_scroll=0; g_bind_target=-1; g_bind_btn=-1;
+                g_listen=(i==1 || i==3); g_sc_capture=false; lock_clear();
+                g_setup_editing=false; g_setup_text[0]=0;
+                clamp_scroll(); InvalidateRect(hwnd,NULL,FALSE); return 0;
+            }
+            return 0;
+        }
+        Config c = get_cfg();
+        if (g_page == 1) {
+            RECT bb = back_btn_rect();
+            if (PtInRect(&bb, pt)) {
+                // Back to the apps list when that is where it was opened
+                // from, so editing one app's layout doesn't lose the list.
+                g_page = (g_bind_target >= 0) ? 2 : 0;
+                g_bind_target = -1;
+                g_listen = false;         // the mapping comes back
+                lock_clear();
+                g_sc_capture = false;
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            // After a release the page is still up but the pad is free.
+            // Clicking the card - which the pad can now do - takes it back.
+            RECT bc = bind_card();
+            if (!g_listen && PtInRect(&bc, pt)) {
+                g_listen = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            int btn = g_bind_btn;
+            if (btn < 0) return 0;        // nothing to act on until one lands
+            // A row assigns - or, if the action is already on this button,
+            // clears it. More than one action can share a button, since one
+            // may be a tap and another a hold.
+            for (int f = 0; f < F_COUNT; f++) {
+                RECT rr = bind_row(f);
+                if (!PtInRect(&rr, pt)) continue;
+                EnterCriticalSection(&g_cs);
+                int* tgt = (g_bind_target >= 0 && g_bind_target < g_app_count)
+                               ? g_apps[g_bind_target].bind : g_cfg.bind;
+                tgt[f] = (tgt[f] == btn) ? -1 : btn;
+                bool app = (tgt != g_cfg.bind);
+                Config nc = g_cfg;
+                LeaveCriticalSection(&g_cs);
+                if (app) rules_save(); else save_config(nc);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT sb = bind_sc_btn();
+            if (g_bind_target < 0 && PtInRect(&sb, pt)) {
+                g_sc_capture = true;
+                SetFocus(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT cb = bind_sc_clear();
+            int slot = sc_slot_for(c, btn);
+            if (g_bind_target < 0 && slot >= 0 && PtInRect(&cb, pt)) {
+                EnterCriticalSection(&g_cs);
+                g_cfg.sc_btn[slot] = -1;
+                g_cfg.sc_mods[slot] = 0;
+                g_cfg.sc_vk[slot] = 0;
+                Config nc = g_cfg;
+                LeaveCriticalSection(&g_cs);
+                save_config(nc);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            return 0;
+        }
+        if (g_page == 3) {
+            RECT bb = back_btn_rect();
+            RECT db = setup_done_btn();
+            RECT sc = setup_card();
+            if (!g_listen && PtInRect(&sc, pt)) {
+                g_listen = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (PtInRect(&bb, pt) || PtInRect(&db, pt)) {
+                g_page = 0;
+                g_listen = false;
+                g_setup_editing = false;
+                lock_clear();
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        if (g_page == 2) {
+            RECT bb = back_btn_rect();
+            if (PtInRect(&bb, pt)) {
+                g_page = 0;
+                g_win_picker = false;
+                g_scroll = 0;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            // The picker owns every click while it is up.
+            if (g_win_picker) {
+                int shown = g_openwin_count > 10 ? 10 : g_openwin_count;
+                for (int i = 0; i < shown; i++) {
+                    RECT wr2 = wp_row(i);
+                    if (!PtInRect(&wr2, pt)) continue;
+                    EnterCriticalSection(&g_cs);
+                    rules_add(g_openwin[i].exe.c_str(),
+                              g_openwin[i].title.c_str());
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    g_win_picker = false;
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                RECT pr = wp_rect();
+                if (!PtInRect(&pr, pt)) g_win_picker = false;   // click away
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT af = app_add_file_btn();
+            if (PtInRect(&af, pt)) {
+                wchar_t file[MAX_PATH] = L"";
+                OPENFILENAMEW ofn = {sizeof(ofn)};
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = L"Programs\0*.exe\0All files\0*.*\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Choose a program";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+                if (GetOpenFileNameW(&ofn)) {
+                    EnterCriticalSection(&g_cs);
+                    rules_add(file, NULL);
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    clamp_scroll();
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            RECT aw = app_add_win_btn();
+            if (PtInRect(&aw, pt)) {
+                collect_open_windows();
+                g_win_picker = true;
+                clamp_scroll();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            EnterCriticalSection(&g_cs);
+            int napp = g_app_count;
+            LeaveCriticalSection(&g_cs);
+            for (int i = 0; i < napp; i++) {
+                RECT pb = app_row_pause(i), pf = app_row_prof(i);
+                RECT eb = app_row_edit(i), db = app_row_del(i);
+                bool hit = true;
+                EnterCriticalSection(&g_cs);
+                if (PtInRect(&pb, pt))      g_apps[i].no_pause = !g_apps[i].no_pause;
+                else if (PtInRect(&pf, pt)) g_apps[i].profile = !g_apps[i].profile;
+                else if (PtInRect(&db, pt)) rules_remove(i);
+                else hit = false;
+                if (hit) rules_save();
+                LeaveCriticalSection(&g_cs);
+                if (hit) {
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                if (PtInRect(&eb, pt)) {
+                    // Editing an app's layout is the same page, aimed at it.
+                    EnterCriticalSection(&g_cs);
+                    g_apps[i].profile = true;
+                    rules_save();
+                    LeaveCriticalSection(&g_cs);
+                    g_bind_target = i;
+                    g_page = 1;
+                    g_bind_btn = -1;
+                    g_sc_capture = false;
+                    g_listen = true;
+                    g_scroll = 0;
+                    clamp_scroll();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        int idx = hit_test_track(pt);
+        if (idx >= 0) {
+            g_drag_track = idx;
+            SetCapture(hwnd);
+            apply_track_pos(idx, track_pos_from_x(idx, pt.x));
+            return 0;
+        }
+        for (int i = 0; i < NTOGGLES; i++) {
+            { RECT t = toggle_rect(i); if (!PtInRect(&t, pt)) continue; }
+            if (i == 2) {
+                // Lives in the registry, not config.json, so that removing the
+                // Run entry by hand is respected.
+                set_startup(!startup_enabled());
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            EnterCriticalSection(&g_cs);
+            if (i == 0) g_cfg.enabled = !g_cfg.enabled;
+            else        g_cfg.game_pause = !g_cfg.game_pause;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            if (i == 0) st_show(c.enabled);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        {
+            RECT hk = search_key_rect();
+            if (c.search_mode == 1 && PtInRect(&hk, pt)) {
+                g_hotkey_capture = true;
+                SetFocus(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+        }
+        for (int i = 0; i < NSEARCH; i++) {
+            { RECT t = search_seg(i); if (!PtInRect(&t, pt)) continue; }
+            EnterCriticalSection(&g_cs);
+            g_cfg.search_mode = i;
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        RECT hb = hid_btn_rect();
+        if (g_hh == INVALID_HANDLE_VALUE && PtInRect(&hb, pt)) {
+            // Open the download page only; installing a driver is the user's
+            // decision to make in their own browser.
+            ShellExecuteW(NULL, L"open", HH_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        {
+            // Only real movement counts. Windows sends a move for anything
+            // that lands under a still pointer, and that is not a person.
+            POINT was = g_ui_pointer;
+            POINT now = lparam_to_dip(lp); now.y -= g_scroll;
+            if (now.x != was.x || now.y != was.y) lock_input();
+        }
+        g_ui_pointer=lparam_to_dip(lp); g_ui_pointer.y-=g_scroll;
+        TRACKMOUSEEVENT leave={sizeof(leave),TME_LEAVE,hwnd,0}; TrackMouseEvent(&leave);
+        InvalidateRect(hwnd,NULL,FALSE);
+        if (g_drag_track >= 0) {
+            POINT pt = lparam_to_dip(lp);
+            apply_track_pos(g_drag_track, track_pos_from_x(g_drag_track, pt.x));
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_ui_pointer={-1000,-1000}; InvalidateRect(hwnd,NULL,FALSE); return 0;
+    case WM_CAPTURECHANGED:
+        g_drag_track=-1; InvalidateRect(hwnd,NULL,FALSE); return 0;
+    case WM_LBUTTONUP: {
+        if (g_drag_track >= 0) {
+            g_drag_track = -1;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        if (!g_rt_main) d2d_create_main(hwnd);
+        // A flip-model swap chain rotates which physical buffer GetBuffer(0)
+        // returns on every Present, so the D2D bitmap has to be rebound to
+        // the current one before each frame - otherwise every other frame
+        // draws onto a buffer that isn't the one about to be shown, and the
+        // one actually presented still has last frame's (or the initial,
+        // blank white) content on it.
+        if (g_mica_main.active) mica_bind_target(g_mica_main);
+        if (g_rt_main) {
+            g_rt_main->BeginDraw();
+            g_rt_main->Clear(g_mica_main.active ? D2D1::ColorF(0, 0.0f)
+                                                : d2d_clr(KB_CLR_BG));
+            g_rt_main->SetTransform(
+                D2D1::Matrix3x2F::Translation(0.0f, -(float)g_scroll));
+            g_rt_main->PushAxisAlignedClip(D2D1::RectF((float)rail_w(),(float)g_scroll,(float)g_cw,(float)(g_scroll+g_ch)),D2D1_ANTIALIAS_MODE_ALIASED);
+            Config c = get_cfg();
+
+            if (g_page != 0 && g_tf_title && g_br_main_text) {
+                const wchar_t* t = (g_page == 1) ? L"Button layout"
+                                 : (g_page == 2) ? L"Per-app rules"
+                                 : (g_page == 3) ? L"Name the buttons"
+                                                 : L"ctrlmouse";
+                g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_title,
+                                    to_f(title_rect()), g_br_main_text);
+            }
+
+            if (g_page == 1) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (g_tf_label) {
+                    wchar_t h[256];
+                    if (g_bind_target >= 0) {
+                        EnterCriticalSection(&g_cs);
+                        std::wstring who = (g_bind_target < g_app_count)
+                                               ? g_apps[g_bind_target].label
+                                               : L"";
+                        LeaveCriticalSection(&g_cs);
+                        swprintf(h, 256,
+                                 L"Editing %s only. Press a button on the "
+                                 L"controller to change what it does there.",
+                                 who.c_str());
+                    } else {
+                        wcscpy(h, L"Press a button on the controller. "
+                                  L"Everything below then applies to that "
+                                  L"button.");
+                    }
+                    if (!g_listen)
+                        wcscpy(h, L"The controller is back to normal. Click "
+                                  L"the box below to bind another button.");
+                    int left = lock_left();
+                    if (left > 0) {
+                        wchar_t tail[64];
+                        swprintf(tail, 64, L"   Releasing the controller in "
+                                           L"%ds.", left);
+                        size_t room = (sizeof(h) / sizeof(h[0])) - wcslen(h) - 1;
+                        if (room > wcslen(tail)) wcscat(h, tail);
+                    }
+                    RECT hr2 = {content_x(), BIND_HINT_Y,
+                                content_x() + content_w(), BIND_HINT_Y + 20};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
+                }
+
+                // What was pressed. Accent-filled once there is one, so it
+                // reads as live rather than as another empty field.
+                int btn = g_bind_btn;
+                draw_control(g_rt_main, to_f(bind_card()), CARD_R,
+                             btn >= 0 ? (ID2D1Brush*)g_br_main_sel
+                                      : g_br_main_card,
+                             btn >= 0 ? NULL : (ID2D1Brush*)g_br_main_border);
+                if (g_tf_header) {
+                    wchar_t bn[48];
+                    if (btn >= 0) button_name(btn, bn, 48);
+                    else          wcscpy(bn, L"Waiting for a button...");
+                    RECT nr = {content_x() + 20, BIND_CARD_Y + 12,
+                               content_x() + content_w() - 20,
+                               BIND_CARD_Y + 38};
+                    g_rt_main->DrawText(bn, (UINT32)wcslen(bn), g_tf_header,
+                                        to_f(nr),
+                                        btn >= 0 ? (ID2D1Brush*)g_br_main_onacc
+                                                 : g_br_main_dim);
+                }
+                if (g_tf_label && btn >= 0) {
+                    wchar_t sub[64];
+                    swprintf(sub, 64, L"Button %d", btn);
+                    RECT sr = {content_x() + 20, BIND_CARD_Y + 34,
+                               content_x() + content_w() - 20,
+                               BIND_CARD_Y + 52};
+                    g_rt_main->DrawText(sub, (UINT32)wcslen(sub), g_tf_label,
+                                        to_f(sr), g_br_main_onacc);
+                }
+
+                if (g_tf_label) {
+                    RECT s1 = {content_x(), BIND_SEC1_Y,
+                               content_x() + content_w(), BIND_SEC1_Y + 20};
+                    g_rt_main->DrawText(L"ACTIONS", 7, g_tf_label, to_f(s1),
+                                        g_br_main_dim);
+                    if (g_bind_target < 0) {
+                        RECT s2 = {content_x(), BIND_SEC2_Y,
+                                   content_x() + content_w(), BIND_SEC2_Y + 20};
+                        g_rt_main->DrawText(L"KEYBOARD SHORTCUT", 17,
+                                            g_tf_label, to_f(s2),
+                                            g_br_main_dim);
+                    }
+                }
+
+                // The actions, with the ones already on this button lit.
+                int tgtbind[F_COUNT];
+                memcpy(tgtbind, c.bind, sizeof(tgtbind));
+                if (g_bind_target >= 0) {
+                    EnterCriticalSection(&g_cs);
+                    if (g_bind_target < g_app_count)
+                        memcpy(tgtbind, g_apps[g_bind_target].bind,
+                               sizeof(tgtbind));
+                    LeaveCriticalSection(&g_cs);
+                }
+                for (int f = 0; f < F_COUNT; f++) {
+                    RECT rr = bind_row(f);
+                    bool on = (btn >= 0 && tgtbind[f] == btn);
+                    ui_card(rr,btn>=0);
+                    if (on)
+                        draw_control(g_rt_main, to_f(rr), 12.0f, g_br_main_sel,
+                                     NULL);
+                    draw_feature_icon(g_rt_main, (float)(rr.left + 18),
+                                      (float)((rr.top + rr.bottom) / 2),
+                                      kFeatIcon[f],
+                                      on ? (ID2D1Brush*)g_br_main_onacc
+                                         : g_br_main_sel);
+                    if (!g_tf_label) continue;
+                    ID2D1Brush* tb = on ? (ID2D1Brush*)g_br_main_onacc
+                                        : (btn >= 0 ? (ID2D1Brush*)g_br_main_text
+                                                    : g_br_main_dim);
+                    RECT nr = {rr.left + 40, rr.top+3, rr.right - 12, rr.top+25};
+                    g_rt_main->DrawText(kFeatName[f],
+                                        (UINT32)wcslen(kFeatName[f]),
+                                        g_tf_label, to_f(nr), tb);
+                    // Where it already is, when that is somewhere else.
+                    wchar_t at[48] = L"";
+                    if (!on && tgtbind[f] >= 0) {
+                        wchar_t bn2[32];
+                        button_name(tgtbind[f], bn2, 32);
+                        swprintf(at, 48, L"%s", bn2);
+                    } else if (!on) {
+                        wcscpy(at, L"unbound");
+                    } else if (kFeatHint[f][0]) {
+                        swprintf(at, 48, L"%s", kFeatHint[f]);
+                    }
+                    if (at[0]) {
+                        RECT ar = {rr.left+40, rr.top+25, rr.right-12, rr.bottom-3};
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        g_rt_main->DrawText(at, (UINT32)wcslen(at), g_tf_label,
+                                            to_f(ar),
+                                            on ? (ID2D1Brush*)g_br_main_onacc
+                                               : g_br_main_dim);
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // The shortcut this button sends, if any. Shortcuts are
+                // global rather than per-app, so the section only appears
+                // when the base layout is the one being edited.
+                if (g_bind_target < 0) {
+                draw_control(g_rt_main, to_f(bind_sc_card()), CARD_R,
+                             g_br_main_card, g_br_main_border);
+                int slot = sc_slot_for(c, btn);
+                draw_feature_icon(g_rt_main, (float)(content_x() + 22),
+                                  (float)BIND_SC_Y + CARD_H / 2, IC_KEYS,
+                                  g_br_main_sel);
+                if (g_tf_label) {
+                    wchar_t kn[64];
+                    if (g_sc_capture)   wcscpy(kn, L"Press the keys...");
+                    else if (slot >= 0) hotkey_name(c.sc_mods[slot],
+                                                    c.sc_vk[slot], kn, 64);
+                    else                wcscpy(kn, L"None");
+                    RECT nr = {content_x() + CARD_ICON, BIND_SC_Y + 11,
+                               content_x() + content_w() - 170,
+                               BIND_SC_Y + 29};
+                    g_rt_main->DrawText(kn, (UINT32)wcslen(kn), g_tf_label,
+                                        to_f(nr),
+                                        (slot >= 0 || g_sc_capture)
+                                            ? (ID2D1Brush*)g_br_main_text
+                                            : g_br_main_dim);
+                    const wchar_t* d2 =
+                        L"Any combination, e.g. F or Ctrl+Shift+Tab.";
+                    RECT dr = {content_x() + CARD_ICON, BIND_SC_Y + 30,
+                               content_x() + content_w() - 170,
+                               BIND_SC_Y + 48};
+                    g_rt_main->DrawText(d2, (UINT32)wcslen(d2), g_tf_label,
+                                        to_f(dr), g_br_main_dim);
+                }
+                if (btn >= 0) {
+                    RECT sb = bind_sc_btn();
+                    draw_control(g_rt_main, to_f(sb), 6.0f,
+                                 g_sc_capture ? g_br_main_armed
+                                              : g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Record", 6, g_tf_body, to_f(sb),
+                                            g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                    if (slot >= 0) {
+                        RECT cb = bind_sc_clear();
+                        draw_control(g_rt_main, to_f(cb), 6.0f, g_br_main_key,
+                                     NULL);
+                        if (g_tf_body) {
+                            g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                            g_rt_main->DrawText(L"\x2715", 1, g_tf_body,
+                                                to_f(cb), g_br_main_dim);
+                            g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        }
+                    }
+                }
+                }
+            } else if (g_page == 3) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (g_tf_label) {
+                    wchar_t h[300];
+                    if (!g_listen)
+                        wcscpy(h, L"The controller is back to normal. Click "
+                                  L"the box below to name another button.");
+                    else if (g_setup_editing)
+                        wcscpy(h, L"Type what that button is called, then "
+                                  L"press Enter. Escape forgets it.");
+                    else
+                        wcscpy(h, L"Press a button on the controller, then "
+                                  L"type what it is called. Every button it "
+                                  L"has, including any on the back.");
+                    int left = lock_left();
+                    if (left > 0) {
+                        wchar_t tail[64];
+                        swprintf(tail, 64, L"   Releasing the controller in "
+                                           L"%ds.", left);
+                        size_t room = (sizeof(h) / sizeof(h[0])) - wcslen(h) - 1;
+                        if (room > wcslen(tail)) wcscat(h, tail);
+                    }
+                    RECT hr2 = {content_x(), SET_HINT_Y,
+                                content_x() + content_w(), SET_HINT_Y + 20};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
+                }
+
+                // What was pressed, and the name being typed for it.
+                int btn = g_bind_btn;
+                draw_control(g_rt_main, to_f(setup_card()), CARD_R,
+                             btn >= 0 ? (ID2D1Brush*)g_br_main_sel
+                                      : g_br_main_card,
+                             btn >= 0 ? NULL : (ID2D1Brush*)g_br_main_border);
+                if (g_tf_header) {
+                    wchar_t line[96];
+                    if (btn < 0)
+                        wcscpy(line, L"Waiting for a button...");
+                    else if (g_setup_editing)
+                        swprintf(line, 96, L"%s_", g_setup_text);
+                    else
+                        swprintf(line, 96, L"Button %d", btn + 1);
+                    RECT nr = {content_x() + 20, SET_CARD_Y + 12,
+                               content_x() + content_w() - 120,
+                               SET_CARD_Y + 38};
+                    g_rt_main->DrawText(line, (UINT32)wcslen(line), g_tf_header,
+                                        to_f(nr),
+                                        btn >= 0 ? (ID2D1Brush*)g_br_main_onacc
+                                                 : g_br_main_dim);
+                }
+                if (g_tf_label && btn >= 0) {
+                    wchar_t sub[64];
+                    if (g_setup_editing) swprintf(sub, 64, L"Naming button %d",
+                                                  btn + 1);
+                    else                 wcscpy(sub, L"Start typing a name");
+                    RECT sr = {content_x() + 20, SET_CARD_Y + 34,
+                               content_x() + content_w() - 120,
+                               SET_CARD_Y + 52};
+                    g_rt_main->DrawText(sub, (UINT32)wcslen(sub), g_tf_label,
+                                        to_f(sr), g_br_main_onacc);
+                }
+                {
+                    RECT db = setup_done_btn();
+                    draw_control(g_rt_main, to_f(db), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Done", 4, g_tf_body, to_f(db),
+                                            g_br_main_text);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // Everything named so far, so it is obvious what is left.
+                int idx[SET_ROWS_MAX];
+                int named = setup_named(idx, SET_ROWS_MAX);
+                if (g_tf_label) {
+                    RECT hd = {content_x(), SET_LIST_Y - 24,
+                               content_x() + content_w(), SET_LIST_Y - 4};
+                    const wchar_t* t = named ? L"NAMED SO FAR"
+                                             : L"Nothing named yet.";
+                    g_rt_main->DrawText(t, (UINT32)wcslen(t), g_tf_label,
+                                        to_f(hd), g_br_main_dim);
+                }
+                if (g_tf_label) {
+                    RECT diagnostics={content_x(),SET_CARD_Y+CARD_H+22,content_x()+content_w(),SET_CARD_Y+CARD_H+134};
+                    ui_card(diagnostics);
+                    ui_text(L"Live controller input",D2D1::RectF((float)content_x()+18,SET_CARD_Y+CARD_H+26,(float)content_x()+content_w()-18,SET_CARD_Y+CARD_H+49),g_tf_body,g_br_main_text);
+                    wchar_t ax[300];
+                    pad_axis_summary(ax, 300);
+                    RECT ar = {content_x()+18, SET_CARD_Y + CARD_H + 50,
+                               content_x() + content_w()-18, SET_CARD_Y + CARD_H + 74};
+                    g_rt_main->DrawText(ax, (UINT32)wcslen(ax), g_tf_label,
+                                        to_f(ar), g_br_main_dim);
+                    wchar_t lv[160];
+                    swprintf(lv, 160,
+                             L"left %d,%d   right %d,%d   hat %d   buttons %08X",
+                             g_dbg_lx, g_dbg_ly, g_dbg_rx, g_dbg_ry,
+                             g_dbg_hat, g_dbg_mask);
+                    RECT lr = {content_x()+18, SET_CARD_Y + CARD_H + 74,
+                               content_x() + content_w()-18, SET_CARD_Y + CARD_H + 98};
+                    g_rt_main->DrawText(lv, (UINT32)wcslen(lv), g_tf_label,
+                                        to_f(lr), g_br_main_dim);
+                    wchar_t hh[200];
+                    swprintf(hh, 200,
+                             L"HidHide: %s, %s, %d collections, %s",
+                             g_hh == INVALID_HANDLE_VALUE ? L"not installed"
+                                                          : L"installed",
+                             g_hh_whitelisted ? L"we are whitelisted"
+                                              : L"NOT whitelisted (needs admin)",
+                             g_pad_inst_count,
+                             g_hh_hiding ? L"hiding now" : L"not hiding");
+                    RECT hr3 = {content_x()+18, SET_CARD_Y + CARD_H + 98,
+                                content_x() + content_w()-18, SET_CARD_Y + CARD_H + 122};
+                    g_rt_main->DrawText(hh, (UINT32)wcslen(hh), g_tf_label,
+                                        to_f(hr3), g_br_main_dim);
+                }
+                for (int i = 0; i < named; i++) {
+                    RECT rr = setup_row(i);
+                    EnterCriticalSection(&g_cs);
+                    int pr = g_pad_prof;
+                    std::wstring nm = (pr >= 0 && pr < g_padprof_count)
+                                          ? g_padprof[pr].name[idx[i]]
+                                          : std::wstring();
+                    LeaveCriticalSection(&g_cs);
+                    if (!g_tf_label) continue;
+                    wchar_t num[32];
+                    swprintf(num, 32, L"Button %d", idx[i] + 1);
+                    RECT nr = {rr.left + 8, rr.top, rr.left + 140, rr.bottom};
+                    g_rt_main->DrawText(num, (UINT32)wcslen(num), g_tf_label,
+                                        to_f(nr), g_br_main_dim);
+                    RECT vr = {rr.left + 150, rr.top, rr.right - 8, rr.bottom};
+                    g_rt_main->DrawText(nm.c_str(), (UINT32)nm.size(),
+                                        g_tf_label, to_f(vr), g_br_main_text);
+                }
+            } else if (g_page == 2) {
+                RECT bb = back_btn_rect();
+                draw_control(g_rt_main, to_f(bb), 6.0f, g_br_main_key, NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Back", 4, g_tf_body, to_f(bb),
+                                        g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                if (g_tf_label) {
+                    const wchar_t* h =
+                        L"Apps listed here can be kept out of the game pause, "
+                        L"and can have their own button layout.";
+                    RECT hr2 = {content_x(), APP_HINT_Y,
+                                content_x() + content_w(), APP_HINT_Y + 20};
+                    g_rt_main->DrawText(h, (UINT32)wcslen(h), g_tf_label,
+                                        to_f(hr2), g_br_main_dim);
+                }
+
+                RECT af = app_add_file_btn(), aw = app_add_win_btn();
+                draw_control(g_rt_main, to_f(af), 6.0f, g_br_main_key, NULL);
+                draw_control(g_rt_main, to_f(aw), 6.0f,
+                             g_win_picker ? g_br_main_armed : g_br_main_key,
+                             NULL);
+                if (g_tf_body) {
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    g_rt_main->DrawText(L"Choose a program...", 19, g_tf_body,
+                                        to_f(af), g_br_main_text);
+                    g_rt_main->DrawText(L"Pick an open window...", 22,
+                                        g_tf_body, to_f(aw), g_br_main_text);
+                    g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+
+                EnterCriticalSection(&g_cs);
+                int napp = g_app_count;
+                LeaveCriticalSection(&g_cs);
+
+                if (!napp && g_tf_label) {
+                    RECT empty={content_x(),APP_ROW_Y0+20,content_x()+content_w(),APP_ROW_Y0+240};
+                    ui_card(empty);
+                    float cx=(empty.left+empty.right)*.5f;
+                    draw_control(g_rt_main,D2D1::RectF(cx-24,(float)(empty.top+35),cx+24,(float)(empty.top+83)),14,g_br_main_key,NULL);
+                    draw_feature_icon(g_rt_main,cx,(float)empty.top+59,IC_LAUNCHER,g_br_main_sel);
+                    g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    ui_text(L"Every app can feel right at home.",D2D1::RectF((float)empty.left,(float)(empty.top+99),(float)empty.right,(float)(empty.top+129)),g_tf_header,g_br_main_text);
+                    g_tf_header->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    ui_text(L"Add a program above to give it its own layout or pause rule.",D2D1::RectF((float)empty.left+18,(float)(empty.top+139),(float)empty.right-18,(float)(empty.top+165)),g_tf_label,g_br_main_dim);
+                    g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+
+                for (int i = 0; i < napp; i++) {
+                    EnterCriticalSection(&g_cs);
+                    AppRule r = g_apps[i];
+                    LeaveCriticalSection(&g_cs);
+                    RECT rr = app_row(i);
+                    draw_control(g_rt_main, to_f(rr), CARD_R, g_br_main_card,
+                                 g_br_main_border);
+                    draw_feature_icon(g_rt_main, (float)(rr.left + 22),
+                                      (float)((rr.top + rr.bottom) / 2),
+                                      IC_PAD, g_br_main_sel);
+                    if (g_tf_label) {
+                        RECT nr = {rr.left + CARD_ICON, rr.top + 11,
+                                   rr.right - 300, rr.top + 29};
+                        g_rt_main->DrawText(r.label.c_str(),
+                                            (UINT32)r.label.size(), g_tf_label,
+                                            to_f(nr), g_br_main_text);
+                        RECT dr = {rr.left + CARD_ICON, rr.top + 30,
+                                   rr.right - 300, rr.top + 48};
+                        g_rt_main->DrawText(r.exe.c_str(),
+                                            (UINT32)r.exe.size(), g_tf_label,
+                                            to_f(dr), g_br_main_dim);
+                    }
+                    // The two switches, each with its own word above it.
+                    const wchar_t* cap[2] = {L"Never pause", L"Own layout"};
+                    RECT sw[2] = {app_row_pause(i), app_row_prof(i)};
+                    bool on[2] = {r.no_pause, r.profile};
+                    for (int k = 0; k < 2; k++) {
+                        if (g_tf_label) {
+                            RECT cr2 = {sw[k].left - 2, sw[k].top - 20,
+                                        sw[k].left + 120, sw[k].top - 4};
+                            g_rt_main->DrawText(cap[k],
+                                                (UINT32)wcslen(cap[k]),
+                                                g_tf_label, to_f(cr2),
+                                                g_br_main_dim);
+                        }
+                        float hgt = (float)(sw[k].bottom - sw[k].top);
+                        g_rt_main->FillRoundedRectangle(
+                            D2D1::RoundedRect(to_f(sw[k]), hgt / 2, hgt / 2),
+                            on[k] ? (ID2D1Brush*)g_br_main_sel
+                                  : g_br_main_toggle_off);
+                        float kx = on[k] ? sw[k].right - hgt / 2
+                                         : sw[k].left + hgt / 2;
+                        g_rt_main->FillEllipse(
+                            D2D1::Ellipse(D2D1::Point2F(kx,
+                                (float)(sw[k].top + sw[k].bottom) / 2),
+                                hgt / 2 - 4, hgt / 2 - 4),
+                            on[k] ? (ID2D1Brush*)g_br_main_onacc
+                                  : g_br_main_white);
+                    }
+                    RECT eb = app_row_edit(i), db = app_row_del(i);
+                    draw_control(g_rt_main, to_f(eb), 6.0f, g_br_main_key, NULL);
+                    draw_control(g_rt_main, to_f(db), 6.0f, g_br_main_key, NULL);
+                    if (g_tf_body) {
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        g_rt_main->DrawText(L"Buttons", 7, g_tf_body, to_f(eb),
+                                            r.profile ? (ID2D1Brush*)g_br_main_text
+                                                      : g_br_main_dim);
+                        g_rt_main->DrawText(L"\x2715", 1, g_tf_body, to_f(db),
+                                            g_br_main_dim);
+                        g_tf_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                }
+
+                // The open-window picker, over the page while it is up.
+                if (g_win_picker) {
+                    RECT pr = wp_rect();
+                    draw_control(g_rt_main, to_f(pr), 8.0f, g_br_main_panel,
+                                 g_br_main_border);
+                    if (g_tf_label) {
+                        RECT th = {pr.left + 12, pr.top + 10, pr.right - 12,
+                                   pr.top + 30};
+                        g_rt_main->DrawText(L"Open windows", 12, g_tf_label,
+                                            to_f(th), g_br_main_dim);
+                    }
+                    int shown = g_openwin_count > 10 ? 10 : g_openwin_count;
+                    for (int i = 0; i < shown; i++) {
+                        RECT wr2 = wp_row(i);
+                        if (!g_tf_label) continue;
+                        RECT nr = {wr2.left + 10, wr2.top, wr2.right - 110,
+                                   wr2.bottom};
+                        g_rt_main->DrawText(g_openwin[i].title.c_str(),
+                                            (UINT32)g_openwin[i].title.size(),
+                                            g_tf_label, to_f(nr),
+                                            g_br_main_text);
+                        RECT er2 = {wr2.right - 106, wr2.top, wr2.right - 10,
+                                    wr2.bottom};
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        g_rt_main->DrawText(g_openwin[i].exe.c_str(),
+                                            (UINT32)g_openwin[i].exe.size(),
+                                            g_tf_label, to_f(er2),
+                                            g_br_main_dim);
+                        g_tf_label->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    }
+                    if (!shown && g_tf_label) {
+                        RECT nr = {pr.left + 12, pr.top + WP_TOP,
+                                   pr.right - 12, pr.top + WP_TOP + 20};
+                        g_rt_main->DrawText(L"No windows found.", 17,
+                                            g_tf_label, to_f(nr),
+                                            g_br_main_dim);
+                    }
+                }
+            } else {
+                ui_home(c);
+            }
+
+            g_rt_main->PopAxisAlignedClip();
+            g_rt_main->SetTransform(D2D1::Matrix3x2F::Identity());
+            ui_sidebar();
+            int extent=win_height();
+            if (extent>g_ch) {
+                float th=(float)g_ch*g_ch/extent;
+                float top=(float)g_scroll/extent*g_ch;
+                g_br_main_glow->SetOpacity(.28f);
+                draw_control(g_rt_main,D2D1::RectF((float)g_cw-7,top+3,(float)g_cw-4,top+th-3),1.5f,g_br_main_glow,NULL);
+                g_br_main_glow->SetOpacity(1);
+            }
+            HRESULT hr = g_rt_main->EndDraw();
+            if (g_mica_main.active && SUCCEEDED(hr))
+                g_mica_main.swap->Present(1, 0);
+            if (hr == D2DERR_RECREATE_TARGET) d2d_release_main();
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_TIMER: {
+        if (wp==90) {
+            if (--g_ui_frames<=0 || !IsWindowVisible(hwnd)) KillTimer(hwnd,90);
+            InvalidateRect(hwnd,NULL,FALSE); return 0;
+        }
+        if (g_lock_armed) {
+            ULONGLONG now = GetTickCount64();
+            if (!g_lock_t0) {
+                if (now - g_lock_input >= LOCK_IDLE_MS) g_lock_t0 = now;
+            } else if (now - g_lock_t0 >= LOCK_HOLD_MS) {
+                lock_release(hwnd);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        // The setup page shows live axis values, so it repaints on the tick
+        // rather than only when something is clicked.
+        if (g_page == 3) InvalidateRect(hwnd, NULL, FALSE);
+        Config c = get_cfg();
+        int st;
+        const wchar_t* state;
+        if (!g_connected)      { st = 0; state = L"Disconnected"; }
+        else if (c.enabled && c.game_pause && g_game_active && !g_override)
+                               { st = 2; state = L"Paused - game detected"; }
+        else if (!c.enabled)   { st = 3; state = L"Disabled"; }
+        else                   { st = 1; state = L"Connected"; }
+        // Name the pad once we have one, so the line reads e.g.
+        // "DualSense Edge : Connected" rather than a generic label.
+        wchar_t line[128];
+        swprintf(line, 128, L"%s : %s",
+                 g_connected ? g_pad_name : L"Controller", state);
+        if (st != g_status_state || wcscmp(line, g_status_txt) != 0) {
+            g_status_state = st;
+            wcsncpy(g_status_txt, line, 63);
+            g_status_txt[63] = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_GAMEPAD:
+        switch (wp) {
+        case GP_KB_TOGGLE:
+            if (g_kb_visible) { g_kb_search = false; g_kb_external = false; }
+            kb_toggle();
+            break;
+        case GP_KB_ENTER:
+            // Jump the selection onto Enter without pressing it.
+            if (g_kb_visible) {
+                g_kb_row = KB_NROWS - 1;
+                g_kb_col = KB_COUNT[KB_NROWS - 1] - 1;
+                g_kb_in_res = false;
+                if (g_kb) InvalidateRect(g_kb, NULL, FALSE);
+            }
+            break;
+        case GP_PT_SEARCH:
+            // Raise PowerToys, then put the keyboard up to type into it. The
+            // keyboard never takes focus, so what it types lands in whatever
+            // PowerToys just focused.
+            {
+                Config sc = get_cfg();
+                send_hotkey(sc.search_mods, sc.search_vk);
+            }
+            g_kb_search = false;
+            if (!g_kb_visible) kb_toggle();
+            g_kb_external = true;
+            break;
+        case GP_RAD_SHOW:
+            // lp says which flyout: 0 the fullscreen shortcuts, 1 media.
+            g_rad_mode = (int)lp;
+            g_rad_sel = g_rad_mode ? MED_PLAY : 1;   // the middle option
+            g_rad_prev_sel = g_rad_sel;
+            g_rad_row = 0;
+            if (g_rad_mode) med_poll_start();
+            rad_show(true);
+            break;
+        case GP_RAD_ROW:
+            g_rad_row = (int)lp ? 1 : 0;
+            if (g_rad) InvalidateRect(g_rad, NULL, FALSE);
+            rad_render();
+            break;
+        case GP_RAD_SEL:
+            rad_select((int)lp);
+            break;
+        case GP_RAD_PICK: {
+            int mode = g_rad_mode, sel = g_rad_sel;
+            med_poll_stop();
+            rad_show(false);
+            if (mode) {
+                // lp is set when the item has already been repeating, which
+                // means it has fired plenty and shouldn't fire once more.
+                if (!lp && sel >= 0 && sel < NMEDIA) tap_key(kMediaFlyVk[sel]);
+                break;
+            }
+            send_fullscreen(sel);
+            // Remember it, so the flyout opens on the last one used.
+            EnterCriticalSection(&g_cs);
+            g_cfg.fullscreen_key = sel;
+            Config fc = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(fc);
+            break;
+        }
+        case GP_RAD_HIDE:
+            med_poll_stop();
+            rad_show(false);
+            break;
+        case GP_MED_REPEAT:
+            if ((int)lp >= 0 && (int)lp < NMEDIA) tap_key(kMediaFlyVk[(int)lp]);
+            break;
+        case GP_MED_SEEK:
+            // The arrow keys, which is what every player treats as a scrub.
+            tap_key((int)lp < 0 ? VK_LEFT : VK_RIGHT);
+            break;
+        case GP_KB_SEARCH:
+            g_kb_external = false;
+            // Hold: open straight into search, or switch an already-open
+            // keyboard over to it.
+            if (g_kb_visible && !g_kb_search) kb_toggle();
+            g_kb_search = true;
+            g_kb_query[0] = 0;
+            g_kb_res_count = 0;
+            g_kb_in_res = false;
+            if (!g_kb_visible) kb_toggle();
+            break;
+        case GP_KB_SELECT:    kb_select(); break;
+        case GP_KB_BACKSPACE: kb_backspace(); break;
+        case GP_KB_NAV:       kb_nav((int)lp); break;
+        case GP_LX_TOGGLE:    lx_toggle(); break;
+        case GP_LX_NAV:       lx_nav((int)lp); break;
+        case GP_LX_CLOSE:
+            if (g_lx_close_mode) lx_set_close_mode(false);
+            else if (g_lx_visible) lx_toggle();
+            break;
+        case GP_LX_SELECT: {
+            if (!g_lx_visible) break;
+            if (g_lx_close_mode) {
+                if (g_lx_sel < g_lx_count) force_close_app(g_lx_apps[g_lx_sel]);
+                lx_set_close_mode(false);
+                break;
+            }
+            if (g_lx_sel == lx_hdr_second()) {
+                lx_toggle();
+                ShellExecuteW(NULL, L"open", L"ms-settings:", NULL, NULL,
+                              SW_SHOWNORMAL);
+                break;
+            }
+            if (g_lx_sel == lx_hdr_first()) {
+                lx_toggle();
+                show_desktop();
+                break;
+            }
+            if (g_lx_sel == lx_add_index()) {
+                // "+" tile: pick an executable. The launcher never takes
+                // focus, so it is dismissed first and the dialog is put up
+                // from the settings window, which can.
+                lx_toggle();
+                wchar_t file[MAX_PATH] = L"";
+                OPENFILENAMEW ofn = {sizeof(ofn)};
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = L"Programs and shortcuts\0*.exe;*.lnk\0All files\0*.*\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Add an app to the launcher";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+                if (GetOpenFileNameW(&ofn) && g_lx_count < LX_MAX_APPS) {
+                    g_lx_apps[g_lx_count++] = file;
+                    lx_save();
+                }
+            } else if (g_lx_sel < g_lx_count) {
+                std::wstring app = g_lx_apps[g_lx_sel];
+                lx_toggle();   // get out of the way before the app appears
+                // Switch to it if it is already running, rather than starting
+                // a second copy.
+                if (!activate_running(app))
+                    ShellExecuteW(NULL, L"open", app.c_str(), NULL, NULL,
+                                  SW_SHOWNORMAL);
+            }
+            break;
+        }
+        case GP_PRESSED:
+            // Not while a name is being typed: a brushed stick would
+            // otherwise throw the half-typed one away without saying so.
+            if (g_listen && g_bind_btn != (int)lp &&
+                !(g_page == 3 && g_setup_editing)) {
+                g_bind_btn = (int)lp;
+                lock_arm();
+                // On the setup page a press is the start of naming it, so
+                // typing can begin straight away without another click.
+                if (g_page == 3) {
+                    g_setup_editing = true;
+                    g_setup_text[0] = 0;
+                    SetFocus(hwnd);
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case GP_TOGGLE: {
+            // Controller keybind: toggles whatever the user perceives. If the
+            // mapping is effectively off (disabled OR game-paused), turn it on
+            // - forcing past the game pause until that game closes.
+            EnterCriticalSection(&g_cs);
+            bool effective = g_cfg.enabled &&
+                             !(g_cfg.game_pause && g_game_active && !g_override);
+            if (effective) { g_cfg.enabled = false; g_override = false; }
+            else           { g_cfg.enabled = true;  g_override = true;  }
+            Config c = g_cfg;
+            LeaveCriticalSection(&g_cs);
+            save_config(c);
+            st_show(!effective);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        }
+        }
+        return 0;
+    case WM_TRAYICON:
+        if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
+            restore_from_tray(hwnd);
+        } else if (LOWORD(lp) == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, L"Show");
+            AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
+            SetForegroundWindow(hwnd);  // required so the menu dismisses correctly
+            int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                     pt.x, pt.y, 0, hwnd, NULL);
+            PostMessage(hwnd, WM_NULL, 0, 0);  // KB135788: let the menu reopen next time
+            DestroyMenu(menu);
+            if (cmd == ID_TRAY_SHOW) restore_from_tray(hwnd);
+            else if (cmd == ID_TRAY_QUIT) DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_DPICHANGED: {
+        // Per-monitor-v2: re-point both render targets at the new DPI (all
+        // drawing is in DIPs, so nothing else changes), resize the keyboard
+        // popup to match, and take the window rect Windows suggests.
+        g_dpi = HIWORD(wp);
+        if (g_rt_main) g_rt_main->SetDpi((float)g_dpi, (float)g_dpi);
+        if (g_surf_kb.rt) g_surf_kb.rt->SetDpi((float)g_dpi, (float)g_dpi);
+        if (g_kb) {
+            RECT wa;
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            int ww = dip_to_px(KB_W), wh = dip_to_px(KB_H);
+            g_kb_x = wa.left + (wa.right - wa.left - ww) / 2;
+            g_kb_y = wa.bottom - wh - dip_to_px(12);
+            SetWindowPos(g_kb, NULL, g_kb_x, g_kb_y, ww, wh,
+                         SWP_NOACTIVATE | SWP_NOZORDER);
+            InvalidateRect(g_kb, NULL, FALSE);
+        }
+        const RECT* sug = (const RECT*)lp;
+        SetWindowPos(hwnd, NULL, sug->left, sug->top,
+                     sug->right - sug->left, sug->bottom - sug->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        // Leave the layout page on the way out: it stops the mapping while
+        // it listens, and a hidden window has no way to say so or to undo it.
+        g_page = 0;
+        g_bind_target = -1;
+        g_listen = false;
+        g_sc_capture = false;
+        g_win_picker = false;
+        g_setup_editing = false;
+        lock_clear();
+        hide_to_tray(hwnd);  // close button -> tray, keep running
+        return 0;
+    case WM_DESTROY:
+        g_listen = false;
+        KillTimer(hwnd, ID_TIMER);
+        remove_tray_icon();
+        d2d_release_main();
+        g_running = false;
+        g_med_run = false;      // let the now-playing poller finish too
+        if (g_worker) {
+            WaitForSingleObject(g_worker, 1000);
+            CloseHandle(g_worker);
+            g_worker = NULL;
+        }
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Per-monitor-v2 DPI awareness, resolved dynamically so this still builds and
+// runs on SDKs/OS versions without it (same defensive approach as the DWM
+// attribute constants above). Without this Windows silently bitmap-stretches
+// the whole window on a high-DPI display, which would throw away everything
+// Direct2D just bought us.
+static void enable_dpi_awareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    typedef BOOL(WINAPI * SetCtxFn)(HANDLE);
+    SetCtxFn fn = (SetCtxFn)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    if (fn && fn((HANDLE)-4))   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        return;
+    // Older Windows 10 / 8.1 fallback.
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    if (shcore) {
+        typedef HRESULT(WINAPI * SetAwareFn)(int);
+        SetAwareFn sa = (SetAwareFn)GetProcAddress(shcore, "SetProcessDpiAwareness");
+        if (sa) sa(2);   // PROCESS_PER_MONITOR_DPI_AWARE
+        FreeLibrary(shcore);
+    }
+}
+
+// Offer HidHide on first launch without it. We only ever open the download
+// page - downloading or running an installer on the user's behalf is not
+// something this app should be doing. Declining is remembered so this is not
+// a recurring nag; delete the marker (or the config) to be asked again.
+static void offer_hidhide() {
+    std::wstring marker = config_path();
+    marker.resize(marker.find_last_of(L"\\/") + 1);
+    marker += L"hidhide_declined";
+    if (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    int r = MessageBoxW(
+        NULL,
+        L"ctrlmouse can stop your controller reaching other applications "
+        L"while the mapping is on, so the D-pad and stick clicks don't drive "
+        L"menus or media at the same time as the mouse.\n\n"
+        L"That needs HidHide - a small, free, open-source driver by Nefarius. "
+        L"It is a one-time install and ctrlmouse only hides the pad while the "
+        L"mapping is enabled.\n\n"
+        L"Without it everything else still works; the controller just stays "
+        L"visible to other apps.\n\n"
+        L"Open the HidHide download page?",
+        L"ctrlmouse - optional: block the pad from other apps",
+        MB_YESNO | MB_ICONINFORMATION);
+
+    if (r == IDYES) {
+        ShellExecuteW(NULL, L"open", HH_RELEASES_URL, NULL, NULL, SW_SHOWNORMAL);
+    } else {
+        HANDLE f = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    enable_dpi_awareness();
+    HANDLE mutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(CLASS_NAME, NULL);
+        if (existing) {
+            ShowWindow(existing, SW_SHOW);
+            SetForegroundWindow(existing);
+        }
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+
+    // COM for the shell APIs (icons, shortcut resolution) and WIC, which is
+    // how an HICON becomes something Direct2D can draw.
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                     IID_IWICImagingFactory, (void**)&g_wic);
+
+    migrate_old_data();
+    InitializeCriticalSection(&g_cs);
+    InitializeCriticalSection(&g_med_cs);
+    g_cfg = load_config();
+    rules_load();
+    padprof_load();
+    init_theme();
+    d2d_init_process();
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                 0, 0, LR_DEFAULTSIZE);
+    if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hbrBackground = g_kb_bg;   // avoids a white flash before the first paint
+    wc.lpszClassName = CLASS_NAME;
+    RegisterClassW(&wc);
+
+    // Pick up the DPI of the monitor the window will open on, so the very
+    // first frame is already correctly scaled.
+    {
+        POINT origin = {0, 0};
+        HMONITOR mon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        if (shcore) {
+            typedef HRESULT(WINAPI * GetDpiFn)(HMONITOR, int, UINT*, UINT*);
+            GetDpiFn get = (GetDpiFn)GetProcAddress(shcore, "GetDpiForMonitor");
+            UINT dx = 96, dy = 96;
+            if (get && SUCCEEDED(get(mon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx)
+                g_dpi = dx;
+            FreeLibrary(shcore);
+        }
+    }
+
+    g_mica_capable = os_supports_mica();
+
+    RECT r = {0, 0, dip_to_px(WIN_W), dip_to_px(820)};
+    DWORD style = WS_OVERLAPPEDWINDOW;   // resizable: content reflows
+    AdjustWindowRect(&r, style, FALSE);
+    // Opening wide enough for the longest description is no good if that is
+    // wider than the screen, which it can be once DPI scaling is in play.
+    {
+        RECT wa;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        int maxw = (wa.right - wa.left) - dip_to_px(24);
+        int maxh = (wa.bottom - wa.top) - dip_to_px(24);
+        if (r.right - r.left > maxw) r.right = r.left + maxw;
+        if (r.bottom - r.top > maxh) r.bottom = r.top + maxh;
+    }
+    // No redirection surface when Mica will be attempted: its content is
+    // presented through DirectComposition instead, and leaving the normal
+    // one in place is what showed through as a white window.
+    DWORD ex = g_mica_capable ? WS_EX_NOREDIRECTIONBITMAP : 0;
+    g_hwnd = CreateWindowExW(
+        ex, CLASS_NAME, L"ControllerMouse", style,
+        CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+        NULL, NULL, hInst, NULL);
+    BOOL dark = TRUE;   // dark title bar to match (Win10 1809+ / Win11)
+    DwmSetWindowAttribute(g_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/,
+                          &dark, sizeof(dark));
+    // Started by the login entry, which passes --tray: go straight to the tray
+    // rather than putting a window in front of someone who just signed in.
+    if (wcsstr(GetCommandLineW(), L"--tray"))
+        hide_to_tray(g_hwnd);
+    else
+        ShowWindow(g_hwnd, SW_SHOW);
+
+    // Optional device-hiding support. Whitelist ourselves up front: hiding is
+    // only ever enabled if that worked, so we can't hide the pad from
+    // ourselves. Requires elevation, and failing is not fatal.
+    if (hh_open()) {
+        hh_recover_blacklist();   // undo a previous run that died while hiding
+        g_hh_whitelisted = hh_whitelist_self();
+        // Writing HidHide's whitelist needs elevation. Rather than force a UAC
+        // prompt on every launch with a manifest, ask only when we actually
+        // needed it and did not have it.
+        if (!g_hh_whitelisted && !is_elevated()) {
+            int r = MessageBoxW(
+                NULL,
+                L"HidHide is installed, but ctrlmouse needs administrator "
+                L"rights once to add itself to HidHide's allowed-applications "
+                L"list.\n\nWithout that it cannot hide your controller from "
+                L"other apps, so the D-pad and stick clicks will keep "
+                L"reaching games, Steam and menus.\n\n"
+                L"Restart ctrlmouse as administrator now?",
+                L"ctrlmouse - administrator rights needed once",
+                MB_YESNO | MB_ICONWARNING);
+            if (r == IDYES) {
+                wchar_t exe[MAX_PATH];
+                if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+                    if (mutex) CloseHandle(mutex);   // let the new instance win
+                    ShellExecuteW(NULL, L"runas", exe, NULL, NULL, SW_SHOWNORMAL);
+                    return 0;
+                }
+            }
+        }
+    } else {
+        offer_hidhide();
+    }
+
+    g_worker = CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    DeleteCriticalSection(&g_cs);
+    return 0;
+}
